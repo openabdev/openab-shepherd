@@ -146,7 +146,10 @@ fn check_outside_repo(token: &Path, project_dir: &Path) -> Result<(), ConfigErro
             boundaries.push(root);
         }
     }
-    if boundaries.iter().any(|boundary| token.starts_with(boundary)) {
+    if boundaries
+        .iter()
+        .any(|boundary| token.starts_with(boundary))
+    {
         return Err(ConfigError(
             "token file must be outside the git repository and the project folder".to_string(),
         ));
@@ -165,11 +168,7 @@ fn git_toplevel(dir: &Path) -> Result<Option<PathBuf>, ConfigError> {
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .output()
-        .map_err(|err| {
-            ConfigError(format!(
-                "cannot run git to check the token location: {err}"
-            ))
-        })?;
+        .map_err(|err| ConfigError(format!("cannot run git to check the token location: {err}")))?;
     if output.status.success() {
         let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
         return Ok(if root.is_empty() {
@@ -238,8 +237,13 @@ mod tests {
     #[test]
     fn refuses_without_any_token() {
         let dir = TempDir::new("no-token");
-        let err = load_config(env_from(&[(SOCKET_ENV, SOCKET)]), "127.0.0.1", 8765, dir.path())
-            .unwrap_err();
+        let err = load_config(
+            env_from(&[(SOCKET_ENV, SOCKET)]),
+            "127.0.0.1",
+            8765,
+            dir.path(),
+        )
+        .unwrap_err();
         assert!(err.0.contains("no bearer token"), "{err}");
     }
 
@@ -294,8 +298,13 @@ mod tests {
     #[test]
     fn missing_socket_env_refused() {
         let dir = TempDir::new("no-socket");
-        let err = load_config(env_from(&[(TOKEN_ENV, GOOD_TOKEN)]), "127.0.0.1", 8765, dir.path())
-            .unwrap_err();
+        let err = load_config(
+            env_from(&[(TOKEN_ENV, GOOD_TOKEN)]),
+            "127.0.0.1",
+            8765,
+            dir.path(),
+        )
+        .unwrap_err();
         assert!(err.0.contains("HC_SOCKET"), "{err}");
     }
 
@@ -357,19 +366,36 @@ mod tests {
         let outside = TempDir::new("outside-token");
         let token = outside.path().join("outside.token");
         write_token(&token, 0o600);
-        assert_eq!(load_with_token_file(&token, &project).unwrap().token, GOOD_TOKEN);
+        assert_eq!(
+            load_with_token_file(&token, &project).unwrap().token,
+            GOOD_TOKEN
+        );
     }
 
     #[test]
     fn loopback_hosts_allowed() {
-        assert_eq!(check_bind_host("127.0.0.1").unwrap(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(check_bind_host("::1").unwrap(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(
+            check_bind_host("127.0.0.1").unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            check_bind_host("::1").unwrap(),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
     }
 
     #[test]
     fn non_loopback_hosts_refused_before_token_check() {
         // RFC 5737 documentation addresses and a name; none of them may bind.
-        for host in ["0.0.0.0", "::", "192.0.2.10", "198.51.100.7", "203.0.113.5", "localhost", "127.0.0.2"] {
+        for host in [
+            "0.0.0.0",
+            "::",
+            "192.0.2.10",
+            "198.51.100.7",
+            "203.0.113.5",
+            "localhost",
+            "127.0.0.2",
+        ] {
             let err = check_bind_host(host).unwrap_err();
             assert!(err.0.contains("only 127.0.0.1 and ::1"), "{host}: {err}");
         }

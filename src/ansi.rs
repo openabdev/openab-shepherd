@@ -77,7 +77,11 @@ fn skip_string(chars: &[char], start: usize, bel_terminates: bool) -> usize {
             return j + 1;
         }
         if c == ESC {
-            return if chars.get(j + 1) == Some(&'\\') { j + 2 } else { j };
+            return if chars.get(j + 1) == Some(&'\\') {
+                j + 2
+            } else {
+                j
+            };
         }
         j += 1;
     }
@@ -105,7 +109,10 @@ mod tests {
 
     #[test]
     fn osc_7501_bel_terminated_stripped() {
-        assert_eq!(strip_terminal_escapes("\u{1b}]7501;state=done\u{7}hello"), "hello");
+        assert_eq!(
+            strip_terminal_escapes("\u{1b}]7501;state=done\u{7}hello"),
+            "hello"
+        );
     }
 
     #[test]
@@ -115,7 +122,10 @@ mod tests {
 
     #[test]
     fn osc_unterminated_at_end_stripped() {
-        assert_eq!(strip_terminal_escapes("keep\u{1b}]7501;state=working"), "keep");
+        assert_eq!(
+            strip_terminal_escapes("keep\u{1b}]7501;state=working"),
+            "keep"
+        );
     }
 
     #[test]

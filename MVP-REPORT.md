@@ -46,19 +46,20 @@ have no tests of their own; `tools.rs` is covered through `mcp.rs`.
 
 ## Tool-to-method map
 
-Source: `src/tools.rs`. Each function sends one herdr-core JSON-RPC method. Parameter names are
+Source: `src/tools.rs`. Each function sends the herdr-core JSON-RPC methods listed. Parameter names are
 as written in that file. `hc.openrpc.json` was checked against them in an earlier step (see
 `build-review.md`).
 
 | MCP tool | Function | herdr-core method | Parameters sent |
 |----------|----------|-------------------|-----------------|
 | `start_pane` | `start_pane` | `terminal.run` | `argv` or `line` (exactly one), `cwd`, `name` |
-| `send_input` | `send_input` | `terminal.send` | `terminal`, `text`. `force` is never sent. |
+| `send_input` | `send_input` | `terminal.get` (twice, to lock the pane), `terminal.send` | `terminal`, `text`. `force` is never sent. |
 | `read_output` | `read_output` | `terminal.read` | `terminal`, `lines` (0 to 10000) |
 | `get_status` | `get_status` | `terminal.get` | `terminal` |
 | `wait_status` | `wait_status` | `terminal.wait` | `terminal`, `timeout` (1 to 1800 s, default 30) |
 | `list_panes` | `list_panes` | `terminal.list` | `all` |
-| `interrupt_pane` | `interrupt_pane` | `terminal.interrupt` | `terminal`, `timeout` (optional, 1 to 60 s) |
+| `interrupt_pane` | `interrupt_pane` | `terminal.get` (twice, to lock the pane), `terminal.interrupt` | `terminal`, `timeout` (optional, 1 to 60 s) |
+| `answer_dialog` | `answer_dialog` | `terminal.get`, `terminal.read`, `terminal.keys` | `terminal`, `choice` (`allow_once` or `deny_once`) |
 
 `call()` in the same file dispatches by tool name. Input checks run before any socket call.
 
@@ -184,8 +185,16 @@ curl -s -i $URL -H "$AUTH" -H 'Content-Type: application/json' -d '{"jsonrpc":"2
 ## Known limits
 
 - **No multi-client authorization.** Any holder of the token controls every pane.
-- **No permission-dialog handling.** A pane blocked on a dialog reports `blocked`. The server does
-  not answer dialogs. `send_input` is refused in that state, and `force` is never sent.
+- **Permission dialogs: what `answer_dialog` guarantees.** `send_input` is refused while a pane is
+  blocked, and `force` is never sent. `answer_dialog` answers `allow_once` or `deny_once` only. It
+  holds a per-pane lock (keyed by address, so a name and its address share it) from its first
+  `terminal.get` through `enter`, so other Shepherd calls that type into the pane (`send_input`,
+  `interrupt_pane`, another `answer_dialog`) cannot run in between. Just before `enter` it calls
+  `terminal.get` again and sends nothing if the pane is no longer blocked with kind `permission` or
+  its turn number changed. herdr-core 0.1.19's `terminal.keys` has no status or turn condition
+  (its parameters are `terminal`, `keys`, `caller`), so the re-check and `enter` are two calls. A
+  person at the terminal or another herdr-core client on the same host can still change the dialog
+  between them. The design accepts this because Shepherd is meant to be the only socket client.
 - **ANSI-only output filter.** The filter removes CSI (including the 8-bit introducer U+009B), OSC
   (including OSC 7501), DCS, SOS, PM, APC, two-byte and nF escapes, and lone ESC. The 8-bit OSC
   introducer (U+009D) is not removed. TUI redraw noise is not removed. An unterminated OSC or DCS

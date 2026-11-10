@@ -51,7 +51,11 @@ fn handle(mut request: Request, state: &AppState) {
 fn route(request: &mut Request, state: &AppState, body: Result<Vec<u8>, u16>) -> Body {
     let host = header_value(request, "Host");
     if !host.as_deref().is_some_and(is_loopback_host) {
-        return json_reply(403, json!({"error": "forbidden", "message": "Host must be a loopback name"}), None);
+        return json_reply(
+            403,
+            json!({"error": "forbidden", "message": "Host must be a loopback name"}),
+            None,
+        );
     }
 
     let authorization = header_value(request, "Authorization");
@@ -63,19 +67,40 @@ fn route(request: &mut Request, state: &AppState, body: Result<Vec<u8>, u16>) ->
         );
     }
 
-    let path = request.url().split('?').next().unwrap_or_default().to_string();
+    let path = request
+        .url()
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .to_string();
     if path != MCP_PATH {
-        return json_reply(404, json!({"error": "not_found", "message": "use the /mcp path"}), None);
+        return json_reply(
+            404,
+            json!({"error": "not_found", "message": "use the /mcp path"}),
+            None,
+        );
     }
     if request.method().as_str() != "POST" {
-        return json_reply(405, json!({"error": "method_not_allowed", "message": "use POST"}), None);
+        return json_reply(
+            405,
+            json!({"error": "method_not_allowed", "message": "use POST"}),
+            None,
+        );
     }
 
     let body = match body {
         Ok(body) => body,
         Err(status) => {
-            let message = if status == 413 { "request body too large" } else { "cannot read request body" };
-            return json_reply(status, json!({"error": "bad_request", "message": message}), None);
+            let message = if status == 413 {
+                "request body too large"
+            } else {
+                "cannot read request body"
+            };
+            return json_reply(
+                status,
+                json!({"error": "bad_request", "message": message}),
+                None,
+            );
         }
     };
     let message: Value = match serde_json::from_slice(&body) {
@@ -183,11 +208,24 @@ mod tests {
 
     #[test]
     fn loopback_host_names() {
-        for ok in ["127.0.0.1", "127.0.0.1:8765", "localhost:8765", "[::1]:8765", "[::1]"] {
+        for ok in [
+            "127.0.0.1",
+            "127.0.0.1:8765",
+            "localhost:8765",
+            "[::1]:8765",
+            "[::1]",
+        ] {
             assert!(is_loopback_host(ok), "{ok} should be allowed");
         }
         // A bare IPv6 host is not valid in a Host header (it must be bracketed).
-        for bad in ["::1", "evil.example", "evil.example:8765", "192.0.2.10:8765", "[2001:db8::1]:8765", "0.0.0.0"] {
+        for bad in [
+            "::1",
+            "evil.example",
+            "evil.example:8765",
+            "192.0.2.10:8765",
+            "[2001:db8::1]:8765",
+            "0.0.0.0",
+        ] {
             assert!(!is_loopback_host(bad), "{bad} should be refused");
         }
     }
@@ -197,7 +235,10 @@ mod tests {
         assert!(bearer_matches(Some(&format!("Bearer {TOKEN}")), TOKEN));
         assert!(!bearer_matches(None, TOKEN));
         assert!(!bearer_matches(Some(TOKEN), TOKEN), "scheme is required");
-        assert!(!bearer_matches(Some("Bearer wrong-token-0000000000"), TOKEN));
+        assert!(!bearer_matches(
+            Some("Bearer wrong-token-0000000000"),
+            TOKEN
+        ));
         assert!(!bearer_matches(Some(&format!("Bearer {TOKEN}x")), TOKEN));
     }
 
@@ -210,9 +251,17 @@ mod tests {
     }
 
     /// Send one raw HTTP/1.1 request and return (status, body).
-    fn raw_request(port: u16, host: &str, auth: Option<&str>, method: &str, body: &str) -> (u16, String) {
+    fn raw_request(
+        port: u16,
+        host: &str,
+        auth: Option<&str>,
+        method: &str,
+        body: &str,
+    ) -> (u16, String) {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        let auth_line = auth.map(|a| format!("Authorization: {a}\r\n")).unwrap_or_default();
+        let auth_line = auth
+            .map(|a| format!("Authorization: {a}\r\n"))
+            .unwrap_or_default();
         let request = format!(
             "{method} /mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
              Accept: application/json, text/event-stream\r\nContent-Length: {}\r\n\
@@ -227,7 +276,11 @@ mod tests {
             .nth(1)
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let body = response.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+        let body = response
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
         (status, body)
     }
 
@@ -256,11 +309,17 @@ mod tests {
 
         let (status, body) = raw_request(port, &host, None, "POST", init);
         assert_eq!(status, 401, "no token");
-        assert!(body.contains("unauthorized"), "401 body must arrive intact: {body}");
+        assert!(
+            body.contains("unauthorized"),
+            "401 body must arrive intact: {body}"
+        );
 
         let (status, body) = raw_request(port, "evil.example", Some(&bearer), "POST", init);
         assert_eq!(status, 403, "non-loopback Host");
-        assert!(body.contains("forbidden"), "403 body must arrive intact: {body}");
+        assert!(
+            body.contains("forbidden"),
+            "403 body must arrive intact: {body}"
+        );
 
         let (status, body) = raw_request(port, &host, Some(&bearer), "POST", init);
         assert_eq!(status, 200, "authenticated initialize");

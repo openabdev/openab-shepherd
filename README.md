@@ -1,7 +1,7 @@
 # OpenAB Shepherd
 
 An MCP server that exposes herdr-core terminal panes as MCP tools. It listens on
-loopback only and requires a bearer token. Status: MVP. The 70 unit tests pass on the
+loopback only and requires a bearer token. Status: MVP. The 91 unit tests pass on the
 build host. Live herdr-core integration checks are NOT RUN. See `MVP-REPORT.md`.
 
 ## Language: Rust
@@ -32,7 +32,8 @@ later is a contained change.
 | `src/input.rs` | Input rules for text sent to panes |
 | `src/ansi.rs` | Escape-sequence filter for pane output |
 | `src/herdr.rs` | JSON-RPC 2.0 client over the herdr-core Unix socket |
-| `src/tools.rs` | The seven tools, their schemas, and the method each one calls |
+| `src/tools.rs` | The eight tools, their schemas, and the methods each one calls |
+| `src/dialog.rs` | Text parser for the kiro-cli permission dialog |
 | `src/mcp.rs` | MCP message handling |
 | `src/http.rs` | Loopback Host check, bearer auth, POST handling |
 | `src/testutil.rs` | Test-only helpers: scratch dirs, fake socket, git init |
@@ -87,26 +88,102 @@ HC_SOCKET=<hc-socket-path> \
 
 ## Tool-to-method map
 
-Each tool sends one herdr-core JSON-RPC method. The implementing function is in
-`src/tools.rs`. Parameter names are as written there. `hc.openrpc.json` was checked
+Most tools send one herdr-core JSON-RPC method. `wait_status` adds a `terminal.get`
+when the wait ends blocked, and `answer_dialog` uses three methods. `send_input`,
+`interrupt_pane`, and `answer_dialog` first resolve the pane with two `terminal.get`
+calls (see [Pane lock](#pane-lock)). The implementing
+function is in `src/tools.rs`. Parameter names are as written there. `hc.openrpc.json` was checked
 against them in an earlier step.
 
 | MCP tool | herdr-core method | Parameters sent | Result returned |
 |----------|-------------------|-----------------|-----------------|
 | `start_pane` | `terminal.run` | `argv` or `line` (exactly one), `cwd`, `name` | the terminal object, with `address` |
-| `send_input` | `terminal.send` | `terminal`, `text` (never `force`) | the send result (`turn`, `started`, `status`, `wait`) |
+| `send_input` | `terminal.get` (twice), `terminal.send` | `terminal`, `text` (never `force`, never `if`) | the send result (`turn`, `started`, `status`, `wait`); on refusal, an error with `kind` and `hint` |
 | `read_output` | `terminal.read` | `terminal`, `lines` (0 to 10000) | `text` (escapes stripped), `complete`, `how`, `why` |
 | `get_status` | `terminal.get` | `terminal` | `terminal`, `status`, `reported`, `state`, `turn`, `status_ms` |
-| `wait_status` | `terminal.wait` | `terminal`, `timeout` (1 to 1800 s, default 30) | `terminal`, `ended`, `reason`, `status`, `exit_code`, `turn` |
+| `wait_status` | `terminal.wait`, then `terminal.get` if it ended blocked | `terminal`, `timeout` (1 to 1800 s, default 30) | `terminal`, `outcome`, `turn_complete`, `ended`, `reason`, `status`, `kind`, `exit_code`, `turn`, and `status_now` when blocked |
 | `list_panes` | `terminal.list` | `all` | the list result (`terminals`, `hidden_finished`, `machines`) |
-| `interrupt_pane` | `terminal.interrupt` | `terminal`, `timeout` (1 to 60 s, optional) | `key`, `outcome` |
+| `interrupt_pane` | `terminal.get` (twice), `terminal.interrupt` | `terminal`, `timeout` (1 to 60 s, optional) | `key`, `outcome` |
+| `answer_dialog` | `terminal.get`, `terminal.read`, `terminal.keys` | `terminal`, `choice` (`allow_once` or `deny_once`) | `choice`, `selected`, `title`, `command`, `options`, `moves`, `keys_result` |
 
 Tool results carry `structuredContent` and a text copy. A tool failure returns
-`isError: true` with the reason. Unknown tool names are JSON-RPC errors.
+`isError: true` with the reason. `send_input` and `answer_dialog` failures also carry
+`structuredContent` with the details. Unknown tool names are JSON-RPC errors.
 
-`wait_status` returns `ended` as a boolean. A herdr-core reply without a boolean
-`ended` is reported as an error, never as idle. `ended: false` means the check-in
-timed out, and the pane is still running.
+### wait_status outcome
+
+Branch on `outcome`:
+
+| `outcome` | When | `turn_complete` |
+|-----------|------|-----------------|
+| `done` | `ended`, `reason: "status"`, `status: "done"` | true |
+| `exited` | `ended`, `reason: "exit"` | true |
+| `blocked` | `ended`, `reason: "status"`, `status: "blocked"`. `kind` comes from a follow-up `terminal.get` (`status.kind`), because `terminal.wait` does not report it | false |
+| `timeout` | `ended: false`, `reason: "timeout"`: a check-in, the pane is still running | false |
+| `other` | anything else (`idle`, `error`, a message to the caller, `not_started`). Read `status` and `reason` | false |
+
+`turn` advances on blocked too, so a changed `turn` is not a completion signal. A
+herdr-core reply without a boolean `ended` is reported as an error, never as idle.
+If the follow-up `terminal.get` shows the pane is no longer blocked, `kind` is null and
+`status_now` shows the current status.
+
+### send_input
+
+`idle` and `done` are both sendable (kiro-cli stays in `done` after a turn). The tool
+sends neither `force` nor `if`. While the program is blocked, herdr-core refuses and
+types nothing. The tool returns `isError: true` with `structuredContent` holding
+herdr-core's `kind` (`blocked`), `hint`, and `message`, plus `next`, which says to read
+the screen and use `answer_dialog`.
+
+### answer_dialog
+
+1. Take the pane lock, then `terminal.get`: refuse unless `status.state` is
+   `blocked` and `status.kind` is `permission`. Record the `turn` number.
+2. `terminal.read` (screen): parse the dialog. It needs a line ending in
+   `requires approval`, the next line as `<tool> → <command>`, then exactly four
+   options in this order: `Allow once`, `Deny once`, `Create allow rule...`,
+   `Create deny rule...`, with one `❯` cursor. Anything else is refused.
+3. Move the cursor with `up` or `down` (`terminal.keys`). `allow_once` from the default
+   cursor needs no moves; `deny_once` needs one `down`. After moving, the status must
+   still be `blocked`.
+4. Read the screen again, up to 5 times 200 ms apart, until the same dialog shows the
+   cursor on the target option. A different dialog stops it at once.
+5. `terminal.get` again: refuse unless the pane is still `blocked` with kind
+   `permission` and `turn` is unchanged. The refusal says which of the two changed.
+6. Only then press `enter`. The lock is released when the call returns.
+
+If a check fails, the tool sends nothing more, never sends `enter`, and returns
+`isError: true` with `structuredContent` holding `reason`, `seen` (the status or the
+last 40 screen lines), and `keys_sent`. The rule-creating options cannot be chosen.
+Follow a successful answer with `wait_status`.
+
+What this guarantees, and what it does not:
+
+- **Serialized against other Shepherd calls.** No other `answer_dialog`,
+  `send_input`, or `interrupt_pane` on the same pane can run between the first
+  `terminal.get` and `enter`. A second `answer_dialog` waits, then finds the pane no
+  longer blocked and is refused.
+- **Re-checked just before Enter.** Status, kind, and turn are read again after the
+  cursor is confirmed.
+- **No herdr-core guard on the key.** herdr-core 0.1.19's `terminal.keys` takes only
+  `terminal`, `keys`, and `caller`; it has no status or turn condition (only
+  `terminal.send` has `if`, limited to `idle` or `working`). The re-check and the
+  `enter` are therefore two calls. A person at the terminal or another herdr-core
+  client on the same host can still change the dialog between them, and `enter`
+  would then select whatever is under the cursor. The design accepts this because
+  Shepherd is meant to be the only client of the socket.
+
+### Pane lock
+
+`send_input`, `interrupt_pane`, and `answer_dialog` hold a per-pane lock for their
+whole sequence. The lock is keyed by the pane's address (`t7`), so a name and its
+address share one lock. To find the address, the tool calls `terminal.get` before
+taking the lock, then calls it again inside the lock and refuses (sending nothing) if
+the name now resolves to a different address. `start_pane` takes no lock:
+`terminal.run` refuses a name that is taken, so it never types into an existing pane.
+Read-only tools (`read_output`, `get_status`, `wait_status`, `list_panes`) take no
+lock. A call waiting for the lock waits as long as the holder runs (an
+`interrupt_pane` holds it for up to its timeout).
 
 ## Input rules
 
@@ -171,15 +248,26 @@ test there, then copy `target/release/openab-shepherd` back.
 
 - **No multi-client authorization.** Any holder of the token has full control of every
   pane.
-- **No permission-dialog handling.** A pane blocked on a dialog reports `blocked`.
-  The server does not answer dialogs. `send_input` is refused in that state, and
-  `force` is never sent.
+- **Permission dialogs: text parsing, one layout.** `answer_dialog` parses the dialog
+  from screen text. It is tested only against kiro-cli 3.1.0 (V3 engine) shell
+  permission dialogs, using the screen captured by the probe. Other tools (fs_write,
+  MCP), other programs, other versions, and `kind` values `question` or `auth` are
+  untested or refused. `force` is never sent.
+- **Residual race on Enter.** `answer_dialog` is serialized against other Shepherd
+  calls and re-checks status and turn just before `enter`, but herdr-core has no
+  conditional key press. A person at the terminal or another herdr-core client can
+  still move or replace the dialog between that re-check and `enter`.
+- **Auto-allowing agents never block.** User Kiro agents whose `allowedTools` include
+  `@builtin` (the default agent does) run builtin tools without a dialog, so the pane
+  never reports `blocked` and `answer_dialog` has nothing to answer. `--trust-tools=`
+  does not override this on V3. Testing the dialog path needs an agent that trusts no
+  tools.
 - **ANSI-only output filter.** TUI redraw noise is not removed. Screen captures can
   contain repeated or partial frames. The 8-bit CSI introducer (U+009B) is removed,
   but the 8-bit OSC introducer (U+009D) is not.
 - **Done versus idle.** kiro-cli 3.1.0 stays in `done` after a turn, not `idle`
-  (measured by the OSC 7501 probe). A `wait_status` on such a pane ends with `done`,
-  so callers must read `status`. A program that never reports status counts as
+  (measured by the OSC 7501 probe). A `wait_status` on such a pane ends with
+  `outcome: "done"`; the next prompt goes `done` → `working`. A program that never reports status counts as
   working until it exits, so `wait_status` on it returns only on exit or timeout.
 - **Trimmed argv.** Argument text is trimmed by the input rules, so leading and
   trailing spaces inside an `argv` element are lost.
