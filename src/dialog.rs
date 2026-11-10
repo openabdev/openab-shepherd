@@ -1,6 +1,6 @@
 //! Text parser for the kiro-cli permission dialog.
 //!
-//! herdr-core reports only `blocked`/`permission`; the dialog itself exists only
+//! The backend reports only `blocked`/`permission`; the dialog itself exists only
 //! as screen text. The layout below was measured on kiro-cli 3.1.0 (V3 engine)
 //! for a shell tool call. Anything else is refused rather than guessed.
 //!

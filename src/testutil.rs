@@ -1,17 +1,18 @@
-//! Helpers shared by unit tests: scratch directories, a fake herdr-core socket,
-//! and a git repository initializer. Compiled only for `cargo test`.
+//! Helpers shared by unit tests: scratch directories, a git repository
+//! initializer, and a fake terminal backend. Compiled only for `cargo test`.
+//! The fake herdr-core socket is in `hc/fake.rs`.
 
-use crate::dialog::fixtures::{dialog_on_allow, dialog_on_deny};
-use serde_json::{json, Value};
+use crate::backend::{
+    BackendError, Capabilities, ErrorKind, InputGuard, InterruptResult, Key, KeysResult,
+    ProgramStatus, RunSpec, ScreenText, SendResult, State, TerminalBackend, TerminalInfo,
+    TerminalList, TerminalRef, WaitResult,
+};
+use crate::panelock::PaneLocks;
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -49,283 +50,222 @@ pub fn git_init(dir: &Path) {
     assert!(status.success(), "git init failed");
 }
 
-/// Bind a fake herdr-core socket, accept one connection, and read one request line.
-/// `respond` writes whatever reply the test needs. The returned handle yields the
-/// raw request line (with its newline) and its parsed JSON.
-pub fn serve_once<F>(socket: &Path, respond: F) -> JoinHandle<(String, Value)>
-where
-    F: FnOnce(&mut UnixStream, &Value) + Send + 'static,
-{
-    // Bind before returning so the client cannot race the listener.
-    let listener = UnixListener::bind(socket).expect("bind fake herdr-core socket");
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-        let mut line = String::new();
-        reader.read_line(&mut line).expect("read request line");
-        let request: Value = serde_json::from_str(&line).expect("request is JSON");
-        respond(&mut stream, &request);
-        (line, request)
-    })
+/// What a [`FakeBackend`] knows and saw.
+#[derive(Debug, Default)]
+pub struct FakeState {
+    pub panes: Vec<TerminalInfo>,
+    /// Each trait call, by method name, in order.
+    pub calls: Vec<&'static str>,
+    /// Text passed to `send`, and whether the pane lock was held for the pane
+    /// at that moment.
+    pub sent: Vec<(String, bool)>,
+    /// The tools' pane locks, so `send` can check it runs under one.
+    pub locks: Option<Arc<PaneLocks>>,
+    /// When set, the Nth `get` (1-based, counting every get) first turns the
+    /// pane it finds blocked with kind permission.
+    pub block_on_get: Option<usize>,
+    /// What `read` returns. `None` makes `read` unsupported.
+    pub screen: Option<String>,
+    /// Keys passed to `keys`, one entry per call.
+    pub keys: Vec<Vec<Key>>,
 }
 
-/// A fake herdr-core socket that answers a sequence of calls, one per connection.
-pub struct ScriptedHerdr {
-    stop: Arc<AtomicBool>,
-    handle: JoinHandle<Vec<Value>>,
+/// An in-memory backend. `get`, `send`, and (with [`FakeState::screen`] set)
+/// `read` and `keys` do real work; every other call is recorded and refused as
+/// unsupported. With `conditional_input`, `send` refuses a blocked pane itself,
+/// as a backend with an atomic guard would; with `conditional_keys`, `keys`
+/// enforces its guard the same way.
+#[derive(Clone)]
+pub struct FakeBackend {
+    pub caps: Capabilities,
+    pub state: Arc<Mutex<FakeState>>,
 }
 
-impl ScriptedHerdr {
-    /// Stop accepting and return every request received, in order. Call it after
-    /// the client code returns: each client call blocks until its reply, so every
-    /// connection has been handled by then.
-    pub fn finish(self) -> Vec<Value> {
-        self.stop.store(true, Ordering::SeqCst);
-        self.handle.join().expect("scripted server thread")
+impl FakeBackend {
+    pub fn new(conditional_input: bool) -> Self {
+        Self {
+            caps: Capabilities {
+                conditional_input,
+                conditional_keys: false,
+                client_command: true,
+                client_cwd: true,
+                screen_text: true,
+            },
+            state: Arc::new(Mutex::new(FakeState::default())),
+        }
+    }
+
+    /// Add a live pane `name` (id `id-<name>`) with this status.
+    pub fn add_pane(&self, name: &str, state: State, kind: Option<&str>) {
+        self.state.lock().unwrap().panes.push(TerminalInfo {
+            id: format!("id-{name}"),
+            name: Some(name.to_string()),
+            live: true,
+            exit_code: None,
+            status: Some(ProgramStatus {
+                state,
+                kind: kind.map(str::to_string),
+            }),
+            reported: true,
+            turn: Some(1),
+            status_ms: None,
+            argv: None,
+            cwd: None,
+        });
+    }
+
+    pub fn calls(&self) -> Vec<&'static str> {
+        self.state.lock().unwrap().calls.clone()
+    }
+
+    fn record(&self, call: &'static str) {
+        self.state.lock().unwrap().calls.push(call);
+    }
+
+    fn find(&self, t: &TerminalRef) -> Result<TerminalInfo, BackendError> {
+        let state = self.state.lock().unwrap();
+        state
+            .panes
+            .iter()
+            .find(|p| p.id == t.as_str() || p.name.as_deref() == Some(t.as_str()))
+            .cloned()
+            .ok_or_else(|| BackendError::new(ErrorKind::NotFound, "fake: no such pane"))
+    }
+
+    fn unsupported<T>(&self, call: &'static str) -> Result<T, BackendError> {
+        self.record(call);
+        Err(BackendError::new(
+            ErrorKind::Unsupported(call.to_string()),
+            "fake: not implemented",
+        ))
     }
 }
 
-/// Bind a fake herdr-core socket that answers the Nth call with `script[N]`.
-/// Each script entry is `{"result": ...}` or `{"error": ...}`; the server adds
-/// `jsonrpc` and the request id. A call past the end of the script gets an
-/// error with kind `unexpected_call`.
-pub fn serve_script(socket: &Path, script: Vec<Value>) -> ScriptedHerdr {
-    let listener = UnixListener::bind(socket).expect("bind fake herdr-core socket");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_flag = Arc::clone(&stop);
-    let handle = thread::spawn(move || {
-        let mut script = script.into_iter();
-        let mut requests = Vec::new();
-        loop {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).expect("blocking stream");
-                    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-                    let mut line = String::new();
-                    reader.read_line(&mut line).expect("read request line");
-                    let request: Value = serde_json::from_str(&line).expect("request is JSON");
-                    let mut payload = script.next().unwrap_or_else(|| {
-                        json!({"error": {"code": -32000, "message": "unexpected call",
-                                         "data": {"kind": "unexpected_call"}}})
-                    });
-                    payload["jsonrpc"] = json!("2.0");
-                    payload["id"] = request["id"].clone();
-                    reply(&mut stream, &payload);
-                    requests.push(request);
-                }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    if stop_flag.load(Ordering::SeqCst) {
-                        return requests;
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(err) => panic!("accept: {err}"),
+impl TerminalBackend for FakeBackend {
+    fn capabilities(&self) -> Capabilities {
+        self.caps
+    }
+
+    fn run(&self, _spec: &RunSpec) -> Result<TerminalInfo, BackendError> {
+        self.unsupported("run")
+    }
+
+    fn get(&self, t: &TerminalRef) -> Result<TerminalInfo, BackendError> {
+        self.record("get");
+        let mut state = self.state.lock().unwrap();
+        let gets = state.calls.iter().filter(|call| **call == "get").count();
+        if state.block_on_get == Some(gets) {
+            if let Some(pane) = state
+                .panes
+                .iter_mut()
+                .find(|p| p.id == t.as_str() || p.name.as_deref() == Some(t.as_str()))
+            {
+                pane.status = Some(ProgramStatus {
+                    state: State::Blocked,
+                    kind: Some("permission".to_string()),
+                });
             }
         }
-    });
-    ScriptedHerdr { stop, handle }
-}
-
-/// Write one reply line.
-pub fn reply(stream: &mut UnixStream, payload: &Value) {
-    writeln!(stream, "{payload}").expect("write reply");
-}
-
-/// The one pane a [`PaneHerdr`] serves: address `t8`, name `work`.
-pub const PANE_ADDRESS: &str = "t8";
-pub const PANE_NAME: &str = "work";
-
-/// State of the fake pane. It starts blocked on the probe's permission dialog
-/// with the cursor on Allow once.
-#[derive(Debug)]
-pub struct PaneModel {
-    pub blocked: bool,
-    pub turn: u64,
-    pub cursor: usize,
-    /// Every request, in the order the fake received it.
-    pub log: Vec<Value>,
-    /// The cursor position at each Enter pressed while blocked.
-    pub selected: Vec<usize>,
-    reads: usize,
-}
-
-/// A fake herdr-core with one pane that answers each connection on its own
-/// thread, so concurrent client calls really overlap. It can pause before
-/// replying to the Nth terminal.read, which lets a test fix the order of two
-/// calls without sleeping.
-pub struct PaneHerdr {
-    stop: Arc<AtomicBool>,
-    handle: JoinHandle<()>,
-    model: Arc<Mutex<PaneModel>>,
-    paused: Receiver<()>,
-    release: Sender<()>,
-}
-
-impl PaneHerdr {
-    /// Wait until the paused read has arrived (its reply is held back).
-    pub fn wait_paused(&self) {
-        self.paused
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the paused terminal.read never arrived");
+        drop(state);
+        self.find(t)
     }
 
-    /// Let the paused read reply.
-    pub fn release(&self) {
-        self.release.send(()).expect("release the paused read");
+    fn list(&self, _all: bool) -> Result<TerminalList, BackendError> {
+        self.unsupported("list")
     }
 
-    /// Stop the fake and return the final model. Call it after every client
-    /// call has returned.
-    pub fn finish(self) -> PaneModel {
-        self.stop.store(true, Ordering::SeqCst);
-        self.handle.join().expect("pane server thread");
-        let model = Arc::try_unwrap(self.model).expect("handlers finished");
-        model.into_inner().expect("model lock")
+    fn read(&self, t: &TerminalRef, _lines: u32) -> Result<ScreenText, BackendError> {
+        let Some(text) = self.state.lock().unwrap().screen.clone() else {
+            return self.unsupported("read");
+        };
+        self.record("read");
+        self.find(t)?;
+        Ok(ScreenText {
+            text,
+            complete: Some(true),
+            source: None,
+            limit: None,
+        })
     }
-}
 
-/// Serve the fake pane on `socket`. `pause_at_read` is the 1-based index of the
-/// terminal.read to hold until [`PaneHerdr::release`].
-pub fn serve_pane(socket: &Path, pause_at_read: Option<usize>) -> PaneHerdr {
-    let listener = UnixListener::bind(socket).expect("bind fake herdr-core socket");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
-    let model = Arc::new(Mutex::new(PaneModel {
-        blocked: true,
-        turn: 1,
-        cursor: 0,
-        log: Vec::new(),
-        selected: Vec::new(),
-        reads: 0,
-    }));
-    let (paused_tx, paused) = mpsc::channel();
-    let (release, release_rx) = mpsc::channel::<()>();
-    let release_rx = Arc::new(Mutex::new(release_rx));
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_flag = Arc::clone(&stop);
-    let shared = Arc::clone(&model);
-    let handle = thread::spawn(move || {
-        let mut handlers = Vec::new();
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let model = Arc::clone(&shared);
-                    let paused_tx = paused_tx.clone();
-                    let release_rx = Arc::clone(&release_rx);
-                    handlers.push(thread::spawn(move || {
-                        pane_connection(stream, &model, pause_at_read, &paused_tx, &release_rx)
-                    }));
-                }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    if stop_flag.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(err) => panic!("accept: {err}"),
+    fn send(
+        &self,
+        t: &TerminalRef,
+        text: &str,
+        guard: &InputGuard,
+    ) -> Result<SendResult, BackendError> {
+        self.record("send");
+        let pane = self.find(t)?;
+        let blocked = pane.status.as_ref().filter(|s| s.state == State::Blocked);
+        if self.caps.conditional_input && guard.refuse_when_blocked {
+            if let Some(status) = blocked {
+                return Err(BackendError::new(
+                    ErrorKind::Blocked {
+                        kind: status.kind.clone(),
+                    },
+                    "fake: refused while blocked",
+                ));
             }
         }
-        for handler in handlers {
-            handler.join().expect("pane connection thread");
-        }
-    });
-    PaneHerdr {
-        stop,
-        handle,
-        model,
-        paused,
-        release,
+        let mut state = self.state.lock().unwrap();
+        let held = state
+            .locks
+            .as_ref()
+            .is_some_and(|locks| locks.is_held(&pane.id));
+        state.sent.push((text.to_string(), held));
+        Ok(SendResult {
+            turn: pane.turn,
+            started: Some(true),
+            status: pane.status.map(|s| s.state),
+        })
     }
-}
 
-fn pane_connection(
-    mut stream: UnixStream,
-    model: &Mutex<PaneModel>,
-    pause_at_read: Option<usize>,
-    paused_tx: &Sender<()>,
-    release_rx: &Mutex<Receiver<()>>,
-) {
-    stream.set_nonblocking(false).expect("blocking stream");
-    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read request line");
-    let request: Value = serde_json::from_str(&line).expect("request is JSON");
-    let (mut payload, pause) = {
-        let mut pane = model.lock().expect("model lock");
-        pane.log.push(request.clone());
-        let mut pause = false;
-        if request["method"] == "terminal.read" {
-            pane.reads += 1;
-            pause = Some(pane.reads) == pause_at_read;
+    fn keys(
+        &self,
+        t: &TerminalRef,
+        keys: &[Key],
+        guard: &InputGuard,
+    ) -> Result<KeysResult, BackendError> {
+        if self.state.lock().unwrap().screen.is_none() {
+            return self.unsupported("keys");
         }
-        (pane_reply(&mut pane, &request), pause)
-    };
-    if pause {
-        paused_tx.send(()).expect("signal pause");
-        release_rx
-            .lock()
-            .expect("release lock")
-            .recv()
-            .expect("wait for release");
-    }
-    payload["jsonrpc"] = json!("2.0");
-    payload["id"] = request["id"].clone();
-    reply(&mut stream, &payload);
-}
-
-fn pane_reply(pane: &mut PaneModel, request: &Value) -> Value {
-    let params = &request["params"];
-    let terminal = params["terminal"].as_str().unwrap_or_default();
-    if terminal != PANE_ADDRESS && terminal != PANE_NAME {
-        return json!({"error": {"code": -32000, "message": "no such terminal",
-                                "data": {"kind": "not_found"}}});
-    }
-    let status_word = if pane.blocked { "blocked" } else { "working" };
-    match request["method"].as_str().unwrap_or_default() {
-        "terminal.get" => {
-            let status = if pane.blocked {
-                json!({"app": "kiro-cli", "kind": "permission", "state": "blocked"})
-            } else {
-                json!({"app": "kiro-cli", "state": "working"})
-            };
-            json!({"result": {"address": PANE_ADDRESS, "name": PANE_NAME, "state": "live",
-                              "turn": pane.turn, "reported": true, "status": status}})
-        }
-        "terminal.read" => {
-            let text = match (pane.blocked, pane.cursor) {
-                (false, _) => "working".to_string(),
-                (true, 1) => dialog_on_deny(),
-                (true, _) => dialog_on_allow(),
-            };
-            json!({"result": {"text": text, "complete": false, "how": "screen"}})
-        }
-        "terminal.keys" => {
-            for key in params["keys"].as_array().into_iter().flatten() {
-                match key.as_str() {
-                    Some("down") => pane.cursor = (pane.cursor + 1).min(3),
-                    Some("up") => pane.cursor = pane.cursor.saturating_sub(1),
-                    Some("enter") if pane.blocked => {
-                        pane.selected.push(pane.cursor);
-                        pane.blocked = false;
-                    }
-                    _ => {}
-                }
+        self.record("keys");
+        let pane = self.find(t)?;
+        if self.caps.conditional_keys {
+            let state = pane.status.as_ref().map(|s| &s.state);
+            let kind = pane.status.as_ref().and_then(|s| s.kind.as_deref());
+            let holds = guard
+                .if_state
+                .as_ref()
+                .is_none_or(|want| state == Some(want))
+                && guard
+                    .if_kind
+                    .as_deref()
+                    .is_none_or(|want| kind == Some(want))
+                && guard.expect_turn.is_none_or(|want| pane.turn == Some(want));
+            if !holds {
+                return Err(BackendError::new(
+                    ErrorKind::StatusMismatch,
+                    "fake: key guard did not hold",
+                ));
             }
-            let status_word = if pane.blocked { "blocked" } else { "working" };
-            json!({"result": {"status": status_word, "turn": pane.turn}})
         }
-        "terminal.send" if pane.blocked => {
-            json!({"error": {"code": -32000, "message": "t8 is blocked (permission)",
-                             "data": {"kind": "blocked"}}})
-        }
-        "terminal.send" => {
-            json!({"result": {"started": true, "status": status_word, "turn": pane.turn}})
-        }
-        _ => json!({"error": {"code": -32000, "message": "unexpected call",
-                              "data": {"kind": "unexpected_call"}}}),
+        self.state.lock().unwrap().keys.push(keys.to_vec());
+        Ok(KeysResult {
+            status: pane.status.map(|s| s.state),
+            turn: pane.turn,
+        })
+    }
+
+    fn wait(&self, _t: &TerminalRef, _timeout: Duration) -> Result<WaitResult, BackendError> {
+        self.unsupported("wait")
+    }
+
+    fn interrupt(
+        &self,
+        _t: &TerminalRef,
+        _timeout: Option<Duration>,
+    ) -> Result<InterruptResult, BackendError> {
+        self.unsupported("interrupt")
     }
 }

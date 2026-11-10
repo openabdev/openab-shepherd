@@ -1,21 +1,29 @@
-//! The eight MCP tools and the herdr-core methods each one calls.
+//! The eight MCP tools. They talk only to [`TerminalBackend`]; the safety rules
+//! (input validation, the pane lock, refusing to type into a blocked pane, and
+//! answer_dialog's checks) are enforced here, whatever the backend.
 //!
-//! Tool -> herdr-core method:
-//!   start_pane      -> terminal.run
-//!   send_input      -> terminal.get (x2, see lock_pane), terminal.send (never `force` or `if`)
-//!   read_output     -> terminal.read
-//!   get_status      -> terminal.get
-//!   wait_status     -> terminal.wait, then terminal.get when it ends blocked
-//!   list_panes      -> terminal.list
-//!   interrupt_pane  -> terminal.get (x2, see lock_pane), terminal.interrupt
-//!   answer_dialog   -> terminal.get, terminal.read, terminal.keys
+//! Tool -> backend calls. Every tool that takes `terminal` resolves it first:
+//! a `get` by name that must return a pane with exactly that name (see
+//! `resolve`). Later calls use the resolved pane's id.
+//!   start_pane      -> run
+//!   send_input      -> get (x2, see lock_pane), send
+//!   read_output     -> get, read
+//!   get_status      -> get
+//!   wait_status     -> get, wait, then get when it ends blocked without a kind
+//!   list_panes      -> list
+//!   interrupt_pane  -> get (x2, see lock_pane), interrupt
+//!   answer_dialog   -> get, read, keys
 
 use crate::ansi::strip_terminal_escapes;
+use crate::backend::{
+    dialog_kind, status_json, BackendError, ErrorKind, InputGuard, Key, KeysResult, RunSpec, State,
+    TerminalBackend, TerminalInfo, TerminalRef, WaitReason,
+};
 use crate::dialog::{self, Choice};
-use crate::herdr::{HerdrClient, HerdrError, DEFAULT_TIMEOUT, WAIT_SOCKET_SLACK};
 use crate::input::{validate_input, validate_name};
-use crate::panelock::PaneGuard;
+use crate::panelock::{PaneGuard, PaneLocks};
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -34,10 +42,9 @@ pub const WAIT_MIN_SECONDS: f64 = 1.0;
 pub const WAIT_MAX_SECONDS: f64 = 1800.0;
 pub const WAIT_DEFAULT_SECONDS: f64 = 30.0;
 pub const INTERRUPT_MAX_SECONDS: f64 = 60.0;
-const INTERRUPT_DEFAULT_SOCKET_SECONDS: f64 = 10.0;
 /// answer_dialog re-reads the screen up to this many times, waiting for the
-/// cursor to land on the target after the moves (herdr-core delivers keys after
-/// a quiet period, and the program redraws after that).
+/// cursor to land on the target after the moves (the backend may deliver keys
+/// after a quiet period, and the program redraws after that).
 pub const CONFIRM_READS: usize = 5;
 pub const CONFIRM_INTERVAL: Duration = Duration::from_millis(200);
 /// kiro-cli 3.1.0 (V3) reports OSC 7501 blocked/permission before it has drawn
@@ -50,20 +57,78 @@ pub const RENDER_READS: usize =
     (RENDER_WAIT.as_millis() / RENDER_POLL_INTERVAL.as_millis()) as usize + 1;
 /// Lines of screen text returned with an answer_dialog refusal.
 const SEEN_TAIL_LINES: usize = 40;
+/// What a caller does after typing was refused because the pane is blocked.
+const BLOCKED_NEXT: &str = "read_output, then answer_dialog; nothing was typed";
 
 pub type Args = Map<String, Value>;
 
-/// A tool failure: the text shown to the MCP client, plus optional structured
-/// data (returned as `structuredContent` alongside `isError: true`).
+/// The tools' shared state: one backend, and the per-pane locks. Clones share
+/// both.
+#[derive(Clone)]
+pub struct Shepherd {
+    backend: Arc<dyn TerminalBackend>,
+    locks: Arc<PaneLocks>,
+}
+
+impl Shepherd {
+    pub fn new(backend: impl TerminalBackend + 'static) -> Self {
+        Self {
+            backend: Arc::new(backend),
+            locks: Arc::new(PaneLocks::default()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn pane_locks(&self) -> &Arc<PaneLocks> {
+        &self.locks
+    }
+}
+
+/// A tool failure: the text shown to the MCP client, and structured data
+/// (returned as `structuredContent` alongside `isError: true`). `data.error` is
+/// Shepherd's error code and `data.message` repeats the text without it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolError {
     pub text: String,
-    pub data: Option<Value>,
+    pub data: Value,
 }
 
+impl ToolError {
+    fn new(code: &str, message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            text: format!("{code}: {message}"),
+            data: json!({"error": code, "message": message}),
+        }
+    }
+
+    fn with(mut self, key: &str, value: impl Into<Value>) -> Self {
+        self.data[key] = value.into();
+        self
+    }
+
+    /// Put `prefix` in front of the message.
+    fn context(self, prefix: &str) -> Self {
+        let code = self.data["error"].as_str().unwrap_or_default().to_string();
+        let message = format!(
+            "{prefix}: {}",
+            self.data["message"].as_str().unwrap_or_default()
+        );
+        Self {
+            text: format!("{code}: {message}"),
+            data: {
+                let mut data = self.data;
+                data["message"] = json!(message);
+                data
+            },
+        }
+    }
+}
+
+/// An argument that fails validation.
 impl From<String> for ToolError {
     fn from(text: String) -> Self {
-        Self { text, data: None }
+        Self::new("invalid_input", text)
     }
 }
 
@@ -76,24 +141,24 @@ pub fn definitions() -> Value {
     json!([
         {
             "name": "start_pane",
-            "description": "Start a program in a new herdr-core pane. Give exactly one of argv (a program and its arguments) or line (a shell line run by sh -c). Returns the terminal object, including its address. Input is trimmed and limited to 4096 bytes per field. Control characters (except TAB) are refused, not removed.",
+            "description": "Start a program in a new pane. Give exactly one of argv (a program and its arguments) or line (a shell line run by sh -c). Later calls address the pane by its name: give one, or Shepherd picks one (pane-<hex>) and returns it. Returns the pane (name, live, status, reported, turn, status_ms, exit_code, argv, cwd). Input is trimmed and limited to 4096 bytes per field. Control characters (except TAB) are refused, not removed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "argv": {"type": "array", "items": {"type": "string"}, "description": "Program and arguments; non-empty."},
                     "line": {"type": "string", "description": "Shell line run by sh -c."},
                     "cwd": {"type": "string", "description": "Working directory."},
-                    "name": {"type": "string", "description": "Terminal name: 1-32 of a-z, 0-9, '-', '_', '.'."}
+                    "name": {"type": "string", "description": "Pane name: 1-32 of a-z, 0-9, '-', '_', '.'. Optional; Shepherd picks one when it is missing."}
                 }
             }
         },
         {
             "name": "send_input",
-            "description": "Type text into a pane and press Enter. Sendable when the pane is idle or done (kiro-cli stays in done after a turn). Input is trimmed and limited to 4096 bytes. Control characters (except TAB) are refused, not removed. While the program is blocked on a dialog, herdr-core refuses and nothing is typed: the error carries kind \"blocked\" and herdr-core's hint. Read the screen, then use answer_dialog. This tool never forces input.",
+            "description": "Type text into a pane and press Enter. Sendable when the pane is idle or done (kiro-cli stays in done after a turn). Input is trimmed and limited to 4096 bytes. Control characters (except TAB) are refused, not removed. While the program is blocked on a dialog, nothing is typed and the error code is pane_blocked, with kind saying which dialog (for example permission). Read the screen, then use answer_dialog. This tool never forces input.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "terminal": {"type": "string", "description": "Pane address (for example t7) or name."},
+                    "terminal": {"type": "string", "description": "Pane name, as start_pane or list_panes returned it."},
                     "text": {"type": "string"}
                 },
                 "required": ["terminal", "text"]
@@ -101,7 +166,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "read_output",
-            "description": "Read a pane's screen (lines=0) or its last N lines of history. ANSI CSI and OSC escape sequences are removed from text. TUI redraw noise is not removed.",
+            "description": "Read a pane's screen (lines=0) or its last N lines of history. ANSI CSI and OSC escape sequences are removed from text. TUI redraw noise is not removed. Returns text, complete, source (screen, history, stitched, or other), and reason (why only the screen was read: blocked, other, or null).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -113,7 +178,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "get_status",
-            "description": "Return a pane's status (idle, working, done, blocked, error, or null) and its reported flag. reported is false when the program never sent an OSC 7501 status.",
+            "description": "Return a pane: its status ({state, kind} with state idle, working, done, blocked, error, or other; null when it never reported one), its reported flag, live, turn, status_ms, and exit_code. reported is false when the program never sent an OSC 7501 status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"terminal": {"type": "string"}},
@@ -122,7 +187,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "wait_status",
-            "description": "Wait until a pane stops working, or check in after timeout seconds. Branch on outcome: done (the turn finished), blocked (waiting on a dialog; kind says which, for example permission), timeout (a check-in: still running), exited (the program ended), or other (any other status word or reason; read status). turn_complete is true only for done and exited; a blocked pane has not completed its turn even though its turn number advanced. A program that never reports status counts as working until it exits.",
+            "description": "Wait until a pane stops working, or check in after timeout seconds. Branch on outcome: done (the turn finished), blocked (waiting on a dialog; kind says which, for example permission), timeout (a check-in: still running), exited (the program ended), or other (any other status or reason; read status). turn_complete is true only for done and exited; a blocked pane has not completed its turn even though its turn number advanced. A program that never reports status counts as working until it exits.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -134,7 +199,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "list_panes",
-            "description": "List herdr-core panes. all=true includes finished panes.",
+            "description": "List panes, each in the same shape start_pane returns. all=true includes finished panes; hidden_finished counts the ones left out.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"all": {"type": "boolean", "default": false}}
@@ -142,7 +207,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "interrupt_pane",
-            "description": "Send the stop key to a pane (esc for programs that report status, else ctrl+c) and report the outcome: stopped, exited, still_working, or unknown. herdr-core does not escalate.",
+            "description": "Send the stop key to a pane and report which key the backend chose (key: esc, ctrl+c, or other) and the outcome: stopped, exited, still_working, unknown, or other. It does not escalate.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -154,7 +219,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "answer_dialog",
-            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another herdr-core client can still act between the last check and Enter, because herdr-core has no conditional key press. The dialog is parsed from screen text; tested only on kiro-cli 3.1.0 (V3) shell permission dialogs. Follow with wait_status.",
+            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter, because the current backend has no conditional key press. The dialog is parsed from screen text; tested only on kiro-cli 3.1.0 (V3) shell permission dialogs. Follow with wait_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -168,133 +233,206 @@ pub fn definitions() -> Value {
 }
 
 /// Run one tool. `Err` carries what is shown to the MCP client with `isError`.
-pub fn call(client: &HerdrClient, name: &str, args: &Args) -> Result<Value, ToolError> {
+pub fn call(sh: &Shepherd, name: &str, args: &Args) -> Result<Value, ToolError> {
     match name {
-        "start_pane" => start_pane(client, args).map_err(ToolError::from),
-        "send_input" => send_input(client, args),
-        "read_output" => read_output(client, args).map_err(ToolError::from),
-        "get_status" => get_status(client, args).map_err(ToolError::from),
-        "wait_status" => wait_status(client, args).map_err(ToolError::from),
-        "list_panes" => list_panes(client, args).map_err(ToolError::from),
-        "interrupt_pane" => interrupt_pane(client, args),
-        "answer_dialog" => answer_dialog(client, args),
+        "start_pane" => start_pane(sh, args),
+        "send_input" => send_input(sh, args),
+        "read_output" => read_output(sh, args),
+        "get_status" => get_status(sh, args),
+        "wait_status" => wait_status(sh, args),
+        "list_panes" => list_panes(sh, args),
+        "interrupt_pane" => interrupt_pane(sh, args),
+        "answer_dialog" => answer_dialog(sh, args),
         other => Err(format!("unknown tool: {other}").into()),
     }
 }
 
-fn start_pane(client: &HerdrClient, args: &Args) -> Result<Value, String> {
+fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     let argv_items = match args.get("argv") {
         None | Some(Value::Null) => None,
         Some(Value::Array(items)) => Some(items),
-        Some(_) => return Err("argv must be a list of strings".to_string()),
+        Some(_) => return Err("argv must be a list of strings".to_string().into()),
     };
     let line = optional_str(args, "line")?;
     let has_argv = argv_items.is_some_and(|items| !items.is_empty());
     if has_argv == line.is_some() {
-        return Err("give exactly one of argv (non-empty list) or line".to_string());
+        return Err("give exactly one of argv (non-empty list) or line"
+            .to_string()
+            .into());
     }
 
     // Same input rules as send_input, applied to every string that reaches the pane.
-    let mut params = Args::new();
+    let mut spec = RunSpec::default();
     if let Some(items) = argv_items.filter(|items| !items.is_empty()) {
         let mut argv = Vec::with_capacity(items.len());
         for item in items {
             let text = item
                 .as_str()
                 .ok_or_else(|| "argv must be a list of strings".to_string())?;
-            let cleaned = validate_input(text).map_err(|err| format!("argv: {err}"))?;
-            argv.push(Value::String(cleaned));
+            argv.push(validate_input(text).map_err(|err| format!("argv: {err}"))?);
         }
-        params.insert("argv".to_string(), Value::Array(argv));
+        spec.argv = Some(argv);
     }
     if let Some(line) = line {
-        let cleaned = validate_input(line).map_err(|err| format!("line: {err}"))?;
-        params.insert("line".to_string(), Value::String(cleaned));
+        spec.line = Some(validate_input(line).map_err(|err| format!("line: {err}"))?);
     }
     if let Some(cwd) = optional_str(args, "cwd")? {
-        let cleaned = validate_input(cwd).map_err(|err| format!("cwd: {err}"))?;
-        params.insert("cwd".to_string(), Value::String(cleaned));
+        spec.cwd = Some(validate_input(cwd).map_err(|err| format!("cwd: {err}"))?);
     }
-    if let Some(name) = optional_str(args, "name")? {
-        let cleaned = validate_name(name).map_err(|err| format!("name: {err}"))?;
-        params.insert("name".to_string(), Value::String(cleaned));
+    // Every pane Shepherd starts has a name: callers address panes by name.
+    let chosen_name = optional_str(args, "name")?;
+    spec.name = Some(match chosen_name {
+        Some(name) => validate_name(name).map_err(|err| format!("name: {err}"))?,
+        None => generated_name(),
+    });
+
+    let caps = sh.backend.capabilities();
+    if !caps.client_command {
+        return Err(unsupported("starting a program the caller chooses"));
     }
-    client
-        .call("terminal.run", params, DEFAULT_TIMEOUT)
-        .map_err(herdr_error)
+    if spec.cwd.is_some() && !caps.client_cwd {
+        return Err(unsupported("a working directory the caller chooses"));
+    }
+    let mut info = sh.backend.run(&spec).map_err(|err| match err.kind {
+        ErrorKind::NotFound => ToolError::new(
+            "not_found",
+            "the program or working directory was not found",
+        )
+        .with("backend_detail", err.detail),
+        ErrorKind::NameTaken if chosen_name.is_none() => ToolError::new(
+            "name_taken",
+            "the name Shepherd generated for the pane is already in use; try again",
+        )
+        .with("backend_detail", err.detail),
+        _ => backend_failure(spec.name.as_deref(), err),
+    })?;
+    if info.name.is_none() {
+        info.name = spec.name;
+    }
+    Ok(info.to_json())
 }
 
-fn send_input(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> {
+/// A name for a pane started without one: `pane-` and 12 hex digits.
+fn generated_name() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(COUNT.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    format!("pane-{:012x}", hasher.finish() & 0xffff_ffff_ffff)
+}
+
+fn send_input(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     let terminal = terminal_arg(args)?;
     let text = validate_input(required_str(args, "text")?).map_err(|err| format!("text: {err}"))?;
-    let (_guard, address, _) = lock_pane(client, &terminal)?;
-    // Neither `force` nor `if` is sent: idle and done are both sendable, and a
-    // blocked program refuses input (herdr-core error kind `blocked`).
-    client
-        .call(
-            "terminal.send",
-            obj(vec![("terminal", json!(address)), ("text", json!(text))]),
-            DEFAULT_TIMEOUT,
-        )
-        .map_err(|err| herdr_tool_error(&terminal, err))
-}
-
-/// Resolve `terminal` (an address or a name) to its address with terminal.get,
-/// hold that address's lock, then get it again inside the lock and check it still
-/// resolves to the same address. Returns the guard, the address, and the
-/// terminal.get made inside the lock. Every tool that types or presses keys into
-/// an existing pane calls this first, so Shepherd's own calls on one pane run one
-/// at a time. start_pane does not: terminal.run refuses a name that is taken
-/// (`name_taken`), so it never types into an existing pane.
-fn lock_pane(
-    client: &HerdrClient,
-    terminal: &str,
-) -> Result<(PaneGuard, String, Value), ToolError> {
-    let before = terminal_get(client, terminal)?;
-    let address = address_of(&before, terminal)?;
-    let guard = client.lock_terminal(&address);
-    let now = terminal_get(client, terminal)?;
-    let address_now = address_of(&now, terminal)?;
-    if address_now != address {
-        let text = format!(
-            "{terminal} resolved to {address}, then to {address_now} while waiting for the pane lock; nothing was sent"
-        );
-        return Err(ToolError {
-            data: Some(json!({
-                "error": "terminal_changed",
-                "terminal": terminal,
-                "address_before": address,
-                "address_now": address_now,
-            })),
-            text,
-        });
+    let (_guard, pane, now) = lock_pane(sh, &terminal)?;
+    // Idle and done are both sendable; a blocked program is never typed into.
+    let guard = InputGuard {
+        refuse_when_blocked: true,
+        ..InputGuard::default()
+    };
+    if !sh.backend.capabilities().conditional_input {
+        // The backend cannot refuse atomically: check the status got inside the
+        // lock, then send.
+        if let Some(status) = now.status.as_ref().filter(|s| s.state == State::Blocked) {
+            return Err(pane_blocked(
+                &terminal,
+                status.kind.clone(),
+                "refused by Shepherd: the status read inside the pane lock was blocked",
+            ));
+        }
     }
-    Ok((guard, address, now))
+    match sh.backend.send(&pane, &text, &guard) {
+        Ok(sent) => Ok(json!({
+            "terminal": terminal,
+            "turn": sent.turn,
+            "started": sent.started,
+            "status": sent.status.as_ref().map(State::as_str),
+        })),
+        Err(BackendError {
+            kind: ErrorKind::Blocked { kind: None },
+            detail,
+        }) => {
+            // The refusal did not say which dialog; read the pane now, best
+            // effort, and fall back to the read taken before the send.
+            let blocked_kind = sh
+                .backend
+                .get(&pane)
+                .ok()
+                .and_then(|info| blocked_kind_of(&info))
+                .or_else(|| blocked_kind_of(&now));
+            Err(pane_blocked(&terminal, blocked_kind, detail))
+        }
+        Err(err) => Err(backend_failure(Some(&terminal), err)),
+    }
 }
 
-fn terminal_get(client: &HerdrClient, terminal: &str) -> Result<Value, ToolError> {
-    client
-        .call(
-            "terminal.get",
-            obj(vec![("terminal", json!(terminal))]),
-            DEFAULT_TIMEOUT,
+fn blocked_kind_of(info: &TerminalInfo) -> Option<String> {
+    info.status
+        .as_ref()
+        .filter(|status| status.state == State::Blocked)
+        .and_then(|status| status.kind.as_deref().map(dialog_kind))
+}
+
+/// Resolve `terminal`, the caller's pane name, with `get`. A backend may also
+/// accept its own references (herdr-core: an address), so the pane found must
+/// carry exactly this name; otherwise no pane has it. Every later backend call
+/// uses the resolved pane's id ([`TerminalInfo::reference`]), never the
+/// caller's string.
+fn resolve(sh: &Shepherd, terminal: &str) -> Result<TerminalInfo, ToolError> {
+    let info = get_pane(sh, &TerminalRef::new(terminal), terminal)?;
+    if info.name.as_deref() != Some(terminal) {
+        return Err(ToolError::new(
+            "not_found",
+            format!(
+                "no pane is named {terminal}; panes are addressed by the name list_panes shows"
+            ),
         )
-        .map_err(|err| herdr_tool_error(terminal, err))
+        .with("terminal", terminal));
+    }
+    Ok(info)
 }
 
-fn address_of(got: &Value, terminal: &str) -> Result<String, ToolError> {
-    got.get("address")
-        .and_then(Value::as_str)
-        .filter(|address| !address.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| {
-            ToolError::from(format!(
-                "terminal.get for {terminal} returned no address; nothing was sent"
-            ))
-        })
+/// Resolve `terminal` (a pane name), hold the lock for its id, then resolve
+/// it again inside the lock and check it is still the same pane. Returns the
+/// guard, a reference by id, and the pane as read inside the lock. Every tool
+/// that types or presses keys into an existing pane calls this first, so
+/// Shepherd's own calls on one pane run one at a time. start_pane does not:
+/// `run` refuses a name that is taken (`name_taken`), so it never types into
+/// an existing pane.
+fn lock_pane(
+    sh: &Shepherd,
+    terminal: &str,
+) -> Result<(PaneGuard, TerminalRef, TerminalInfo), ToolError> {
+    let before = resolve(sh, terminal)?;
+    let guard = sh.locks.lock(&before.id);
+    let now = resolve(sh, terminal)?;
+    if now.id != before.id {
+        return Err(ToolError::new(
+            "terminal_changed",
+            format!(
+                "{terminal} named a different pane while waiting for the pane lock; nothing was sent"
+            ),
+        )
+        .with("terminal", terminal));
+    }
+    Ok((guard, before.reference(), now))
 }
 
-fn read_output(client: &HerdrClient, args: &Args) -> Result<Value, String> {
+fn get_pane(sh: &Shepherd, pane: &TerminalRef, terminal: &str) -> Result<TerminalInfo, ToolError> {
+    sh.backend
+        .get(pane)
+        .map_err(|err| backend_failure(Some(terminal), err))
+}
+
+fn read_output(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     let terminal = terminal_arg(args)?;
     let lines = match args.get("lines") {
         None | Some(Value::Null) => 0,
@@ -303,182 +441,197 @@ fn read_output(client: &HerdrClient, args: &Args) -> Result<Value, String> {
             .ok_or_else(|| "lines must be a non-negative integer".to_string())?,
     };
     if lines > READ_MAX_LINES {
-        return Err(format!("lines must be between 0 and {READ_MAX_LINES}"));
+        return Err(format!("lines must be between 0 and {READ_MAX_LINES}").into());
     }
-    let result = client
-        .call(
-            "terminal.read",
-            obj(vec![("terminal", json!(terminal)), ("lines", json!(lines))]),
-            DEFAULT_TIMEOUT,
-        )
-        .map_err(herdr_error)?;
-    let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+    if !sh.backend.capabilities().screen_text {
+        return Err(unsupported("reading screen text"));
+    }
+    let pane = resolve(sh, &terminal)?.reference();
+    let screen = sh
+        .backend
+        .read(&pane, lines as u32)
+        .map_err(|err| backend_failure(Some(&terminal), err))?;
     Ok(json!({
-        "text": strip_terminal_escapes(text),
-        "complete": field(&result, "complete"),
-        "how": field(&result, "how"),
-        "why": field(&result, "why"),
+        "text": strip_terminal_escapes(&screen.text),
+        "complete": screen.complete,
+        "source": screen.source.as_ref().map(|source| source.as_str()),
+        "reason": screen.limit.as_ref().map(|limit| limit.as_str()),
     }))
 }
 
-fn get_status(client: &HerdrClient, args: &Args) -> Result<Value, String> {
+fn get_status(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     let terminal = terminal_arg(args)?;
-    let result = client
-        .call(
-            "terminal.get",
-            obj(vec![("terminal", json!(terminal))]),
-            DEFAULT_TIMEOUT,
-        )
-        .map_err(herdr_error)?;
-    Ok(json!({
-        "terminal": terminal,
-        "status": field(&result, "status"),
-        "reported": field(&result, "reported"),
-        "state": field(&result, "state"),
-        "turn": field(&result, "turn"),
-        "status_ms": field(&result, "status_ms"),
-    }))
+    let info = resolve(sh, &terminal)?;
+    let mut out = info.to_json();
+    out["terminal"] = json!(terminal);
+    Ok(out)
 }
 
-fn wait_status(client: &HerdrClient, args: &Args) -> Result<Value, String> {
+fn wait_status(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     let terminal = terminal_arg(args)?;
     let timeout = optional_number(args, "timeout", WAIT_MIN_SECONDS, WAIT_MAX_SECONDS)?
         .unwrap_or(WAIT_DEFAULT_SECONDS);
-    let result = client
-        .call(
-            "terminal.wait",
-            obj(vec![
-                ("terminal", json!(terminal)),
-                ("timeout", json!(timeout)),
-            ]),
-            Duration::from_secs_f64(timeout) + WAIT_SOCKET_SLACK,
-        )
-        .map_err(herdr_error)?;
-    // A reply without a boolean `ended` is not evidence of idle. Report it as an error.
-    let ended = match result.get("ended") {
-        Some(Value::Bool(ended)) => *ended,
-        _ => {
-            return Err(
-                "terminal.wait reply has no boolean `ended`; not treated as idle".to_string(),
-            )
-        }
-    };
-    let reason = result.get("reason").and_then(Value::as_str);
-    let status = result.get("status").and_then(Value::as_str);
-    let outcome = wait_outcome(ended, reason, status);
+    let pane = resolve(sh, &terminal)?.reference();
+    let result = sh
+        .backend
+        .wait(&pane, Duration::from_secs_f64(timeout))
+        .map_err(|err| {
+            let protocol = err.kind == ErrorKind::Protocol;
+            let failure = backend_failure(Some(&terminal), err);
+            if protocol {
+                failure.context("the wait result is unknown and is not treated as idle")
+            } else {
+                failure
+            }
+        })?;
+    let state = result.status.as_ref().map(|status| &status.state);
+    let outcome = wait_outcome(result.ended, result.reason.as_ref(), state);
     let mut out = json!({
         "terminal": terminal,
         "outcome": outcome,
         "turn_complete": matches!(outcome, "done" | "exited"),
-        "ended": ended,
-        "reason": field(&result, "reason"),
-        "status": field(&result, "status"),
+        "ended": result.ended,
+        "reason": result.reason.as_ref().map(WaitReason::as_str),
+        "status": state.map(State::as_str),
         "kind": Value::Null,
-        "exit_code": field(&result, "exit_code"),
-        "turn": field(&result, "turn"),
+        "exit_code": result.exit_code,
+        "turn": result.turn,
     });
     if outcome == "blocked" {
-        // terminal.wait does not report kind; terminal.get does, in status.kind.
-        let now = client
-            .call(
-                "terminal.get",
-                obj(vec![("terminal", json!(terminal))]),
-                DEFAULT_TIMEOUT,
-            )
-            .map_err(|err| {
-                format!("terminal.wait ended blocked, but terminal.get for its kind failed: herdr-core: {err}")
-            })?;
-        let status_now = field(&now, "status");
-        if status_now.get("state").and_then(Value::as_str) == Some("blocked") {
-            out["kind"] = field(&status_now, "kind");
+        match result
+            .status
+            .as_ref()
+            .and_then(|status| status.kind.clone())
+        {
+            Some(kind) => out["kind"] = json!(dialog_kind(&kind)),
+            None => {
+                // The wait did not say which dialog; read the pane for its kind.
+                let now = get_pane(sh, &pane, &terminal).map_err(|err| {
+                    err.context("the wait ended blocked, but reading the dialog kind failed")
+                })?;
+                out["kind"] = json!(blocked_kind_of(&now));
+                out["status_now"] = status_json(now.status.as_ref());
+            }
         }
-        out["status_now"] = status_now;
     }
     Ok(out)
 }
 
-/// What a terminal.wait return means. Only `done` and `exited` complete a turn.
-fn wait_outcome(ended: bool, reason: Option<&str>, status: Option<&str>) -> &'static str {
-    match (ended, reason, status) {
-        (false, Some("timeout"), _) => "timeout",
-        (true, Some("exit"), _) => "exited",
-        (true, Some("status"), Some("done")) => "done",
-        (true, Some("status"), Some("blocked")) => "blocked",
+/// What a wait result means. Only `done` and `exited` complete a turn.
+fn wait_outcome(ended: bool, reason: Option<&WaitReason>, state: Option<&State>) -> &'static str {
+    match (ended, reason, state) {
+        (false, Some(WaitReason::Timeout), _) => "timeout",
+        (true, Some(WaitReason::Exit), _) => "exited",
+        (true, Some(WaitReason::Status), Some(State::Done)) => "done",
+        (true, Some(WaitReason::Status), Some(State::Blocked)) => "blocked",
         _ => "other",
     }
 }
 
-fn list_panes(client: &HerdrClient, args: &Args) -> Result<Value, String> {
+fn list_panes(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     let all = match args.get("all") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(all)) => *all,
-        Some(_) => return Err("all must be a boolean".to_string()),
+        Some(_) => return Err("all must be a boolean".to_string().into()),
     };
-    client
-        .call(
-            "terminal.list",
-            obj(vec![("all", json!(all))]),
-            DEFAULT_TIMEOUT,
-        )
-        .map_err(herdr_error)
+    let list = sh
+        .backend
+        .list(all)
+        .map_err(|err| backend_failure(None, err))?;
+    let panes: Vec<Value> = list.terminals.iter().map(TerminalInfo::to_json).collect();
+    Ok(json!({"panes": panes, "hidden_finished": list.hidden_finished}))
 }
 
-fn interrupt_pane(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> {
+fn interrupt_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     let terminal = terminal_arg(args)?;
     let timeout = optional_number(args, "timeout", WAIT_MIN_SECONDS, INTERRUPT_MAX_SECONDS)?;
-    let socket_seconds =
-        timeout.unwrap_or(INTERRUPT_DEFAULT_SOCKET_SECONDS) + WAIT_SOCKET_SLACK.as_secs_f64();
-    let (_guard, address, _) = lock_pane(client, &terminal)?;
-    client
-        .call(
-            "terminal.interrupt",
-            obj(vec![
-                ("terminal", json!(address)),
-                ("timeout", json!(timeout)),
-            ]),
-            Duration::from_secs_f64(socket_seconds),
-        )
-        .map_err(|err| ToolError::from(herdr_error(err)))
-}
-
-fn herdr_error(err: HerdrError) -> String {
-    format!("herdr-core: {err}")
-}
-
-/// A herdr-core failure with its kind and hint passed through as structured data.
-fn herdr_tool_error(terminal: &str, err: HerdrError) -> ToolError {
-    let mut data = json!({
-        "error": "herdr-core",
+    let (_guard, pane, _) = lock_pane(sh, &terminal)?;
+    let result = sh
+        .backend
+        .interrupt(&pane, timeout.map(Duration::from_secs_f64))
+        .map_err(|err| backend_failure(Some(&terminal), err))?;
+    Ok(json!({
         "terminal": terminal,
-        "message": err.message,
-        "kind": err.kind,
-        "hint": err.hint,
-        "code": err.code,
-    });
-    if err.kind.as_deref() == Some("blocked") {
-        data["next"] = json!("read_output, then answer_dialog; nothing was typed");
-    }
-    ToolError {
-        text: herdr_error(err),
-        data: Some(data),
-    }
+        "key": result.key.as_str(),
+        "outcome": result.outcome.as_str(),
+    }))
 }
 
-fn answer_dialog(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> {
+/// A backend failure in Shepherd's words. The backend's own text is kept only
+/// under `backend_detail`.
+fn backend_failure(terminal: Option<&str>, err: BackendError) -> ToolError {
+    let pane = terminal.unwrap_or("the pane");
+    let message = match &err.kind {
+        ErrorKind::Blocked { kind } => return pane_blocked(pane, kind.clone(), err.detail),
+        ErrorKind::Unavailable => "the terminal backend is not reachable".to_string(),
+        ErrorKind::Timeout => "the terminal backend did not answer in time".to_string(),
+        ErrorKind::NotFound => match terminal {
+            Some(terminal) => format!("no pane matches {terminal}"),
+            None => "the terminal backend could not find what the request named".to_string(),
+        },
+        ErrorKind::NameTaken => format!("a pane named {pane} already exists; choose another name"),
+        ErrorKind::StatusMismatch => {
+            format!("{pane} is not in the state the request required; nothing was sent")
+        }
+        ErrorKind::Finished => format!("{pane} has finished; its program is no longer running"),
+        ErrorKind::Unsupported(op) => format!("the terminal backend does not support {op}"),
+        ErrorKind::InvalidInput => "the terminal backend refused the request".to_string(),
+        ErrorKind::Protocol => "the terminal backend sent a reply Shepherd cannot use".to_string(),
+        ErrorKind::Other => "the terminal backend reported a failure".to_string(),
+    };
+    let mut failure = ToolError::new(err.code(), message);
+    if let Some(terminal) = terminal {
+        failure = failure.with("terminal", terminal);
+    }
+    failure.with("backend_detail", err.detail)
+}
+
+/// Typing was refused because the program is blocked on a dialog.
+fn pane_blocked(terminal: &str, kind: Option<String>, detail: impl Into<String>) -> ToolError {
+    let kind = kind.as_deref().map(dialog_kind);
+    let dialog = match &kind {
+        Some(kind) if kind == "other" => "a dialog of another kind".to_string(),
+        Some(kind) => format!("a {kind} dialog"),
+        None => "a dialog".to_string(),
+    };
+    ToolError::new(
+        "pane_blocked",
+        format!("{terminal} is blocked on {dialog}; nothing was typed. Read the screen with read_output, then answer with answer_dialog"),
+    )
+    .with("terminal", terminal)
+    .with("kind", kind)
+    .with("next", BLOCKED_NEXT)
+    .with("backend_detail", detail.into())
+}
+
+fn unsupported(op: &str) -> ToolError {
+    ToolError::new(
+        "unsupported",
+        format!("the terminal backend does not support {op}"),
+    )
+}
+
+fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     let terminal = terminal_arg(args)?;
     let choice_text = required_str(args, "choice")?;
     let choice = Choice::parse(choice_text)
         .ok_or_else(|| format!("choice must be allow_once or deny_once, not {choice_text:?}"))?;
-    let mut sent: Vec<Vec<&str>> = Vec::new();
+    let caps = sh.backend.capabilities();
+    if !caps.screen_text {
+        return Err(unsupported("reading screen text"));
+    }
+    let mut sent: Vec<Vec<String>> = Vec::new();
 
-    // Hold the pane lock from the first terminal.get through Enter.
-    let (_guard, address, got) = lock_pane(client, &terminal)?;
+    // Hold the pane lock from the first get through Enter.
+    let (_guard, pane, got) = lock_pane(sh, &terminal)?;
 
     // 1. Only a pane blocked on a permission dialog.
-    let status = field(&got, "status");
-    let state = status.get("state").and_then(Value::as_str);
-    let kind = status.get("kind").and_then(Value::as_str);
-    if state != Some("blocked") || kind != Some("permission") {
+    let status = status_json(got.status.as_ref());
+    if !got
+        .status
+        .as_ref()
+        .is_some_and(|s| s.is_blocked_with("permission"))
+    {
         return Err(refusal(
             &terminal,
             choice,
@@ -487,15 +640,23 @@ fn answer_dialog(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> 
             &sent,
         ));
     }
-    let Some(turn) = got.get("turn").and_then(Value::as_u64) else {
+    let Some(turn) = got.turn else {
         return Err(refusal(
             &terminal,
             choice,
-            "terminal.get reported no turn number, so a change before Enter could not be detected"
+            "the pane reported no turn number, so a change before Enter could not be detected"
                 .to_string(),
-            json!({"status": status, "turn": field(&got, "turn")}),
+            json!({"status": status, "turn": Value::Null}),
             &sent,
         ));
+    };
+    // Every key goes to this dialog in this turn. A backend with conditional
+    // keys enforces it; for one without, the checks below do (non-atomically).
+    let key_guard = InputGuard {
+        refuse_when_blocked: false,
+        if_state: Some(State::Blocked),
+        if_kind: Some("permission".to_string()),
+        expect_turn: Some(turn),
     };
 
     // 2. Parse the dialog from the screen, waiting for it to render. Between
@@ -507,7 +668,7 @@ fn answer_dialog(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> 
     for attempt in 0..RENDER_READS {
         if attempt > 0 {
             thread::sleep(RENDER_POLL_INTERVAL);
-            let now = terminal_get(client, &address)?;
+            let now = get_pane(sh, &pane, &terminal)?;
             let changes = pane_changes(&now, turn);
             if !changes.is_empty() {
                 return Err(refusal(
@@ -518,16 +679,16 @@ fn answer_dialog(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> 
                         changes.join("; ")
                     ),
                     json!({
-                        "status": field(&now, "status"),
+                        "status": status_json(now.status.as_ref()),
                         "turn_before": turn,
-                        "turn_now": field(&now, "turn"),
+                        "turn_now": now.turn,
                         "screen": tail(&screen),
                     }),
                     &sent,
                 ));
             }
         }
-        screen = read_screen(client, &address)?;
+        screen = read_screen(sh, &pane, &terminal)?;
         match dialog::parse(&screen) {
             Ok(found) => {
                 parsed = Some(found);
@@ -553,17 +714,17 @@ fn answer_dialog(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> 
     let target = choice.index();
     let moves = target as isize - first.cursor as isize;
     if moves != 0 {
-        let key = if moves > 0 { "down" } else { "up" };
+        let key = if moves > 0 { Key::Down } else { Key::Up };
         let keys = vec![key; moves.unsigned_abs()];
-        let result = press(client, &address, &keys)?;
-        sent.push(keys);
-        let after = result.get("status").and_then(Value::as_str);
-        if after != Some("blocked") {
+        let result = press(sh, &pane, &terminal, &keys, &key_guard)?;
+        sent.push(keys.iter().map(|key| key.as_str().to_string()).collect());
+        if result.status != Some(State::Blocked) {
+            let after = result.status.as_ref().map(State::as_str);
             return Err(refusal(
                 &terminal,
                 choice,
                 format!("after the cursor moves the status is {after:?}, not blocked"),
-                json!({"keys_result": result}),
+                json!({"keys_result": result.to_json()}),
                 &sent,
             ));
         }
@@ -577,7 +738,7 @@ fn answer_dialog(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> 
         if attempt > 0 {
             thread::sleep(CONFIRM_INTERVAL);
         }
-        last_seen = read_screen(client, &address)?;
+        last_seen = read_screen(sh, &pane, &terminal)?;
         match dialog::parse(&last_seen) {
             Ok(now) if now.title != first.title || now.command != first.command => {
                 return Err(refusal(
@@ -615,32 +776,33 @@ fn answer_dialog(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> 
     }
 
     // 5. Re-check, still inside the lock, that the pane is blocked on a
-    // permission dialog in the same turn. herdr-core 0.1.19's terminal.keys has
-    // no status or turn condition, so this check and the Enter are two calls: a
-    // person or another herdr-core client can still act between them.
-    let again = terminal_get(client, &address)?;
-    let status_again = field(&again, "status");
-    let changes = pane_changes(&again, turn);
-    if !changes.is_empty() {
-        return Err(refusal(
-            &terminal,
-            choice,
-            format!(
-                "the pane changed after the cursor was confirmed: {}",
-                changes.join("; ")
-            ),
-            json!({
-                "status": status_again,
-                "turn_before": turn,
-                "turn_now": field(&again, "turn"),
-                "screen": tail(&last_seen),
-            }),
-            &sent,
-        ));
+    // permission dialog in the same turn. A backend without conditional keys
+    // cannot do this with the Enter, so the check and the Enter are two calls:
+    // a person or another client of the backend can still act between them.
+    if !caps.conditional_keys {
+        let again = get_pane(sh, &pane, &terminal)?;
+        let changes = pane_changes(&again, turn);
+        if !changes.is_empty() {
+            return Err(refusal(
+                &terminal,
+                choice,
+                format!(
+                    "the pane changed after the cursor was confirmed: {}",
+                    changes.join("; ")
+                ),
+                json!({
+                    "status": status_json(again.status.as_ref()),
+                    "turn_before": turn,
+                    "turn_now": again.turn,
+                    "screen": tail(&last_seen),
+                }),
+                &sent,
+            ));
+        }
     }
 
     // 6. Select it.
-    let result = press(client, &address, &["enter"])?;
+    let result = press(sh, &pane, &terminal, &[Key::Enter], &key_guard)?;
     Ok(json!({
         "terminal": terminal,
         "choice": choice.as_str(),
@@ -649,51 +811,48 @@ fn answer_dialog(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> 
         "command": first.command,
         "options": first.options,
         "moves": moves,
-        "keys_result": result,
+        "keys_result": result.to_json(),
     }))
 }
 
-/// What differs between a terminal.get and "blocked with kind permission in
-/// turn `turn`". Empty when nothing changed.
-fn pane_changes(got: &Value, turn: u64) -> Vec<String> {
-    let status = field(got, "status");
-    let state = status.get("state").and_then(Value::as_str);
-    let kind = status.get("kind").and_then(Value::as_str);
+/// What differs between a pane and "blocked with kind permission in turn
+/// `turn`". Empty when nothing changed.
+fn pane_changes(info: &TerminalInfo, turn: u64) -> Vec<String> {
     let mut changes = Vec::new();
-    if state != Some("blocked") || kind != Some("permission") {
+    if !info
+        .status
+        .as_ref()
+        .is_some_and(|s| s.is_blocked_with("permission"))
+    {
         changes.push(format!(
-            "the status is now {status}, not blocked with kind permission"
+            "the status is now {}, not blocked with kind permission",
+            status_json(info.status.as_ref())
         ));
     }
-    if got.get("turn").and_then(Value::as_u64) != Some(turn) {
-        changes.push(format!(
-            "the turn is now {}, not {turn}",
-            field(got, "turn")
-        ));
+    if info.turn != Some(turn) {
+        changes.push(format!("the turn is now {}, not {turn}", json!(info.turn)));
     }
     changes
 }
 
-fn read_screen(client: &HerdrClient, terminal: &str) -> Result<String, ToolError> {
-    let result = client
-        .call(
-            "terminal.read",
-            obj(vec![("terminal", json!(terminal)), ("lines", json!(0))]),
-            DEFAULT_TIMEOUT,
-        )
-        .map_err(|err| herdr_tool_error(terminal, err))?;
-    let text = result.get("text").and_then(Value::as_str).unwrap_or("");
-    Ok(strip_terminal_escapes(text))
+fn read_screen(sh: &Shepherd, pane: &TerminalRef, terminal: &str) -> Result<String, ToolError> {
+    let screen = sh
+        .backend
+        .read(pane, 0)
+        .map_err(|err| backend_failure(Some(terminal), err))?;
+    Ok(strip_terminal_escapes(&screen.text))
 }
 
-fn press(client: &HerdrClient, terminal: &str, keys: &[&str]) -> Result<Value, ToolError> {
-    client
-        .call(
-            "terminal.keys",
-            obj(vec![("terminal", json!(terminal)), ("keys", json!(keys))]),
-            DEFAULT_TIMEOUT,
-        )
-        .map_err(|err| herdr_tool_error(terminal, err))
+fn press(
+    sh: &Shepherd,
+    pane: &TerminalRef,
+    terminal: &str,
+    keys: &[Key],
+    guard: &InputGuard,
+) -> Result<KeysResult, ToolError> {
+    sh.backend
+        .keys(pane, keys, guard)
+        .map_err(|err| backend_failure(Some(terminal), err))
 }
 
 /// An answer_dialog refusal: what was seen, and which keys (if any) were sent.
@@ -703,40 +862,24 @@ fn refusal(
     choice: Choice,
     reason: String,
     seen: Value,
-    sent: &[Vec<&str>],
+    sent: &[Vec<String>],
 ) -> ToolError {
-    let text = format!(
-        "answer_dialog refused ({}): {reason}. Enter was not sent; keys sent: {sent:?}.\nSeen: {seen}",
+    let message = format!(
+        "answer_dialog ({}) refused: {reason}. Enter was not sent; keys sent: {sent:?}.\nSeen: {seen}",
         choice.as_str()
     );
-    ToolError {
-        text,
-        data: Some(json!({
-            "error": "refused",
-            "terminal": terminal,
-            "choice": choice.as_str(),
-            "reason": reason,
-            "seen": seen,
-            "keys_sent": sent,
-        })),
-    }
+    ToolError::new("refused", message)
+        .with("terminal", terminal)
+        .with("choice", choice.as_str())
+        .with("reason", reason)
+        .with("seen", seen)
+        .with("keys_sent", json!(sent))
 }
 
 fn tail(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(SEEN_TAIL_LINES);
     lines[start..].join("\n")
-}
-
-fn obj(pairs: Vec<(&str, Value)>) -> Args {
-    pairs
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value))
-        .collect()
-}
-
-fn field(result: &Value, key: &str) -> Value {
-    result.get(key).cloned().unwrap_or(Value::Null)
 }
 
 fn required_str<'a>(args: &'a Args, key: &str) -> Result<&'a str, String> {
@@ -755,7 +898,8 @@ fn optional_str<'a>(args: &'a Args, key: &str) -> Result<Option<&'a str>, String
     }
 }
 
-/// The pane address: required, cleaned with the input rules, then sent.
+/// The pane name: required and cleaned with the input rules. `resolve` then
+/// checks a pane carries it.
 fn terminal_arg(args: &Args) -> Result<String, String> {
     let raw = required_str(args, "terminal")?;
     validate_input(raw).map_err(|err| format!("terminal: {err}"))
@@ -773,5 +917,210 @@ fn optional_number(args: &Args, key: &str, min: f64, max: f64) -> Result<Option<
             }
             Ok(Some(number))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::FakeBackend;
+
+    fn args(value: Value) -> Args {
+        value.as_object().unwrap().clone()
+    }
+
+    /// A Shepherd over `fake`, with the fake able to see the pane locks.
+    fn shepherd(fake: &FakeBackend) -> Shepherd {
+        let sh = Shepherd::new(fake.clone());
+        fake.state.lock().unwrap().locks = Some(Arc::clone(sh.pane_locks()));
+        sh
+    }
+
+    #[test]
+    fn send_input_without_conditional_input_checks_status_under_the_lock() {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("stuck", State::Blocked, Some("permission"));
+        fake.add_pane("ready", State::Done, None);
+        let sh = shepherd(&fake);
+
+        let err = call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "stuck", "text": "yes"})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "pane_blocked");
+        assert_eq!(err.data["kind"], "permission");
+        assert_eq!(err.data["terminal"], "stuck");
+        // get, then get inside the lock; the status check refused, so no send.
+        assert_eq!(fake.calls(), ["get", "get"]);
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+
+        let sent = call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "ready", "text": "next"})),
+        )
+        .unwrap();
+        assert_eq!(sent["status"], "done");
+        assert_eq!(fake.calls(), ["get", "get", "get", "get", "send"]);
+        // The send ran while Shepherd held the pane lock for the pane's id.
+        assert_eq!(
+            fake.state.lock().unwrap().sent,
+            [("next".to_string(), true)]
+        );
+        assert!(!sh.pane_locks().is_held("id-ready"));
+    }
+
+    #[test]
+    fn send_input_with_conditional_input_leaves_the_refusal_to_the_backend() {
+        let fake = FakeBackend::new(true);
+        fake.add_pane("stuck", State::Blocked, Some("permission"));
+        let sh = shepherd(&fake);
+        let err = call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "stuck", "text": "yes"})),
+        )
+        .unwrap_err();
+        assert_eq!(fake.calls(), ["get", "get", "send"]);
+        assert_eq!(err.data["error"], "pane_blocked");
+        assert_eq!(err.data["kind"], "permission");
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn send_input_checks_the_status_read_inside_the_lock_not_before_it() {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("ready", State::Done, None);
+        // Done at the lookup before the lock, blocked at the get inside it.
+        fake.state.lock().unwrap().block_on_get = Some(2);
+        let sh = shepherd(&fake);
+        let err = call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "ready", "text": "next"})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "pane_blocked");
+        assert_eq!(err.data["kind"], "permission");
+        assert_eq!(fake.calls(), ["get", "get"]);
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn panes_are_reached_only_by_their_name() {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", State::Done, None);
+        fake.add_pane("anon", State::Done, None);
+        fake.state.lock().unwrap().panes[1].name = None;
+        fake.state.lock().unwrap().screen = Some("screen".to_string());
+        let sh = shepherd(&fake);
+        // The fake's get also accepts ids, as herdr-core accepts addresses.
+        for terminal in ["id-work", "id-anon"] {
+            for (tool, extra) in [
+                ("send_input", json!({"text": "hi"})),
+                ("read_output", json!({})),
+                ("get_status", json!({})),
+                ("wait_status", json!({"timeout": 1})),
+                ("interrupt_pane", json!({})),
+                ("answer_dialog", json!({"choice": "allow_once"})),
+            ] {
+                let mut a = args(extra);
+                a.insert("terminal".to_string(), json!(terminal));
+                let err = call(&sh, tool, &a).unwrap_err();
+                assert_eq!(err.data["error"], "not_found", "{tool} {terminal}");
+                assert!(err.text.contains("no pane is named"), "{}", err.text);
+            }
+        }
+        // Only the lookups ran; nothing reached either pane.
+        assert!(fake.calls().iter().all(|call| *call == "get"));
+        assert_eq!(fake.calls().len(), 12);
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+
+        // The name works, and the result names the pane by it.
+        let out = call(&sh, "read_output", &args(json!({"terminal": "work"}))).unwrap();
+        assert_eq!(out["text"], "screen");
+        let out = call(&sh, "get_status", &args(json!({"terminal": "work"}))).unwrap();
+        assert_eq!(out["terminal"], "work");
+        assert_eq!(out["name"], "work");
+    }
+
+    #[test]
+    fn answer_dialog_leaves_the_pre_enter_check_to_a_backend_with_conditional_keys() {
+        let mut fake = FakeBackend::new(false);
+        fake.caps.conditional_keys = true;
+        fake.add_pane("work", State::Blocked, Some("permission"));
+        fake.state.lock().unwrap().screen = Some(crate::dialog::fixtures::dialog_on_allow());
+        let sh = shepherd(&fake);
+        let out = call(
+            &sh,
+            "answer_dialog",
+            &args(json!({"terminal": "work", "choice": "allow_once"})),
+        )
+        .unwrap();
+        assert_eq!(out["selected"], "Allow once");
+        // No get between the confirming read and Enter: the guard goes with it.
+        assert_eq!(fake.calls(), ["get", "get", "read", "read", "keys"]);
+        assert_eq!(fake.state.lock().unwrap().keys, [vec![Key::Enter]]);
+    }
+
+    #[test]
+    fn backend_failures_use_shepherd_codes_and_keep_detail_aside() {
+        for (kind, code) in [
+            (ErrorKind::Unavailable, "unavailable"),
+            (ErrorKind::Timeout, "timeout"),
+            (ErrorKind::NotFound, "not_found"),
+            (ErrorKind::NameTaken, "name_taken"),
+            (ErrorKind::Blocked { kind: None }, "pane_blocked"),
+            (ErrorKind::StatusMismatch, "status_mismatch"),
+            (ErrorKind::Finished, "pane_finished"),
+            (ErrorKind::Unsupported("x".to_string()), "unsupported"),
+            (ErrorKind::InvalidInput, "invalid_input"),
+            (ErrorKind::Protocol, "backend_error"),
+            (ErrorKind::Other, "backend_error"),
+        ] {
+            let failure = backend_failure(
+                Some("work"),
+                BackendError::new(kind, "raw backend text --force"),
+            );
+            assert_eq!(failure.data["error"], code);
+            assert_eq!(failure.data["backend_detail"], "raw backend text --force");
+            assert!(failure.text.starts_with(&format!("{code}: ")));
+            assert!(
+                !failure.text.contains("raw backend text"),
+                "{}",
+                failure.text
+            );
+        }
+    }
+
+    #[test]
+    fn generated_names_are_valid_and_distinct() {
+        let names: Vec<String> = (0..50).map(|_| generated_name()).collect();
+        for name in &names {
+            assert_eq!(validate_name(name).as_deref(), Ok(name.as_str()));
+            assert_eq!(name.len(), "pane-".len() + 12, "{name}");
+        }
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len());
+    }
+
+    #[test]
+    fn wait_outcome_only_completes_on_done_and_exit() {
+        let status = Some(&WaitReason::Status);
+        assert_eq!(wait_outcome(true, status, Some(&State::Done)), "done");
+        assert_eq!(wait_outcome(true, status, Some(&State::Blocked)), "blocked");
+        assert_eq!(wait_outcome(true, status, Some(&State::Idle)), "other");
+        assert_eq!(wait_outcome(true, status, Some(&State::Other)), "other");
+        assert_eq!(wait_outcome(true, Some(&WaitReason::Exit), None), "exited");
+        assert_eq!(
+            wait_outcome(false, Some(&WaitReason::Timeout), None),
+            "timeout"
+        );
+        assert_eq!(wait_outcome(false, Some(&WaitReason::Other), None), "other");
+        assert_eq!(wait_outcome(true, None, Some(&State::Done)), "other");
     }
 }

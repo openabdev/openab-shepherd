@@ -5,14 +5,12 @@
 //! skipped. Whether herdr-core requires `hello` before other calls is unverified;
 //! the integration step checks it.
 
-use crate::panelock::{PaneGuard, PaneLocks};
 use serde_json::{json, Map, Value};
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 pub const MAX_REPLY_BYTES: usize = 8 * 1024 * 1024;
@@ -59,30 +57,17 @@ impl fmt::Display for HerdrError {
 
 impl std::error::Error for HerdrError {}
 
-/// A herdr-core client. Clones share one set of per-terminal locks.
+/// A herdr-core client.
 #[derive(Debug, Clone)]
 pub struct HerdrClient {
     socket: PathBuf,
-    locks: Arc<PaneLocks>,
 }
 
 impl HerdrClient {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
-            locks: Arc::new(PaneLocks::default()),
         }
-    }
-
-    /// Block until no other Shepherd call holds `address`, then hold it until the
-    /// guard is dropped. Pass the resolved address, not a name.
-    pub fn lock_terminal(&self, address: &str) -> PaneGuard {
-        self.locks.lock(address)
-    }
-
-    #[cfg(test)]
-    pub fn pane_locks(&self) -> &PaneLocks {
-        &self.locks
     }
 
     /// Send one request and return its `result`. `timeout` bounds the socket
@@ -206,7 +191,8 @@ fn read_reply<R: Read>(reader: &mut R, id: u64) -> Result<Value, HerdrError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{reply, serve_once, TempDir};
+    use crate::hc::fake::{reply, serve_once};
+    use crate::testutil::TempDir;
     use std::thread;
 
     fn params(pairs: Vec<(&str, Value)>) -> Map<String, Value> {

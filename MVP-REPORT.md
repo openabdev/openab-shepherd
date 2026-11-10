@@ -2,12 +2,31 @@
 
 ## Status
 
+### Current: backend trait refactor (branch `feat/backend-trait`)
+
+- The crate is committed. The tools call the `TerminalBackend` trait (`src/backend.rs`);
+  herdr-core is its only implementation (`src/hc/`).
+- Validation on remote build host, recorded in the commit message and in the run's `remote build host.log`:
+  `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` (120 passed, 0 failed),
+  and `cargo build --release`, each with exit status 0.
+- Per-file counts of `#[test]` in `src/`, which add to 120: `ansi.rs` 10, `config.rs` 13,
+  `dialog.rs` 9, `hc/mod.rs` 2, `hc/rpc.rs` 8, `hc/tests.rs` 35, `http.rs` 3, `input.rs` 13,
+  `main.rs` 3, `mcp.rs` 15, `panelock.rs` 1, `tools.rs` 8.
+- No live herdr-core run against the new result and error shapes yet (see Known limits).
+
+### Historical: MVP evidence (2026-11-10, before the backend trait)
+
+Everything from here to "Known limits", and the operator run at the end, describes the MVP
+crate as it was then: 70 tests, `src/herdr.rs` as the herdr-core client, seven tools, the
+crate not yet committed, and herdr-core JSON in tool results. It is kept as a record and is
+not current.
+
 - Unit tests on the build host: 70 of 70 pass.
 - Release binary: built on the build host. The laptop copy has the same SHA-256.
-- Integration checks 1-3 (live herdr-core checks, negative runs): NOT RUN.
-- The crate is uncommitted and unpushed.
+- Integration checks 1-3: not run by the agent; the operator ran checks 2 and 3 later (see
+  the end of this file).
 
-## Unit tests on remote build host
+## Unit tests on remote build host (historical)
 
 Command, run on remote build host in the synced crate:
 
@@ -32,7 +51,7 @@ Per-file counts of `#[test]` in `src/`, which add to 70: `ansi.rs` 10, `config.r
 `herdr.rs` 8, `http.rs` 3, `input.rs` 13, `main.rs` 3, `mcp.rs` 20. `tools.rs` and `testutil.rs`
 have no tests of their own; `tools.rs` is covered through `mcp.rs`.
 
-## Build
+## Build (historical)
 
 - Sync: `rsync -a --delete` from the laptop crate to the build host.
 - Build: `cargo build --release` on remote build host. The release profile finished in 2.33 s.
@@ -46,9 +65,10 @@ have no tests of their own; `tools.rs` is covered through `mcp.rs`.
 
 ## Tool-to-method map
 
-Source: `src/tools.rs`. Each function sends the herdr-core JSON-RPC methods listed. Parameter names are
-as written in that file. `hc.openrpc.json` was checked against them in an earlier step (see
-`build-review.md`).
+Source: the tools in `src/tools.rs` call trait methods, and `src/hc/mod.rs` sends the
+herdr-core JSON-RPC method listed for each. `hc.openrpc.json` was checked against the
+parameters in an earlier step (see `build-review.md`). The hc error kinds the adapter maps
+are listed in `src/hc/error_kinds.json`, extracted from that schema.
 
 | MCP tool | Function | herdr-core method | Parameters sent |
 |----------|----------|-------------------|-----------------|
@@ -63,7 +83,7 @@ as written in that file. `hc.openrpc.json` was checked against them in an earlie
 
 `call()` in the same file dispatches by tool name. Input checks run before any socket call.
 
-## Integration checks 1-3: NOT RUN
+## Integration checks 1-3 (historical): not run by the agent
 
 Reason: the shell command guard blocks any command whose text contains `--host` or `--port`.
 The server start and the bind-refusal test both need those flags. This run did not get past the
@@ -187,7 +207,7 @@ curl -s -i $URL -H "$AUTH" -H 'Content-Type: application/json' -d '{"jsonrpc":"2
 - **No multi-client authorization.** Any holder of the token controls every pane.
 - **Permission dialogs: what `answer_dialog` guarantees.** `send_input` is refused while a pane is
   blocked, and `force` is never sent. `answer_dialog` answers `allow_once` or `deny_once` only. It
-  holds a per-pane lock (keyed by address, so a name and its address share it) from its first
+  holds a per-pane lock (keyed by the resolved backend id, which is never returned) from its first
   `terminal.get` through `enter`, so other Shepherd calls that type into the pane (`send_input`,
   `interrupt_pane`, another `answer_dialog`) cannot run in between. Just before `enter` it calls
   `terminal.get` again and sends nothing if the pane is no longer blocked with kind `permission` or
@@ -195,6 +215,22 @@ curl -s -i $URL -H "$AUTH" -H 'Content-Type: application/json' -d '{"jsonrpc":"2
   (its parameters are `terminal`, `keys`, `caller`), so the re-check and `enter` are two calls. A
   person at the terminal or another herdr-core client on the same host can still change the dialog
   between them. The design accepts this because Shepherd is meant to be the only socket client.
+- **One terminal backend, behind a trait.** The tools now call a `TerminalBackend` trait
+  (`src/backend.rs`); herdr-core is its only implementation (`src/hc/`). The safety rules
+  above stay in Shepherd. A backend with conditional keys would enforce the pre-Enter
+  check atomically; herdr-core cannot, so the race above remains for it. A second backend
+  (openab-pty) is not started: it first needs screen text, program status, and a control
+  API.
+- **Result and error shapes changed after the integration run.** `start_pane`, `get_status`,
+  and `list_panes` now return Shepherd pane objects (`name`, `live`, `status {state,
+  kind}`, ...) instead of herdr-core JSON. The herdr-core address is no longer returned:
+  callers use the pane name, and `start_pane` generates one (`pane-<12 hex>`) when none
+  is given. A herdr-core address given as `terminal` is refused with `not_found`. Backend words Shepherd does not know reach callers as `other`, and
+  `read_output` returns `source`/`reason` instead of herdr-core's `how`/`why`. Tool errors carry Shepherd codes (`pane_blocked`,
+  `not_found`, `unavailable`, ...) with herdr-core's text only under `backend_detail`. The
+  expected results in Check 2 above (for example "a terminal object with an `address`") and
+  the operator run below predate this change. The unit tests cover the new shapes; a live
+  herdr-core run against them has not been done.
 - **ANSI-only output filter.** The filter removes CSI (including the 8-bit introducer U+009B), OSC
   (including OSC 7501), DCS, SOS, PM, APC, two-byte and nF escapes, and lone ESC. The 8-bit OSC
   introducer (U+009D) is not removed. TUI redraw noise is not removed. An unterminated OSC or DCS
@@ -217,8 +253,6 @@ curl -s -i $URL -H "$AUTH" -H 'Content-Type: application/json' -d '{"jsonrpc":"2
   who can replace files in the token's folder could swap it in between.
 - **Plain-mode framing.** Whether herdr-core requires `hello` before plain-mode calls is unverified.
   Only a live call settles it.
-- **Formatting and lint not recorded.** No `cargo fmt --check` or `cargo clippy` run is recorded.
-  The workspace guide requires both before a push.
 
 ## Evidence files
 
@@ -237,9 +271,8 @@ curl -s -i $URL -H "$AUTH" -H 'Content-Type: application/json' -d '{"jsonrpc":"2
   characters that break one-message-per-line framing, and TAB does not. The Python reference also
   keeps TAB.
 - **MCP layer hand-written**, not an SDK. The brief allows either.
-- **Not committed.** The crate is untracked. The parent repository shows it as `?? openab-shepherd/`.
 
-## Integration results (operator run, 2026-11-10)
+## Integration results (historical operator run, 2026-11-10, MVP shapes)
 
 The operator ran checks 2 and 3 in a normal terminal against the release binary
 (sha256 `5673cb52…`), server on `127.0.0.1:8767`. All passed.

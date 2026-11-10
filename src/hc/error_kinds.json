@@ -1,0 +1,82 @@
+{
+  "source": "herdr-core 0.1.19 OpenRPC schema (hc.openrpc.json): every error data.kind, and the kinds each method the adapter calls declares",
+  "kinds": [
+    "already_added",
+    "blocked",
+    "config",
+    "conflict",
+    "edit_failed",
+    "finished",
+    "hc_missing",
+    "incompatible",
+    "internal",
+    "invalid_params",
+    "invalid_template",
+    "io",
+    "live",
+    "machine_unknown",
+    "name_taken",
+    "needs_framed",
+    "needs_target",
+    "needs_update",
+    "not_found",
+    "not_text",
+    "spawn_failed",
+    "status_mismatch",
+    "unavailable",
+    "unreachable",
+    "unsupported_generation"
+  ],
+  "methods": {
+    "terminal.run": [
+      "config",
+      "invalid_params",
+      "invalid_template",
+      "machine_unknown",
+      "name_taken",
+      "not_found",
+      "spawn_failed",
+      "unavailable"
+    ],
+    "terminal.get": [
+      "machine_unknown",
+      "not_found"
+    ],
+    "terminal.list": [],
+    "terminal.read": [
+      "machine_unknown",
+      "not_found"
+    ],
+    "terminal.send": [
+      "blocked",
+      "config",
+      "finished",
+      "invalid_params",
+      "machine_unknown",
+      "not_found",
+      "status_mismatch",
+      "unavailable"
+    ],
+    "terminal.keys": [
+      "finished",
+      "invalid_params",
+      "machine_unknown",
+      "not_found",
+      "unavailable"
+    ],
+    "terminal.wait": [
+      "config",
+      "invalid_params",
+      "machine_unknown",
+      "needs_target",
+      "not_found"
+    ],
+    "terminal.interrupt": [
+      "finished",
+      "invalid_params",
+      "machine_unknown",
+      "not_found",
+      "unavailable"
+    ]
+  }
+}

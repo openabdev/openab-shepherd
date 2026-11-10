@@ -5,8 +5,8 @@
 //! to the MCP layer. Nothing is logged from request bodies, because they can carry
 //! text typed into panes.
 
-use crate::herdr::HerdrClient;
 use crate::mcp;
+use crate::tools::Shepherd;
 use serde_json::{json, Value};
 use std::io::Read;
 use std::net::SocketAddr;
@@ -21,7 +21,7 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 pub struct AppState {
     pub token: String,
-    pub client: HerdrClient,
+    pub shepherd: Shepherd,
 }
 
 type Body = Response<std::io::Cursor<Vec<u8>>>;
@@ -113,7 +113,7 @@ fn route(request: &mut Request, state: &AppState, body: Result<Vec<u8>, u16>) ->
             )
         }
     };
-    match mcp::handle_message(&state.client, &message) {
+    match mcp::handle_message(&state.shepherd, &message) {
         Some(reply) => json_reply(200, reply, None),
         None => empty_reply(202),
     }
@@ -290,7 +290,7 @@ mod tests {
         let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let state = Arc::new(AppState {
             token: TOKEN.to_string(),
-            client: HerdrClient::new("/tmp/shep-e2e-absent.sock"),
+            shepherd: Shepherd::new(crate::testutil::FakeBackend::new(true)),
         });
         thread::spawn(move || {
             let _ = serve(bind, state);

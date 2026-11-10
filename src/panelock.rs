@@ -1,10 +1,10 @@
 //! Per-terminal locks. A tool that types or presses keys into a pane holds the
-//! lock for the pane's address for its whole sequence, so two Shepherd calls on
-//! one pane never interleave. Callers lock the resolved address (`t7`), not the
-//! name they were given, so a name and its address share one lock.
+//! lock for the pane's backend id for its whole sequence, so two Shepherd calls
+//! on one pane never interleave. Callers lock the resolved id, not the name they
+//! were given, so a name and its id share one lock.
 //!
 //! This serializes Shepherd's own calls only. A person at the terminal or another
-//! herdr-core client is not covered.
+//! client of the terminal backend is not covered.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -66,6 +66,12 @@ impl PaneLocks {
     #[cfg(test)]
     pub fn waiting(&self, address: &str) -> usize {
         self.table().waiting.get(address).copied().unwrap_or(0)
+    }
+
+    /// Whether some call holds `address` now.
+    #[cfg(test)]
+    pub fn is_held(&self, address: &str) -> bool {
+        self.table().held.contains(address)
     }
 }
 

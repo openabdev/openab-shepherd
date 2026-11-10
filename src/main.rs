@@ -1,12 +1,14 @@
 //! OpenAB Shepherd: an MCP server that exposes herdr-core terminal panes as tools.
 //!
-//! The server listens on loopback only, requires a bearer token, and forwards each
-//! tool call to herdr-core over its Unix socket. See README.md for the tool map.
+//! The server listens on loopback only, requires a bearer token, and serves each
+//! tool call through a terminal backend (`backend.rs`). The only backend today is
+//! herdr-core over its Unix socket (`hc/`). See README.md for the tool map.
 
 mod ansi;
+mod backend;
 mod config;
 mod dialog;
-mod herdr;
+mod hc;
 mod http;
 mod input;
 mod mcp;
@@ -16,7 +18,7 @@ mod tools;
 #[cfg(test)]
 mod testutil;
 
-use herdr::HerdrClient;
+use hc::HcBackend;
 use http::AppState;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -117,7 +119,7 @@ fn main() -> ExitCode {
 
     let state = Arc::new(AppState {
         token: config.token,
-        client: HerdrClient::new(config.socket_path),
+        shepherd: tools::Shepherd::new(HcBackend::new(config.socket_path)),
     });
     eprintln!(
         "openab-shepherd: listening on http://{}{}",

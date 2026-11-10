@@ -1,4 +1,4 @@
-//! Input rules for text that reaches herdr-core.
+//! Input rules for text that reaches the terminal backend.
 //!
 //! Every string field that is sent to a pane passes through `validate_input`:
 //! a control character is refused, the text is trimmed, and empty or oversized
@@ -7,10 +7,11 @@
 use std::fmt;
 
 /// Largest accepted input, in UTF-8 bytes, measured after trimming. This is the
-/// exact text sent to herdr-core.
+/// exact text sent to the backend.
 pub const MAX_INPUT_BYTES: usize = 4096;
 
-/// Longest accepted terminal name (herdr-core schema: 1-32 of a-z 0-9 - _ .).
+/// Longest accepted pane name (1-32 of a-z 0-9 - _ .; herdr-core uses the same
+/// rule).
 pub const MAX_NAME_CHARS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
