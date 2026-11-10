@@ -229,3 +229,27 @@ curl -s -i $URL -H "$AUTH" -H 'Content-Type: application/json' -d '{"jsonrpc":"2
   keeps TAB.
 - **MCP layer hand-written**, not an SDK. The brief allows either.
 - **Not committed.** The crate is untracked. The parent repository shows it as `?? openab-shepherd/`.
+
+## Integration results (operator run, 2026-11-10)
+
+The operator ran checks 2 and 3 in a normal terminal against the release binary
+(sha256 `5673cb52…`), server on `127.0.0.1:8767`. All passed.
+
+| Check | Result |
+|-------|--------|
+| initialize / initialized / tools/list | 200 / 202 / 200, seven tools |
+| list_panes (all) | `isError:false`, empty list |
+| start_pane (`sh -c 'echo SHEPHERD_READY; cat'`) | `isError:false`, `state:live`, `reported:false` |
+| send_input `echo SHEPHERD_ECHO_1` | `isError:false` |
+| read_output | text contains `SHEPHERD_READY` and `SHEPHERD_ECHO_1` |
+| get_status | `reported:false`, `state:live`, `status:null` |
+| wait_status (5 s) | `ended:false`, `reason:timeout` (check-in, not idle) |
+| interrupt_pane | `key:ctrl+c`, `outcome:exited` |
+| start_pane `line:"   "` | `isError:true`, "input is empty after trimming"; pane list unchanged |
+| start_pane `line` with U+0007 | `isError:true`, control character refused; pane list unchanged |
+| no token / wrong token | 401, `WWW-Authenticate: Bearer` |
+| bind 0.0.0.0 | exit 2, "refusing to bind", no listener |
+| cleanup | pane removed, `hc ls --all` empty |
+
+A first attempt was pasted into a terminal that wrapped long lines and broke the JSON. The server
+answered each malformed body with JSON-RPC `-32700 parse error` and created no pane.
