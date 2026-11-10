@@ -832,27 +832,145 @@ mod tests {
         let dir = TempDir::new("mcp-dlg-noparse");
         let sock = dir.path().join("core.sock");
         let broken = format!("{PROBE_HEAD} ❯ Yes\n   No\n{PROBE_TAIL}");
-        let fake = serve_script(
-            &sock,
-            vec![
-                blocked_get("permission"),
-                blocked_get("permission"),
-                screen(&broken),
-            ],
-        );
+        let fake = serve_script(&sock, render_wait_script(&broken, tools::RENDER_READS));
         let out = answer(&sock, "deny_once");
         let requests = fake.finish();
         assert_eq!(out["isError"], true);
-        assert_eq!(
-            methods(&requests),
-            ["terminal.get", "terminal.get", "terminal.read"]
-        );
+        assert_eq!(requests.len(), 2 + 2 * tools::RENDER_READS - 1);
         assert!(keys_sent(&requests).is_empty());
         assert!(text_of(&out).contains("cannot parse the permission dialog"));
         assert!(out["structuredContent"]["seen"]["screen"]
             .as_str()
             .unwrap()
             .contains("❯ Yes"));
+    }
+
+    /// The screen kiro-cli shows right after it reports blocked/permission: the
+    /// tool call line is drawn, the dialog box is not (measured, e2e run).
+    const BEFORE_DIALOG: &str = "  Use the shell tool to run exactly this command in the current directory and nothing else: touch shepherd_marker.txt
+
+↓ Shell touch shepherd_marker.txt
+";
+
+    /// The two lock gets, then `reads` reads of `text` with a blocked
+    /// terminal.get before every read after the first.
+    fn render_wait_script(text: &str, reads: usize) -> Vec<Value> {
+        let mut script = vec![blocked_get("permission"), blocked_get("permission")];
+        for read in 0..reads {
+            if read > 0 {
+                script.push(blocked_get("permission"));
+            }
+            script.push(screen(text));
+        }
+        script
+    }
+
+    #[test]
+    fn answer_dialog_waits_for_the_dialog_to_render() {
+        let dir = TempDir::new("mcp-dlg-render");
+        let sock = dir.path().join("core.sock");
+        let mut script = render_wait_script(BEFORE_DIALOG, 2);
+        script.extend([
+            blocked_get("permission"),
+            screen(&dialog_on_allow()),
+            screen(&dialog_on_allow()),
+            blocked_get("permission"),
+            keys_ok("working"),
+        ]);
+        let fake = serve_script(&sock, script);
+        let out = answer(&sock, "allow_once");
+        let requests = fake.finish();
+        assert_eq!(out["isError"], false, "{}", text_of(&out));
+        assert_eq!(
+            methods(&requests),
+            [
+                "terminal.get",
+                "terminal.get",
+                "terminal.read",
+                "terminal.get",
+                "terminal.read",
+                "terminal.get",
+                "terminal.read",
+                "terminal.read",
+                "terminal.get",
+                "terminal.keys"
+            ]
+        );
+        assert_eq!(keys_sent(&requests), [json!(["enter"])]);
+        assert_eq!(out["structuredContent"]["selected"], "Allow once");
+    }
+
+    #[test]
+    fn answer_dialog_refuses_when_the_dialog_never_renders() {
+        let dir = TempDir::new("mcp-dlg-norender");
+        let sock = dir.path().join("core.sock");
+        let fake = serve_script(
+            &sock,
+            render_wait_script(BEFORE_DIALOG, tools::RENDER_READS),
+        );
+        let out = answer(&sock, "allow_once");
+        let requests = fake.finish();
+        assert_eq!(out["isError"], true);
+        // Every scripted reply used, nothing after the last read.
+        assert_eq!(requests.len(), 2 + 2 * tools::RENDER_READS - 1);
+        assert_eq!(requests.last().unwrap()["method"], "terminal.read");
+        assert!(keys_sent(&requests).is_empty());
+        assert_eq!(out["structuredContent"]["keys_sent"], json!([]));
+        let text = text_of(&out);
+        assert!(
+            text.contains("timed out waiting for the dialog to render"),
+            "{text}"
+        );
+        assert!(text.contains("requires approval"), "{text}");
+        assert!(text.contains("Enter was not sent"), "{text}");
+    }
+
+    #[test]
+    fn answer_dialog_stops_waiting_when_the_pane_changes() {
+        let cases = [
+            (
+                get_with_status(json!({"app": "kiro-cli", "state": "done"})),
+                "not blocked with kind permission",
+            ),
+            (
+                ok(
+                    json!({"address": "t8", "state": "live", "turn": 2, "reported": true,
+                          "status": {"app": "kiro-cli", "kind": "permission", "state": "blocked"}}),
+                ),
+                "the turn is now 2, not 1",
+            ),
+        ];
+        for (changed, expected) in cases {
+            let dir = TempDir::new("mcp-dlg-render-changed");
+            let sock = dir.path().join("core.sock");
+            let mut script = render_wait_script(BEFORE_DIALOG, 2);
+            // The pane changes before the third read; a dialog would be there.
+            script.extend([changed, screen(&dialog_on_allow())]);
+            let fake = serve_script(&sock, script);
+            let out = answer(&sock, "allow_once");
+            let requests = fake.finish();
+            assert_eq!(out["isError"], true, "{expected}");
+            assert_eq!(
+                methods(&requests),
+                [
+                    "terminal.get",
+                    "terminal.get",
+                    "terminal.read",
+                    "terminal.get",
+                    "terminal.read",
+                    "terminal.get"
+                ],
+                "nothing after the changed get: {expected}"
+            );
+            assert!(keys_sent(&requests).is_empty(), "{expected}");
+            let text = text_of(&out);
+            assert!(
+                text.contains("changed while waiting for the dialog to render"),
+                "{text}"
+            );
+            assert!(text.contains(expected), "{text}");
+            assert!(text.contains("Enter was not sent"), "{text}");
+        }
     }
 
     #[test]
