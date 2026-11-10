@@ -40,6 +40,14 @@ const INTERRUPT_DEFAULT_SOCKET_SECONDS: f64 = 10.0;
 /// a quiet period, and the program redraws after that).
 pub const CONFIRM_READS: usize = 5;
 pub const CONFIRM_INTERVAL: Duration = Duration::from_millis(200);
+/// kiro-cli 3.1.0 (V3) reports OSC 7501 blocked/permission before it has drawn
+/// the dialog. answer_dialog waits up to this long for the dialog to parse,
+/// re-reading the screen every [`RENDER_POLL_INTERVAL`].
+pub const RENDER_WAIT: Duration = Duration::from_secs(3);
+pub const RENDER_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Screen reads in the render wait: one at once, then one per interval.
+pub const RENDER_READS: usize =
+    (RENDER_WAIT.as_millis() / RENDER_POLL_INTERVAL.as_millis()) as usize + 1;
 /// Lines of screen text returned with an answer_dialog refusal.
 const SEEN_TAIL_LINES: usize = 40;
 
@@ -146,7 +154,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "answer_dialog",
-            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another herdr-core client can still act between the last check and Enter, because herdr-core has no conditional key press. The dialog is parsed from screen text; tested only on kiro-cli 3.1.0 (V3) shell permission dialogs. Follow with wait_status.",
+            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another herdr-core client can still act between the last check and Enter, because herdr-core has no conditional key press. The dialog is parsed from screen text; tested only on kiro-cli 3.1.0 (V3) shell permission dialogs. Follow with wait_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -490,17 +498,56 @@ fn answer_dialog(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> 
         ));
     };
 
-    // 2. Parse the dialog from the screen.
-    let screen = read_screen(client, &address)?;
-    let first = dialog::parse(&screen).map_err(|err| {
-        refusal(
+    // 2. Parse the dialog from the screen, waiting for it to render. Between
+    // reads, check the pane is still blocked on a permission dialog in the same
+    // turn. Nothing is sent until the dialog parses.
+    let mut screen = String::new();
+    let mut parse_error = String::new();
+    let mut parsed = None;
+    for attempt in 0..RENDER_READS {
+        if attempt > 0 {
+            thread::sleep(RENDER_POLL_INTERVAL);
+            let now = terminal_get(client, &address)?;
+            let changes = pane_changes(&now, turn);
+            if !changes.is_empty() {
+                return Err(refusal(
+                    &terminal,
+                    choice,
+                    format!(
+                        "the pane changed while waiting for the dialog to render: {}",
+                        changes.join("; ")
+                    ),
+                    json!({
+                        "status": field(&now, "status"),
+                        "turn_before": turn,
+                        "turn_now": field(&now, "turn"),
+                        "screen": tail(&screen),
+                    }),
+                    &sent,
+                ));
+            }
+        }
+        screen = read_screen(client, &address)?;
+        match dialog::parse(&screen) {
+            Ok(found) => {
+                parsed = Some(found);
+                break;
+            }
+            Err(err) => parse_error = err,
+        }
+    }
+    let Some(first) = parsed else {
+        return Err(refusal(
             &terminal,
             choice,
-            format!("cannot parse the permission dialog: {err}"),
+            format!(
+                "cannot parse the permission dialog: timed out waiting for the dialog to render ({RENDER_READS} reads over {} ms): {parse_error}",
+                RENDER_WAIT.as_millis()
+            ),
             json!({"status": status, "screen": tail(&screen)}),
             &sent,
-        )
-    })?;
+        ));
+    };
 
     // 3. Move the cursor, if needed.
     let target = choice.index();
@@ -573,21 +620,7 @@ fn answer_dialog(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> 
     // person or another herdr-core client can still act between them.
     let again = terminal_get(client, &address)?;
     let status_again = field(&again, "status");
-    let state_again = status_again.get("state").and_then(Value::as_str);
-    let kind_again = status_again.get("kind").and_then(Value::as_str);
-    let turn_again = again.get("turn").and_then(Value::as_u64);
-    let mut changes = Vec::new();
-    if state_again != Some("blocked") || kind_again != Some("permission") {
-        changes.push(format!(
-            "the status is now {status_again}, not blocked with kind permission"
-        ));
-    }
-    if turn_again != Some(turn) {
-        changes.push(format!(
-            "the turn is now {}, not {turn}",
-            field(&again, "turn")
-        ));
-    }
+    let changes = pane_changes(&again, turn);
     if !changes.is_empty() {
         return Err(refusal(
             &terminal,
@@ -618,6 +651,27 @@ fn answer_dialog(client: &HerdrClient, args: &Args) -> Result<Value, ToolError> 
         "moves": moves,
         "keys_result": result,
     }))
+}
+
+/// What differs between a terminal.get and "blocked with kind permission in
+/// turn `turn`". Empty when nothing changed.
+fn pane_changes(got: &Value, turn: u64) -> Vec<String> {
+    let status = field(got, "status");
+    let state = status.get("state").and_then(Value::as_str);
+    let kind = status.get("kind").and_then(Value::as_str);
+    let mut changes = Vec::new();
+    if state != Some("blocked") || kind != Some("permission") {
+        changes.push(format!(
+            "the status is now {status}, not blocked with kind permission"
+        ));
+    }
+    if got.get("turn").and_then(Value::as_u64) != Some(turn) {
+        changes.push(format!(
+            "the turn is now {}, not {turn}",
+            field(got, "turn")
+        ));
+    }
+    changes
 }
 
 fn read_screen(client: &HerdrClient, terminal: &str) -> Result<String, ToolError> {

@@ -139,7 +139,14 @@ the screen and use `answer_dialog`.
 
 1. Take the pane lock, then `terminal.get`: refuse unless `status.state` is
    `blocked` and `status.kind` is `permission`. Record the `turn` number.
-2. `terminal.read` (screen): parse the dialog. It needs a line ending in
+2. `terminal.read` (screen): parse the dialog. kiro-cli 3.1.0 (V3) reports
+   `blocked`/`permission` before it has drawn the dialog, so the tool re-reads the
+   screen every 200 ms (`RENDER_POLL_INTERVAL`) for up to 3 s (`RENDER_WAIT`, 16
+   reads) until the dialog parses. Before each re-read it calls `terminal.get` and
+   refuses, sending nothing, if the pane is no longer `blocked` with kind
+   `permission` or the `turn` changed; the refusal says which. If the dialog still
+   does not parse after the wait, it refuses, sending nothing, and says it timed out
+   waiting for the dialog to render. The dialog needs a line ending in
    `requires approval`, the next line as `<tool> → <command>`, then exactly four
    options in this order: `Allow once`, `Deny once`, `Create allow rule...`,
    `Create deny rule...`, with one `❯` cursor. Anything else is refused.
@@ -183,7 +190,9 @@ the name now resolves to a different address. `start_pane` takes no lock:
 `terminal.run` refuses a name that is taken, so it never types into an existing pane.
 Read-only tools (`read_output`, `get_status`, `wait_status`, `list_panes`) take no
 lock. A call waiting for the lock waits as long as the holder runs (an
-`interrupt_pane` holds it for up to its timeout).
+`interrupt_pane` holds it for up to its timeout; an `answer_dialog` holds it for up
+to the 3 s render wait plus its other steps: up to 0.8 s of cursor confirmation and
+each herdr-core call).
 
 ## Input rules
 
