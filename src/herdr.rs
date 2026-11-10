@@ -5,12 +5,14 @@
 //! skipped. Whether herdr-core requires `hello` before other calls is unverified;
 //! the integration step checks it.
 
+use crate::panelock::{PaneGuard, PaneLocks};
 use serde_json::{json, Map, Value};
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const MAX_REPLY_BYTES: usize = 8 * 1024 * 1024;
@@ -22,11 +24,13 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A failed call. `kind` is either a local class (`unavailable`, `transport`,
 /// `timeout`, `protocol`) or the `data.kind` herdr-core attached to its error.
+/// `hint` is herdr-core's `data.hint`, when it sent one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HerdrError {
     pub message: String,
     pub code: Option<i64>,
     pub kind: Option<String>,
+    pub hint: Option<String>,
 }
 
 impl HerdrError {
@@ -35,6 +39,7 @@ impl HerdrError {
             message: message.into(),
             code: None,
             kind: Some(kind.to_string()),
+            hint: None,
         }
     }
 }
@@ -42,24 +47,42 @@ impl HerdrError {
 impl fmt::Display for HerdrError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            Some(kind) => write!(f, "{} ({kind})", self.message),
-            None => f.write_str(&self.message),
+            Some(kind) => write!(f, "{} ({kind})", self.message)?,
+            None => f.write_str(&self.message)?,
+        }
+        match &self.hint {
+            Some(hint) => write!(f, "; hint: {hint}"),
+            None => Ok(()),
         }
     }
 }
 
 impl std::error::Error for HerdrError {}
 
+/// A herdr-core client. Clones share one set of per-terminal locks.
 #[derive(Debug, Clone)]
 pub struct HerdrClient {
     socket: PathBuf,
+    locks: Arc<PaneLocks>,
 }
 
 impl HerdrClient {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
+            locks: Arc::new(PaneLocks::default()),
         }
+    }
+
+    /// Block until no other Shepherd call holds `address`, then hold it until the
+    /// guard is dropped. Pass the resolved address, not a name.
+    pub fn lock_terminal(&self, address: &str) -> PaneGuard {
+        self.locks.lock(address)
+    }
+
+    #[cfg(test)]
+    pub fn pane_locks(&self) -> &PaneLocks {
+        &self.locks
     }
 
     /// Send one request and return its `result`. `timeout` bounds the socket
@@ -76,8 +99,9 @@ impl HerdrClient {
         let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         // serde_json escapes newlines inside strings, so the newline below is the
         // only frame delimiter on the line.
-        let mut line = serde_json::to_string(&request)
-            .map_err(|err| HerdrError::local("protocol", format!("cannot encode request: {err}")))?;
+        let mut line = serde_json::to_string(&request).map_err(|err| {
+            HerdrError::local("protocol", format!("cannot encode request: {err}"))
+        })?;
         line.push('\n');
 
         let reply = self.exchange(line.as_bytes(), id, timeout)?;
@@ -88,27 +112,39 @@ impl HerdrClient {
                 .unwrap_or("herdr-core error")
                 .to_string();
             let code = err.get("code").and_then(Value::as_i64);
-            let kind = err
-                .get("data")
-                .and_then(|data| data.get("kind"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            return Err(HerdrError { message, code, kind });
+            let data_str = |key: &str| {
+                err.get("data")
+                    .and_then(|data| data.get(key))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            let kind = data_str("kind");
+            let hint = data_str("hint");
+            return Err(HerdrError {
+                message,
+                code,
+                kind,
+                hint,
+            });
         }
-        reply
-            .get("result")
-            .cloned()
-            .ok_or_else(|| HerdrError::local("protocol", "herdr-core reply has neither result nor error"))
+        reply.get("result").cloned().ok_or_else(|| {
+            HerdrError::local("protocol", "herdr-core reply has neither result nor error")
+        })
     }
 
     fn exchange(&self, payload: &[u8], id: u64, timeout: Duration) -> Result<Value, HerdrError> {
         let mut stream = UnixStream::connect(&self.socket).map_err(|err| {
-            HerdrError::local("unavailable", format!("cannot connect to herdr-core socket: {err}"))
+            HerdrError::local(
+                "unavailable",
+                format!("cannot connect to herdr-core socket: {err}"),
+            )
         })?;
         stream
             .set_read_timeout(Some(timeout))
             .and_then(|()| stream.set_write_timeout(Some(timeout)))
-            .map_err(|err| HerdrError::local("transport", format!("cannot set socket timeout: {err}")))?;
+            .map_err(|err| {
+                HerdrError::local("transport", format!("cannot set socket timeout: {err}"))
+            })?;
         stream
             .write_all(payload)
             .map_err(|err| HerdrError::local("transport", format!("send failed: {err}")))?;
@@ -127,8 +163,9 @@ fn read_reply<R: Read>(reader: &mut R, id: u64) -> Result<Value, HerdrError> {
             if line.iter().all(|b| b.is_ascii_whitespace()) {
                 continue;
             }
-            let message: Value = serde_json::from_slice(line)
-                .map_err(|err| HerdrError::local("protocol", format!("malformed reply line: {err}")))?;
+            let message: Value = serde_json::from_slice(line).map_err(|err| {
+                HerdrError::local("protocol", format!("malformed reply line: {err}"))
+            })?;
             if message.get("id").and_then(Value::as_u64) == Some(id) {
                 return Ok(message);
             }
@@ -138,10 +175,16 @@ fn read_reply<R: Read>(reader: &mut R, id: u64) -> Result<Value, HerdrError> {
             Ok(n) => n,
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Err(HerdrError::local("timeout", "timed out waiting for herdr-core reply"));
+                return Err(HerdrError::local(
+                    "timeout",
+                    "timed out waiting for herdr-core reply",
+                ));
             }
             Err(err) => {
-                return Err(HerdrError::local("transport", format!("receive failed: {err}")));
+                return Err(HerdrError::local(
+                    "transport",
+                    format!("receive failed: {err}"),
+                ));
             }
         };
         if n == 0 {
@@ -152,7 +195,10 @@ fn read_reply<R: Read>(reader: &mut R, id: u64) -> Result<Value, HerdrError> {
         }
         buf.extend_from_slice(&chunk[..n]);
         if buf.len() > MAX_REPLY_BYTES {
-            return Err(HerdrError::local("protocol", "herdr-core reply exceeds size limit"));
+            return Err(HerdrError::local(
+                "protocol",
+                "herdr-core reply exceeds size limit",
+            ));
         }
     }
 }
@@ -172,15 +218,26 @@ mod tests {
         let dir = TempDir::new("frame");
         let sock = dir.path().join("core.sock");
         let handle = serve_once(&sock, |s, req| {
-            reply(s, &json!({"jsonrpc": "2.0", "id": req["id"], "result": {"ok": true}}));
+            reply(
+                s,
+                &json!({"jsonrpc": "2.0", "id": req["id"], "result": {"ok": true}}),
+            );
         });
         let result = HerdrClient::new(&sock)
-            .call("terminal.list", params(vec![("all", json!(false))]), DEFAULT_TIMEOUT)
+            .call(
+                "terminal.list",
+                params(vec![("all", json!(false))]),
+                DEFAULT_TIMEOUT,
+            )
             .unwrap();
         assert_eq!(result, json!({"ok": true}));
 
         let (line, request) = handle.join().unwrap();
-        assert_eq!(line.matches('\n').count(), 1, "exactly one newline, at the end");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "exactly one newline, at the end"
+        );
         assert!(line.ends_with('\n'));
         assert_eq!(request["jsonrpc"], "2.0");
         assert_eq!(request["method"], "terminal.list");
@@ -212,12 +269,22 @@ mod tests {
         let sock = dir.path().join("core.sock");
         let handle = serve_once(&sock, |s, req| {
             let id = req["id"].as_u64().unwrap();
-            reply(s, &json!({"jsonrpc": "2.0", "method": "event", "params": {}}));
-            reply(s, &json!({"jsonrpc": "2.0", "id": id + 999, "result": "wrong"}));
+            reply(
+                s,
+                &json!({"jsonrpc": "2.0", "method": "event", "params": {}}),
+            );
+            reply(
+                s,
+                &json!({"jsonrpc": "2.0", "id": id + 999, "result": "wrong"}),
+            );
             reply(s, &json!({"jsonrpc": "2.0", "id": id, "result": "right"}));
         });
         let result = HerdrClient::new(&sock)
-            .call("terminal.get", params(vec![("terminal", json!("t1"))]), DEFAULT_TIMEOUT)
+            .call(
+                "terminal.get",
+                params(vec![("terminal", json!("t1"))]),
+                DEFAULT_TIMEOUT,
+            )
             .unwrap();
         handle.join().unwrap();
         assert_eq!(result, json!("right"));
@@ -239,7 +306,11 @@ mod tests {
             s.write_all(&bytes[mid..]).unwrap();
         });
         let result = HerdrClient::new(&sock)
-            .call("terminal.read", params(vec![("terminal", json!("t1"))]), DEFAULT_TIMEOUT)
+            .call(
+                "terminal.read",
+                params(vec![("terminal", json!("t1"))]),
+                DEFAULT_TIMEOUT,
+            )
             .unwrap();
         handle.join().unwrap();
         assert_eq!(result, json!({"text": "héllo 你好"}));
@@ -253,14 +324,20 @@ mod tests {
             reply(
                 s,
                 &json!({"jsonrpc": "2.0", "id": req["id"], "error": {
-                    "code": -32000, "message": "terminal is blocked", "data": {"kind": "blocked"}}}),
+                    "code": -32000, "message": "terminal is blocked",
+                    "data": {"kind": "blocked", "hint": "read its screen first"}}}),
             );
         });
         let err = HerdrClient::new(&sock)
-            .call("terminal.send", params(vec![("terminal", json!("t1"))]), DEFAULT_TIMEOUT)
+            .call(
+                "terminal.send",
+                params(vec![("terminal", json!("t1"))]),
+                DEFAULT_TIMEOUT,
+            )
             .unwrap_err();
         handle.join().unwrap();
         assert_eq!(err.kind.as_deref(), Some("blocked"));
+        assert_eq!(err.hint.as_deref(), Some("read its screen first"));
         assert_eq!(err.code, Some(-32000));
         assert!(err.to_string().contains("terminal is blocked"));
     }

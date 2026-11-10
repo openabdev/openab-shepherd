@@ -86,7 +86,9 @@ mod tests {
 
     #[test]
     fn only_control_characters_rejected() {
-        assert!(err_text(validate_input("\u{1}\u{2}\u{7f}\u{9b}")).contains("control character U+0001"));
+        assert!(
+            err_text(validate_input("\u{1}\u{2}\u{7f}\u{9b}")).contains("control character U+0001")
+        );
     }
 
     #[test]

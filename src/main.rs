@@ -5,10 +5,12 @@
 
 mod ansi;
 mod config;
+mod dialog;
 mod herdr;
 mod http;
 mod input;
 mod mcp;
+mod panelock;
 mod tools;
 
 #[cfg(test)]
