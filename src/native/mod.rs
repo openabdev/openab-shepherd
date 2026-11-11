@@ -2,13 +2,15 @@
 //! output, and the OSC 7501 program status read from that same emulator.
 //! See docs/adr/native-core.md.
 //!
-//! Locking (ADR §9): the pane table, then a pane's `input`, then its `state`.
+//! Locking (ADR §9): the pane table, then a pane's `input`, then its `state`;
+//! a pane's `tree` is taken before its `state` and never with `input`.
 //! Nothing takes `input` while holding `state`, and no lock is held across a
 //! sleep, a poll or a wait, except the condvar wait, which releases `state`.
 //! The reader and reaper threads hold only their pane, so dropping the last
 //! [`NativeBackend`] handle ends every pane.
 
 pub(crate) mod keys;
+mod procs;
 mod pty;
 pub(crate) mod status;
 pub(crate) mod term;
@@ -65,6 +67,13 @@ const READ_POLL_MS: libc::c_int = 200;
 const EXIT_DRAIN: Duration = Duration::from_millis(500);
 /// How often interrupt re-reads the foreground group.
 const INTERRUPT_POLL: Duration = Duration::from_millis(50);
+/// How often the reader refreshes the pane's process tree while the leader
+/// runs, so a descendant is known before its parent can exit (ADR §11).
+const TREE_POLL: Duration = Duration::from_millis(250);
+/// How often a stop re-checks whether the pane's descendants have exited.
+const TREE_WAIT_POLL: Duration = Duration::from_millis(50);
+/// At most this many refresh-and-stop rounds before the final SIGKILL.
+const FREEZE_ROUNDS: usize = 8;
 
 const CAPABILITIES: Capabilities = Capabilities {
     conditional_input: true,
@@ -125,6 +134,14 @@ struct Pane {
     changed: Condvar,
     /// Held for a whole write sequence (send, keys, interrupt, reply flush).
     input: Mutex<()>,
+    /// Every descendant seen so far (ADR §11). Taken before `state`.
+    tree: Mutex<procs::Tree>,
+    /// A removal or shutdown is ending the pane: the reaper leaves the
+    /// descendants' grace to it and reaps once it has released the pane.
+    stopping: AtomicBool,
+    /// Stops the reader. Set only once the leader is reaped, because a
+    /// process exiting with output still queued on the terminal waits
+    /// (on macOS forever) for someone to read it.
     shutdown: AtomicBool,
     reader: Mutex<Option<JoinHandle<()>>>,
 }
@@ -133,6 +150,10 @@ struct PaneState {
     emu: Emulator,
     tracker: Tracker,
     live: bool,
+    /// The leader has exited: set as soon as its status is read, before the
+    /// reaper waits for the reader to drain, so a removal decides `killed`
+    /// from when the leader exited, not from when `live` was cleared.
+    exited: bool,
     exit_code: Option<i64>,
     reader_done: bool,
     /// The turn of a send that has not gone working yet.
@@ -142,10 +163,11 @@ struct PaneState {
     raw: VecDeque<u8>,
     last_output: Instant,
     log: StatusLog,
-    /// The exited leader, not yet reaped: it holds the group id (ADR §11).
-    zombie: Option<Child>,
-    /// The group was ended for good (removal, eviction, shutdown); the
-    /// reaper reaps at once instead of keeping a zombie.
+    /// The leader has been reaped: its pid, so the group and session ids,
+    /// are no longer reserved for this pane (ADR §11).
+    reaped: bool,
+    /// The pane's group and descendants were killed for good (`release`);
+    /// the reaper reaps the leader only after this.
     released: bool,
     /// The reaper fell back to a plain wait, which frees the group id: the
     /// group is never signalled again.
@@ -295,6 +317,7 @@ impl NativeBackend {
                     emu: Emulator::new(),
                     tracker: Tracker::default(),
                     live: true,
+                    exited: false,
                     exit_code: None,
                     reader_done: false,
                     pending_send: None,
@@ -303,12 +326,14 @@ impl NativeBackend {
                     raw: VecDeque::new(),
                     last_output: Instant::now(),
                     log: StatusLog::default(),
-                    zombie: None,
+                    reaped: false,
                     released: false,
                     group_lost: false,
                 }),
                 changed: Condvar::new(),
                 input: Mutex::new(()),
+                tree: Mutex::new(procs::Tree::default()),
+                stopping: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
                 reader: Mutex::new(None),
             });
@@ -318,7 +343,7 @@ impl NativeBackend {
         };
         // Finished panes leave the table only with their group ended.
         for old in dropped {
-            old.shutdown.store(true, Ordering::Release);
+            old.stopping.store(true, Ordering::Release);
             old.release();
         }
         // The reaper takes the child from this slot, so if its thread cannot
@@ -349,6 +374,7 @@ impl NativeBackend {
                 Ok(pane)
             }
             Err(err) => {
+                pane.stopping.store(true, Ordering::Release);
                 pane.shutdown.store(true, Ordering::Release);
                 pane.release();
                 // No reaper took the child: reap the killed leader here.
@@ -360,9 +386,14 @@ impl NativeBackend {
                     {
                         let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
                         st.live = false;
+                        st.exited = true;
                         st.group_lost = true;
                     }
                     let _ = child.wait();
+                    pane.state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .reaped = true;
                     pane.changed.notify_all();
                 }
                 self.inner.table()?.panes.retain(|p| !Arc::ptr_eq(p, &pane));
@@ -407,29 +438,33 @@ impl Inner {
 }
 
 impl Inner {
-    /// SIGHUP and SIGTERM to every group still ours, one wait of up to 2 s for
-    /// all leaders, then SIGKILL to those groups and reap the leaders.
+    /// SIGHUP and SIGTERM to every pane's group and descendants, one wait of
+    /// up to 2 s for all of them, then kill what is left of each pane's tree
+    /// and wait (up to 2 s more) for the leaders to be reaped.
     fn end_all(&self) {
         let panes = {
             let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
             table.exiting = true;
             std::mem::take(&mut table.panes)
         };
-        let mut owned = Vec::new();
         for pane in &panes {
-            pane.shutdown.store(true, Ordering::Release);
-            if pane.owns_group() {
-                pane.signal(libc::SIGHUP);
-                pane.signal(libc::SIGTERM);
-                owned.push(pane);
-            }
+            pane.stopping.store(true, Ordering::Release);
+            pane.soft_stop();
         }
         let deadline = Instant::now() + KILL_GRACE;
-        for pane in &owned {
+        for pane in &panes {
             pane.await_exit(deadline);
         }
         for pane in &panes {
+            pane.await_tree_gone(deadline);
+        }
+        for pane in &panes {
             pane.release();
+        }
+        let deadline = Instant::now() + KILL_GRACE;
+        for pane in &panes {
+            pane.await_reaped(deadline);
+            pane.shutdown.store(true, Ordering::Release);
         }
     }
 }
@@ -513,37 +548,115 @@ impl Pane {
         self.state.lock().is_ok_and(|st| st.live)
     }
 
-    /// Whether the group id is still reserved for this pane: the leader runs,
-    /// or it is an unreaped zombie. Only then may Shepherd signal the group
-    /// (POSIX does not reuse a pid, so a group id, while its process exists).
-    fn owns_group(&self) -> bool {
-        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        !st.group_lost && (st.live || st.zombie.is_some())
+    fn has_exited(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .exited
     }
 
-    /// SIGKILL the group if it is still ours, then reap the leader. After
-    /// this the group id is no longer reserved and is never signalled again.
-    fn release(&self) {
-        let zombie = {
-            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            st.released = true;
-            if st.group_lost || !(st.live || st.zombie.is_some()) {
+    /// Whether the group id is still reserved for this pane: the leader is
+    /// not reaped yet (it runs, or is a zombie). Only then may Shepherd
+    /// signal the group or look up the group and session by the leader's pid
+    /// (POSIX does not reuse a pid while its process exists).
+    fn owns_group(&self) -> bool {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        !st.group_lost && !st.reaped
+    }
+
+    /// Send `signals` to the group if it is still ours, under `state`, so the
+    /// reservation cannot end between the check and the kill. Whether it was.
+    fn signal_group(&self, signals: &[libc::c_int]) -> bool {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if st.group_lost || st.reaped {
+            return false;
+        }
+        for &signal in signals {
+            self.signal(signal, st.live);
+        }
+        true
+    }
+
+    /// SIGHUP and SIGTERM to the group and to every known descendant, after
+    /// a fresh look for descendants. No key is typed (ADR §11).
+    fn soft_stop(&self) {
+        let mut tree = self.tree.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.owns_group() {
+            tree.refresh(self.pid);
+        }
+        self.signal_group(&[libc::SIGHUP, libc::SIGTERM]);
+        tree.signal_all(libc::SIGHUP);
+        tree.signal_all(libc::SIGTERM);
+    }
+
+    /// Wait until no known descendant runs, or `deadline` passes.
+    fn await_tree_gone(&self, deadline: Instant) {
+        loop {
+            {
+                let mut tree = self.tree.lock().unwrap_or_else(PoisonError::into_inner);
+                if self.owns_group() {
+                    tree.refresh(self.pid);
+                }
+                if !tree.any_alive() {
+                    return;
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 return;
             }
-            // Signalled under `state`, so the reaper cannot reap the leader
-            // (freeing the id) between the check and the kill. A live leader
-            // is reaped by the reaper, which sees `released`.
-            self.signal(libc::SIGKILL);
-            st.zombie.take()
-        };
-        if let Some(mut child) = zombie {
-            let _ = child.wait();
+            thread::sleep(left.min(TREE_WAIT_POLL));
         }
     }
 
-    fn signal(&self, signal: libc::c_int) {
-        if let Err(err) = pty::killpg(self.pid, signal) {
-            eprintln!("openab-shepherd: native: {}: kill failed: {err}", self.id);
+    /// End the pane's processes for good: look for descendants and SIGSTOP
+    /// them and the group, again until a look finds nobody new (a stopped
+    /// process cannot fork), then SIGKILL the group and every descendant.
+    /// After this the reaper reaps the leader, and the group id is no longer
+    /// reserved. Idempotent.
+    fn release(&self) {
+        let mut tree = self.tree.lock().unwrap_or_else(PoisonError::into_inner);
+        for round in 1..=FREEZE_ROUNDS {
+            let owned = self.owns_group();
+            let added = if owned { tree.refresh(self.pid) } else { 0 };
+            self.signal_group(&[libc::SIGSTOP]);
+            tree.signal_all(libc::SIGSTOP);
+            if !owned || (round > 1 && added == 0) {
+                break;
+            }
+        }
+        self.signal_group(&[libc::SIGKILL]);
+        tree.signal_all(libc::SIGKILL);
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .released = true;
+        drop(tree);
+        self.changed.notify_all();
+    }
+
+    /// Signal the group. EPERM once the leader has exited is not logged: on
+    /// macOS a group left with only its zombie leader answers EPERM.
+    fn signal(&self, signal: libc::c_int, live: bool) {
+        match pty::killpg(self.pid, signal) {
+            Err(err) if !live && err.raw_os_error() == Some(libc::EPERM) => {}
+            Err(err) => eprintln!("openab-shepherd: native: {}: kill failed: {err}", self.id),
+            Ok(()) => {}
+        }
+    }
+
+    /// Wait until the reaper has reaped the leader or `deadline` passes.
+    fn await_reaped(&self, deadline: Instant) {
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while !st.reaped && !st.group_lost {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            st = match self.changed.wait_timeout(st, left) {
+                Ok((next, _)) => next,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
         }
     }
 
@@ -552,7 +665,7 @@ impl Pane {
         let Ok(mut st) = self.state.lock() else {
             return;
         };
-        while st.live {
+        while !st.exited {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return;
@@ -912,10 +1025,12 @@ fn enter_refusal(err: &BackendError) -> &'static str {
     }
 }
 
-/// The reader thread: output into the emulator until EOF, EIO or removal.
+/// The reader thread: output into the emulator until EOF, EIO or removal,
+/// and every `TREE_POLL` a fresh look for the pane's descendants.
 fn read_loop(pane: Arc<Pane>) {
     let fd = pane.master.as_raw_fd();
     let mut buf = vec![0u8; READ_CHUNK];
+    let mut next_tree = Instant::now();
     while !pane.shutdown.load(Ordering::Acquire) {
         match pty::poll_read(fd, &mut buf, READ_POLL_MS) {
             Ok(None) => {}
@@ -934,6 +1049,16 @@ fn read_loop(pane: Arc<Pane>) {
         if let Ok(_input) = pane.input.try_lock() {
             pane.flush_replies();
         }
+        if Instant::now() >= next_tree {
+            // try_lock: a stop holds the tree, and the reader must keep
+            // draining the terminal meanwhile.
+            if let Ok(mut tree) = pane.tree.try_lock() {
+                if pane.is_live() && pane.owns_group() {
+                    let _ = tree.refresh(pane.pid);
+                }
+            }
+            next_tree = Instant::now() + TREE_POLL;
+        }
     }
     if let Ok(mut st) = pane.state.lock() {
         st.reader_done = true;
@@ -942,7 +1067,11 @@ fn read_loop(pane: Arc<Pane>) {
 }
 
 /// The reaper thread: waits for the leader to exit without reaping it (the
-/// zombie keeps the group id ours), then leaves it to `release`.
+/// zombie keeps the group and session ids ours) and records the exit. Then
+/// it ends what the leader left behind: on its own exit, SIGHUP and SIGTERM
+/// to the group and descendants, up to 2 s, and `release`; during a removal
+/// or shutdown, it waits for that to `release`. Then it reaps the leader,
+/// under the tree lock, so no look for descendants runs on a freed pid.
 fn reap(pane: Arc<Pane>, mut child: Child) {
     let (code, reaped) = match pty::wait_exited(pane.pid) {
         Ok(code) => (Some(code), false),
@@ -965,6 +1094,8 @@ fn reap(pane: Arc<Pane>, mut child: Child) {
         }
     };
     let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
+    st.exited = true;
+    pane.changed.notify_all();
     let deadline = Instant::now() + EXIT_DRAIN;
     while !st.reader_done {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -980,14 +1111,29 @@ fn reap(pane: Arc<Pane>, mut child: Child) {
     st.exit_code = code;
     st.pending_send = None;
     st.tracker.on_exit();
-    if !reaped {
-        if st.released {
-            let _ = child.wait();
-        } else {
-            st.zombie = Some(child);
-        }
-    }
     drop(st);
+    pane.changed.notify_all();
+    if pane.stopping.load(Ordering::Acquire) {
+        let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while !st.released {
+            st = match pane.changed.wait_timeout(st, Duration::from_secs(1)) {
+                Ok((next, _)) => next,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    } else {
+        pane.soft_stop();
+        pane.await_tree_gone(Instant::now() + KILL_GRACE);
+        pane.release();
+    }
+    let tree = pane.tree.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
+    if !reaped {
+        let _ = child.wait();
+    }
+    st.reaped = true;
+    drop(st);
+    drop(tree);
     pane.changed.notify_all();
 }
 
@@ -1248,10 +1394,11 @@ impl TerminalBackend for NativeBackend {
         Ok(InterruptResult { key, outcome })
     }
 
-    /// SIGHUP and SIGTERM to the pane's group, up to `grace` (default 2 s)
-    /// for the leader to exit, then SIGKILL to the group, which also ends
-    /// members that outlived the leader; the leader is reaped and the pane
-    /// leaves the table. No key is sent first.
+    /// SIGHUP and SIGTERM to the pane's group and every descendant, up to
+    /// `grace` (default 2 s) for the leader and descendants to exit, then
+    /// SIGKILL to the group and every descendant left (ADR §11). The leader
+    /// is reaped, its exit code recorded, and the pane leaves the table. No
+    /// key is sent first.
     fn remove(
         &self,
         t: &TerminalRef,
@@ -1259,22 +1406,20 @@ impl TerminalBackend for NativeBackend {
     ) -> Result<RemoveResult, BackendError> {
         let pane = self.inner.resolve(t)?;
         let was_live = pane.is_live();
-        pane.shutdown.store(true, Ordering::Release);
-        let mut killed = false;
-        if pane.owns_group() {
-            pane.signal(libc::SIGHUP);
-            pane.signal(libc::SIGTERM);
-            pane.await_exit(Instant::now() + grace.unwrap_or(KILL_GRACE));
-            killed = pane.is_live();
-        }
+        pane.stopping.store(true, Ordering::Release);
+        pane.soft_stop();
+        let deadline = Instant::now() + grace.unwrap_or(KILL_GRACE);
+        pane.await_exit(deadline);
+        let killed = !pane.has_exited();
+        pane.await_tree_gone(deadline);
         pane.release();
+        // The reaper records the exit code (128 + SIGKILL when killed) and
+        // reaps; the reader drains the terminal until then.
+        pane.await_reaped(Instant::now() + KILL_GRACE);
+        pane.shutdown.store(true, Ordering::Release);
         let reader = pane.reader.lock().ok().and_then(|mut slot| slot.take());
         if let Some(reader) = reader {
             let _ = reader.join();
-        }
-        if killed {
-            // The reaper records the exit code once the SIGKILL lands.
-            pane.await_exit(Instant::now() + KILL_GRACE);
         }
         self.inner.table()?.panes.retain(|p| !Arc::ptr_eq(p, &pane));
         let exit_code = pane

@@ -832,51 +832,43 @@ fn process_gone_within(pid: i32, within: Duration) -> bool {
     !process_alive(pid)
 }
 
-/// Review B3: the leader exits while a member of its group that ignores HUP
-/// and TERM and has closed the PTY lives on. Removal, shutdown and replacing
-/// the finished pane by name each still end it, and the leader stays a
-/// zombie (the group id ours) until then.
+/// Review B3, revised for issue #10: the leader exits while a member of its
+/// group that ignores HUP and TERM and has closed the PTY lives on. The
+/// leader stays a zombie (the group id ours) while that member gets the
+/// grace, then the member is killed and the leader reaped, without any
+/// removal; removing the finished pane afterwards reports its exit code.
 #[test]
 fn a_group_member_that_outlives_the_leader_is_ended() {
     const SURVIVOR: &str = "(trap '' HUP TERM; exec sleep 300 </dev/null >/dev/null 2>&1) & \
-                            echo \"bg:$!\"; sleep 1";
-    for how in ["remove", "shutdown", "replace"] {
-        let dir = TempDir::new("native-survivor");
-        let b = backend();
-        let info = b.run(&spec_line("surv", SURVIVOR, &dir)).unwrap();
-        let text = wait_for_screen(&b, &info, "bg:");
-        let bg: i32 = text
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("bg:"))
-            .and_then(|pid| pid.trim().parse().ok())
-            .unwrap_or_else(|| panic!("{how}: no pid in {text}"));
-        let pane = pane_of(&b, &info);
-        let ended = b.wait(&info.reference(), LONG).unwrap();
-        assert_eq!(ended.reason, Some(WaitReason::Exit), "{how}");
-        wait_for(&b, &info, |_| pane.state.lock().unwrap().reader_done);
-        thread::sleep(Duration::from_millis(300));
-        assert!(process_alive(bg), "{how}: the survivor died early");
-        assert!(pane.owns_group(), "{how}: the leader was reaped early");
-        match how {
-            "remove" => {
-                b.remove(&info.reference(), None).unwrap();
-            }
-            "shutdown" => {
-                b.shutdown();
-                assert!(b.list(true).unwrap().terminals.is_empty());
-            }
-            _ => {
-                let again = b.run(&spec_line("surv", "true", &dir)).unwrap();
-                assert_ne!(again.id, info.id);
-            }
-        }
-        assert!(
-            process_gone_within(bg, Duration::from_secs(5)),
-            "{how}: the survivor outlived its pane"
-        );
-        assert!(!pane.owns_group(), "{how}");
-        assert!(pane.state.lock().unwrap().zombie.is_none(), "{how}");
+                            echo \"bg:$!\"; sleep 1; exit 5";
+    let dir = TempDir::new("native-survivor");
+    let b = backend();
+    let info = b.run(&spec_line("surv", SURVIVOR, &dir)).unwrap();
+    let bg = printed_pid(&b, &info, "bg:");
+    let pane = pane_of(&b, &info);
+    let ended = b.wait(&info.reference(), LONG).unwrap();
+    assert_eq!(ended.reason, Some(WaitReason::Exit));
+    assert_eq!(ended.exit_code, Some(5));
+    thread::sleep(Duration::from_millis(300));
+    assert!(process_alive(bg), "the survivor got no grace");
+    assert!(
+        pane.owns_group(),
+        "the leader was reaped before its group ended"
+    );
+    assert!(
+        process_gone_within(bg, Duration::from_secs(5)),
+        "the survivor outlived its pane"
+    );
+    let end = Instant::now() + Duration::from_secs(5);
+    while pane.owns_group() && Instant::now() < end {
+        thread::sleep(Duration::from_millis(50));
     }
+    assert!(!pane.owns_group());
+    assert!(pane.state.lock().unwrap().reaped);
+    assert!(!process_alive(pane.pid), "the leader is still a zombie");
+    let out = b.remove(&info.reference(), None).unwrap();
+    assert!(!out.was_live);
+    assert_eq!(out.exit_code, Some(5));
 }
 
 /// Review N4: several keys are one guarded write, so a refusal writes none.
@@ -1084,4 +1076,167 @@ fn a_run_after_shutdown_is_ended() {
     assert!(pid > 1);
     assert!(!process_alive(pid), "late child {pid} survived");
     assert!(b.list(true).unwrap().terminals.is_empty());
+}
+
+// Issue #10: removed panes left the killed leader unreaped (exit code lost)
+// and descendants outside the pane's process group alive.
+
+/// The pid a pane printed after `tag`, e.g. `gc:1234`.
+fn printed_pid(b: &NativeBackend, info: &TerminalInfo, tag: &str) -> i32 {
+    let text = wait_for_screen(b, info, tag);
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix(tag))
+        .and_then(|pid| pid.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no {tag} pid in {text}"))
+}
+
+/// A program that ignores HUP and TERM and keeps writing while nobody else
+/// reads: removal kills it, reaps it at once and reports 128 + SIGKILL.
+#[test]
+fn a_killed_program_that_keeps_writing_is_reaped_with_its_signal_code() {
+    let dir = TempDir::new("native-flood-kill");
+    let b = backend();
+    let info = b
+        .run(&spec_line("flood", "trap '' HUP TERM; exec yes", &dir))
+        .unwrap();
+    let pid = pane_of(&b, &info).pid;
+    wait_for_screen(&b, &info, "y\ny");
+    let out = b
+        .remove(&info.reference(), Some(Duration::from_millis(500)))
+        .unwrap();
+    assert_eq!(out.stopped, Some(StopHow::Killed), "{out:?}");
+    assert_eq!(
+        out.exit_code,
+        Some(128 + i64::from(libc::SIGKILL)),
+        "{out:?}"
+    );
+    assert!(!process_alive(pid), "leader {pid} was not reaped");
+}
+
+/// A program that writes a lot of output when it gets the hangup signal, as
+/// a TUI does when it restores the terminal: it exits within the grace,
+/// because the output is still drained while it stops.
+#[test]
+fn a_program_that_writes_on_hangup_exits_within_the_grace() {
+    let dir = TempDir::new("native-flood-exit");
+    let b = backend();
+    let info = b
+        .run(&spec_line(
+            "tui",
+            "trap 'yes | head -c 400000; exit 7' HUP TERM; echo ready; \
+             while :; do sleep 1; done",
+            &dir,
+        ))
+        .unwrap();
+    let pid = pane_of(&b, &info).pid;
+    wait_for_screen(&b, &info, "ready");
+    let out = b.remove(&info.reference(), None).unwrap();
+    assert_eq!(out.stopped, Some(StopHow::Exited), "{out:?}");
+    assert_eq!(out.exit_code, Some(7), "{out:?}");
+    assert!(!process_alive(pid), "leader {pid} was not reaped");
+}
+
+/// A grandchild that leaves the pane's process group (`setpgid`) or its
+/// session (`setsid`, as kiro-cli's node acp-server does: `ps` shows it
+/// `Ss` with no terminal), with its stdio closed so it holds no terminal.
+fn escapee(how: &str) -> String {
+    format!(
+        "perl -MPOSIX -e 'my $r = {how}; die if !defined $r || $r == -1; \
+         print \"gc:$$\\n\"; \
+         close STDIN; close STDOUT; close STDERR; sleep 60'"
+    )
+}
+
+const ESCAPES: [&str; 2] = ["POSIX::setpgid(0, 0)", "POSIX::setsid()"];
+
+/// Removal ends descendants outside the process group and session.
+#[test]
+fn remove_ends_descendants_outside_the_group() {
+    for how in ESCAPES {
+        let dir = TempDir::new("native-escape-rm");
+        let b = backend();
+        let line = format!("{} & sleep 60", escapee(how));
+        let info = b.run(&spec_line("esc", &line, &dir)).unwrap();
+        let gc = printed_pid(&b, &info, "gc:");
+        thread::sleep(Duration::from_millis(600));
+        assert!(process_alive(gc), "{how}: the grandchild died early");
+        b.remove(&info.reference(), None).unwrap();
+        assert!(
+            process_gone_within(gc, Duration::from_secs(5)),
+            "{how}: grandchild {gc} outlived remove"
+        );
+    }
+}
+
+/// A grandchild whose parent already exited (reparented to pid 1) and that
+/// stayed in the pane's session is ended on removal too.
+#[test]
+fn remove_ends_a_reparented_descendant_in_the_session() {
+    let dir = TempDir::new("native-escape-orphan");
+    let b = backend();
+    let line = format!("({} &); sleep 60", escapee(ESCAPES[0]));
+    let info = b.run(&spec_line("orphan", &line, &dir)).unwrap();
+    let gc = printed_pid(&b, &info, "gc:");
+    thread::sleep(Duration::from_millis(600));
+    assert!(process_alive(gc), "the grandchild died early");
+    b.remove(&info.reference(), None).unwrap();
+    assert!(
+        process_gone_within(gc, Duration::from_secs(5)),
+        "grandchild {gc} outlived remove"
+    );
+}
+
+/// When the pane's program exits on its own, descendants it left behind,
+/// in another group or session and reparented to pid 1, are ended and the
+/// leader is reaped.
+#[test]
+fn pane_exit_ends_descendants_outside_the_group() {
+    for how in ESCAPES {
+        let dir = TempDir::new("native-escape-exit");
+        let b = backend();
+        let line = format!("{} & sleep 1; exit 4", escapee(how));
+        let info = b.run(&spec_line("esc", &line, &dir)).unwrap();
+        let pid = pane_of(&b, &info).pid;
+        let gc = printed_pid(&b, &info, "gc:");
+        let ended = b.wait(&info.reference(), LONG).unwrap();
+        assert_eq!(ended.reason, Some(WaitReason::Exit), "{how}");
+        assert_eq!(ended.exit_code, Some(4), "{how}");
+        assert!(
+            process_gone_within(gc, Duration::from_secs(5)),
+            "{how}: grandchild {gc} outlived its pane"
+        );
+        assert!(
+            process_gone_within(pid, Duration::from_secs(5)),
+            "{how}: leader {pid} was not reaped"
+        );
+    }
+}
+
+/// Shutdown and dropping the last handle end descendants outside the group.
+#[test]
+fn shutdown_and_drop_end_descendants_outside_the_group() {
+    for how in ESCAPES {
+        for drop_it in [false, true] {
+            let dir = TempDir::new("native-escape-drop");
+            let b = backend();
+            let line = format!("{} & sleep 60", escapee(how));
+            let info = b.run(&spec_line("esc", &line, &dir)).unwrap();
+            let pid = pane_of(&b, &info).pid;
+            let gc = printed_pid(&b, &info, "gc:");
+            thread::sleep(Duration::from_millis(600));
+            if drop_it {
+                drop(b);
+            } else {
+                b.shutdown();
+            }
+            assert!(
+                process_gone_within(gc, Duration::from_secs(5)),
+                "{how} drop={drop_it}: grandchild {gc} survived"
+            );
+            assert!(
+                process_gone_within(pid, Duration::from_secs(5)),
+                "{how} drop={drop_it}: leader {pid} was not reaped"
+            );
+        }
+    }
 }

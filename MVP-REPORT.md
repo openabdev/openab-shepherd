@@ -261,10 +261,12 @@ curl -s -i $URL -H "$AUTH" -H 'Content-Type: application/json' -d '{"jsonrpc":"2
   and never get a profile's env. A profile's program and what it runs (Kiro's tools)
   still hold its credential; a caller who can prompt that Kiro can try to make it reveal
   the key. Without a profiles file `start_pane` starts nothing.
-- **Native: finished panes keep a zombie leader** (`<defunct>`, at most 40) until removed,
-  evicted, replaced or Shepherd exits; it keeps the group id ours so the final SIGKILL can
-  never hit an unrelated group. Worst-case memory is about 520 MB (8 live + 32 finished
-  panes, each with full scrollback).
+- **Native: a finished pane's leftovers are ended when its program exits** (issue #10):
+  descendants get SIGHUP and SIGTERM, up to 2 s, then SIGKILL, and the leader is reaped
+  after that, so no `<defunct>` leader is kept. A descendant that is re-parented and
+  fully detaches (`setsid`, parents gone) before the next tree poll (about 250 ms) is
+  not seen; macOS has no unprivileged way to close this (ADR §11). Worst-case memory is about 520 MB
+  (8 live + 32 finished panes, each with full scrollback).
 - **Dialog parsing is still Kiro-specific.** `dialog::parse` knows only the kiro-cli 3.1.0 V3
   shell permission dialog, on both backends.
 - **Result and error shapes changed after the integration run.** `start_pane`, `get_status`,

@@ -344,15 +344,19 @@ runs at most 8 panes, and finished panes keep their screen memory until removed)
    say) finishes first; then the pane is read again, and the removal acts on what it
    finds then. If the name is gone by then, the result is `not_found`.
 2. If the program is running, stop it with signals, not keys: SIGHUP and SIGTERM to
-   its process group, up to `timeout` seconds (default 2) for the leader to exit,
-   then SIGKILL to the group, which also ends members that outlived the leader.
-   `stopped` is `exited` when the leader was gone by the end of the timeout and
-   `killed` when it had to be killed. Keys were rejected for this step: a program
-   may ignore Esc or Ctrl-C, or sit in a dialog, while signals reach every process
-   in the group. To let the program end its turn cleanly, call `interrupt_pane`
-   first. A finished pane gets no signals except the final SIGKILL to group members
-   that outlived its leader; `stopped` is then null and `exit_code` is the code it
-   ended with.
+   its process group and to every descendant of the program (native: also those
+   that moved to their own process group or session, such as kiro-cli's node
+   `acp-server.js`), up to `timeout` seconds (default 2) for them to exit, then
+   SIGKILL to the group and every descendant left. The pane's output is still read
+   while they stop, so a program that writes as it exits is not stuck. The leader is
+   reaped before the call returns. `stopped` is `exited` when the leader was gone by
+   the end of the timeout and `killed` when it had to be killed; `exit_code` is the
+   leader's code, or 128 + the signal (137 after the kill). Keys were rejected for
+   this step: a program may ignore Esc or Ctrl-C, or sit in a dialog, while signals
+   reach every process. To let the program end its turn cleanly, call
+   `interrupt_pane` first. A finished pane has already had its leftovers ended when
+   its program exited (see [Process groups](#native-backend)); `stopped` is then null
+   and `exit_code` is the code it ended with.
 3. Remove the pane. `list_panes` (even with `all: true`) no longer shows it, every
    later call naming it gets `not_found`, and `start_pane` can use the name again.
 
@@ -362,8 +366,8 @@ flight on the pane (it takes no lock) returns `outcome: "exited"`. With hc, the
 removal is herdr-core's own `kill` (hangup, terminate, kill, on its own timing, so
 `timeout` is not used) followed by `rm`; `stopped` is `killed` when herdr-core
 reports SIGKILL, `exited` for another signal or a plain exit, else `other`.
-Processes that left the pane's process group (`setsid`, daemonizing) are not
-reached.
+With hc, processes that left the pane's process group (`setsid`, daemonizing) are
+not reached.
 
 ### Pane lock
 
@@ -432,15 +436,23 @@ its own PTY, with a `vt100` emulator for the screen. No herdr-core and no
   `PATH`, `USER`, `LANG`, `TERM` or any `DYLD_*`/`LD_*` name (refused with
   `invalid_input`). Shepherd's token, token file path, profiles path,
   `OPENAB_SHEPHERD_BACKEND`, `HC_*` and everything else never reach a child. Descriptors are close-on-exec and native spawns are serialized.
-- **Process groups.** Each child is a session and group leader with the PTY as its
-  controlling terminal. Removing a pane (`remove_pane`) and Shepherd's exit on
-  SIGINT, SIGTERM or SIGHUP send SIGHUP and SIGTERM to the group, wait up to 2 s
-  (for `remove_pane`, its `timeout`) for the leader, then SIGKILL the group, which
-  also ends members that outlived the leader. A finished pane's group is ended the
-  same way when the pane is evicted or replaced by name. The leader is not reaped
-  until then (it shows as `<defunct>`, at most 40 of them): its zombie keeps the
-  group id from being reused, and Shepherd signals a group only while it holds
-  that id. If Shepherd is killed with SIGKILL, children get only the PTY hangup.
+- **Process groups and descendants.** Each child is a session and group leader with
+  the PTY as its controlling terminal. Shepherd also tracks every descendant of the
+  child, by pid and start time: by parent pid every 250 ms while the child runs and
+  again before any stop, and by membership of the child's group and session. So a
+  descendant that moves to its own group or session, or whose parent exits, is
+  still known. Removing a pane (`remove_pane`) and Shepherd's exit on SIGINT,
+  SIGTERM or SIGHUP send SIGHUP and SIGTERM to the group and the descendants, wait
+  up to 2 s (for `remove_pane`, its `timeout`), then stop (SIGSTOP) the group and
+  descendants until no new one appears and SIGKILL them all. When the program exits
+  on its own, what it left behind gets the same treatment at once. The leader stays
+  an unreaped zombie only during that stop, so its pid (the group and session id)
+  cannot be reused while Shepherd signals by it; a descendant is signalled only
+  while its pid still has the recorded start time. Known limit: a descendant that
+  is re-parented and fully detaches (new session, no terminal) before the next
+  look at the process table (about every 250 ms) is never seen and survives
+  (see Known limits). If Shepherd is killed with SIGKILL, children get only the
+  PTY hangup.
 - **Status.** OSC 7501 reports from the program are parsed in the emulator's
   stream (any field order, unknown keys ignored, split reads handled). The turn
   advances when the program leaves `working` or enters a new dialog (ADR §6).
@@ -636,8 +648,15 @@ machine that has kiro-cli (it takes only `--keep-dir` and opens no listener).
   retained, oldest evicted first) until removed.
 - **Native: RIS does not reset kitty flags**, and mode 1047 (alternate screen
   without cursor save) is not emulated.
-- **Native: processes that leave their process group** (`setsid`, daemonizing)
-  escape removal and Shepherd's exit.
+- **Native: a fast daemon escapes.** A descendant that is re-parented and fully
+  detaches (calls `setsid`, so it has no group, session or terminal link to the
+  pane, and its parents exit) before the next look at the process table, about
+  every 250 ms, is never seen. It survives `remove_pane`, the program's own exit,
+  and Shepherd's shutdown. One that only changes process group, or stays under a
+  live parent until the next look, is ended (issue #10). macOS offers no
+  unprivileged way to close this: kqueue `NOTE_TRACK` answers `ENOTSUP`, only root
+  can create a coalition, and there is no subreaper or cgroup (measured on macOS
+  15.7). A Linux subreaper is a follow-up.
 - **A profile's credential goes to that profile's program and what it runs.** A Kiro
   profile with `KIRO_API_KEY` gives the key to kiro-cli, and Kiro's tools inherit it,
   so a caller who can prompt that Kiro can try to make it reveal the key. Profiles

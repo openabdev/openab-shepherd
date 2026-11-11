@@ -1,7 +1,8 @@
 //! The PTY layer (ADR §3, §10, §11): `openpty`, spawning a child as its own
 //! session with the slave as its controlling terminal, the child's
 //! environment, and non-blocking I/O and signal helpers on the master. Every
-//! `unsafe` block of the native core is here.
+//! `unsafe` block of the native core is here, except the process-table reads
+//! in `procs.rs`.
 
 use super::term::{COLS, ROWS};
 use super::MAX_EXTRA_ENV;
