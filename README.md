@@ -134,4 +134,4 @@ is in [docs/operations.md](docs/operations.md#known-limits-mvp-scope).
 
 ## License
 
-License: to be decided.
+MIT. See [LICENSE](LICENSE).
