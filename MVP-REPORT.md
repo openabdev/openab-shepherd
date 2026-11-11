@@ -111,6 +111,7 @@ are listed in `src/hc/error_kinds.json`, extracted from that schema.
 | `list_panes` | `list_panes` | `terminal.list` | `all` |
 | `interrupt_pane` | `interrupt_pane` | `terminal.get` (twice, to lock the pane), `terminal.interrupt` | `terminal`, `timeout` (optional, 1 to 60 s) |
 | `answer_dialog` | `answer_dialog` | `terminal.get`, `terminal.read`, `terminal.keys` | `terminal`, `choice` (`allow_once` or `deny_once`) |
+| `remove_pane` | `remove_pane` | `terminal.get` (twice, to lock the pane; once more in the adapter), `terminal.kill` (live only), `terminal.rm` | `terminal`. Shepherd's `timeout` (0 to 60 s) is not sent; herdr-core times its own stop. |
 
 `call()` in the same file dispatches by tool name. Input checks run before any socket call.
 
@@ -252,8 +253,8 @@ curl -s -i $URL -H "$AUTH" -H 'Content-Type: application/json' -d '{"jsonrpc":"2
   pre-Enter check atomically (`conditional_keys` true), so the race above remains for hc
   only. openab-pty is not a backend.
 - **Native: no restart survival.** Native panes are children of Shepherd and end with it.
-  There is also no viewer or attach, and no MCP removal tool (`NativeBackend::remove` is
-  inherent only).
+  There is also no viewer or attach. `remove_pane` (added after the MVP) closes a pane
+  and frees its live slot; `list_panes` reports `live_panes` and `live_pane_limit`.
 - **Credentials reach a child only through a launch profile.** `start_pane` starts an
   operator-defined profile (`OPENAB_SHEPHERD_PROFILES`: fixed argv, allowed cwds, env
   from `keychain:`/`env:`/literal); caller `argv`/`line` need `allow_arbitrary_command`

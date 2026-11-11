@@ -184,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_the_eight_tools() {
+    fn tools_list_has_the_nine_tools() {
         let (client, _fake) = fake_client();
         let msg = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let out = handle_message(&client, &msg).unwrap();

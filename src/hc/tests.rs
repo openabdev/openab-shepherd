@@ -219,6 +219,118 @@ fn interrupt_pane_maps_to_terminal_interrupt() {
     assert_eq!(out["structuredContent"]["outcome"], "stopped");
 }
 
+/// remove_pane on a live pane: the two lookups, the adapter's own get, then
+/// terminal.kill and terminal.rm by address. How hc reports the end maps to
+/// Shepherd's words.
+#[test]
+fn remove_pane_kills_a_live_terminal_then_removes_it() {
+    let killed = |end: Value| {
+        let mut end = end;
+        end["address"] = json!("t8");
+        end["name"] = json!("work");
+        end["state"] = json!("finished");
+        ok(end)
+    };
+    for (end, stopped, exit_code) in [
+        (
+            json!({"signal": 9, "reason": "killed", "exit_code": null}),
+            "killed",
+            Value::Null,
+        ),
+        (
+            json!({"signal": 1, "reason": "killed", "exit_code": null}),
+            "exited",
+            Value::Null,
+        ),
+        (
+            json!({"reason": "exited", "exit_code": 0}),
+            "exited",
+            json!(0),
+        ),
+        (
+            json!({"reason": "hc-odd --force", "exit_code": null}),
+            "other",
+            Value::Null,
+        ),
+    ] {
+        let dir = TempDir::new("mcp-remove");
+        let sock = dir.path().join("core.sock");
+        let fake = serve_script(
+            &sock,
+            vec![
+                get_at("t8"),
+                get_at("t8"),
+                get_at("t8"),
+                killed(end.clone()),
+                ok(json!({"removed": "t8"})),
+            ],
+        );
+        let out = tool_out(handle_message(
+            &hc_shepherd(&sock),
+            &call_msg("remove_pane", json!({"terminal": "work", "timeout": 5})),
+        ));
+        let requests = fake.finish();
+        assert_eq!(
+            methods(&requests),
+            [
+                "terminal.get",
+                "terminal.get",
+                "terminal.get",
+                "terminal.kill",
+                "terminal.rm"
+            ],
+            "{end}"
+        );
+        for request in &requests[2..] {
+            assert_eq!(request["params"], json!({"terminal": "t8"}), "{end}");
+        }
+        assert_eq!(out["isError"], false, "{end}: {}", text_of(&out));
+        assert_eq!(
+            out["structuredContent"],
+            json!({"name": "work", "was_live": true, "stopped": stopped, "exit_code": exit_code}),
+            "{end}"
+        );
+        assert_no_hc_strings(&out);
+        assert!(!out.to_string().contains("t8"), "{out}");
+        assert!(!out.to_string().contains("hc-odd"), "{out}");
+    }
+}
+
+/// A finished terminal is not killed, only removed.
+#[test]
+fn remove_pane_removes_a_finished_terminal_without_kill() {
+    let dir = TempDir::new("mcp-remove-done");
+    let sock = dir.path().join("core.sock");
+    let fake = serve_script(
+        &sock,
+        vec![
+            finished_get(),
+            finished_get(),
+            finished_get(),
+            ok(json!({"removed": "t8"})),
+        ],
+    );
+    let out = tool_out(handle_message(
+        &hc_shepherd(&sock),
+        &call_msg("remove_pane", json!({"terminal": "work"})),
+    ));
+    let requests = fake.finish();
+    assert_eq!(
+        methods(&requests),
+        [
+            "terminal.get",
+            "terminal.get",
+            "terminal.get",
+            "terminal.rm"
+        ]
+    );
+    assert_eq!(
+        out["structuredContent"],
+        json!({"name": "work", "was_live": false, "stopped": null, "exit_code": 2})
+    );
+    assert_no_hc_strings(&out);
+}
+
 fn ok(result: Value) -> Value {
     json!({ "result": result })
 }
@@ -228,6 +340,14 @@ fn get_at(address: &str) -> Value {
     ok(
         json!({"address": address, "name": "work", "state": "live", "turn": 1,
               "reported": true, "status": {"app": "kiro-cli", "state": "done"}}),
+    )
+}
+
+/// A terminal.get reply for `work` after its program ended with code 2.
+fn finished_get() -> Value {
+    ok(
+        json!({"address": "t8", "name": "work", "state": "finished", "exit_code": 2,
+              "turn": 1, "reported": true, "status": null}),
     )
 }
 
@@ -747,13 +867,14 @@ fn herdr_addresses_do_not_reach_panes_through_mcp() {
                   "status": {"app": "kiro-cli", "state": "done"}}),
         )
     };
-    let tools: [(&str, Value); 6] = [
+    let tools: [(&str, Value); 7] = [
         ("send_input", json!({"text": "hi"})),
         ("read_output", json!({})),
         ("get_status", json!({})),
         ("wait_status", json!({"timeout": 1})),
         ("interrupt_pane", json!({})),
         ("answer_dialog", json!({"choice": "allow_once"})),
+        ("remove_pane", json!({})),
     ];
     // An unnamed pane by its address, then the pane named work by its address.
     for (address, lookup) in [("t1", unnamed()), ("t8", get_at("t8"))] {
@@ -1142,6 +1263,16 @@ fn fail_method(method: &str, error: Value) -> Value {
             json!({"terminal": "work"}),
             vec![get_at("t8"), get_at("t8")],
         ),
+        "terminal.kill" => (
+            "remove_pane",
+            json!({"terminal": "work"}),
+            vec![get_at("t8"), get_at("t8"), get_at("t8")],
+        ),
+        "terminal.rm" => (
+            "remove_pane",
+            json!({"terminal": "work"}),
+            vec![finished_get(), finished_get(), finished_get()],
+        ),
         "terminal.keys" => (
             "answer_dialog",
             json!({"terminal": "work", "choice": "allow_once"}),
@@ -1172,7 +1303,7 @@ fn fail_method(method: &str, error: Value) -> Value {
 fn every_hc_error_kind_reaches_mcp_as_a_shepherd_code() {
     let schema = schema();
     let methods = schema["methods"].as_object().expect("methods");
-    assert_eq!(methods.len(), 8, "the eight adapter methods");
+    assert_eq!(methods.len(), 10, "the ten adapter methods");
     let mut covered = Vec::new();
     for (method, kinds) in methods {
         for hc_kind in strings(kinds) {
@@ -1279,6 +1410,7 @@ fn get_status_and_list_panes_return_normalized_panes() {
     assert_eq!(
         list["structuredContent"],
         json!({"panes": [expected.clone()], "hidden_finished": 2,
+               "live_panes": 1, "live_pane_limit": null,
                "profiles": [], "allow_arbitrary_command": true})
     );
     assert_eq!(started["structuredContent"], expected);

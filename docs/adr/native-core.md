@@ -343,10 +343,10 @@ Nothing else passes, by construction (`env_clear()` first). In particular, `OPEN
 ## 11. Process groups, removal and shutdown
 
 - `setsid` in `pre_exec` makes the child a session and group leader (pgid = pid) with the PTY as its controlling terminal.
-- **Removal** is an inherent method, `NativeBackend::remove(&TerminalRef) -> Result<(), BackendError>`. The trait at 9022867 has no `remove`, and there is no MCP tool for it (**open**, Q3). It runs:
-  1. Set `shutdown`.
-  2. If the group id is still ours (below): `kill(-pgid, SIGHUP)` and `kill(-pgid, SIGTERM)`.
-  3. Wait on the condvar up to 2 s (`KILL_GRACE`) for `live == false`.
+- **Removal** is `TerminalBackend::remove(&TerminalRef, grace: Option<Duration>) -> Result<RemoveResult, BackendError>`, reached through the `remove_pane` tool (Q3, resolved). It runs:
+  1. Note whether the pane is live, and set `shutdown`.
+  2. If the group id is still ours (below): `kill(-pgid, SIGHUP)` and `kill(-pgid, SIGTERM)`. No key is sent first: a program can ignore Esc or Ctrl-C or sit in a dialog, while the signals reach the whole group.
+  3. Wait on the condvar up to `grace` (default 2 s, `KILL_GRACE`; `remove_pane` takes 0 to 60 s) for `live == false`. Still live at the end means `stopped: killed`, else `exited`; after the SIGKILL below, wait up to 2 s more for the reaper to record the exit code (137).
   4. Release: if the group id is still ours, `kill(-pgid, SIGKILL)` under `state`, then reap the leader. This catches group members left behind by the leader, including ones that ignore HUP and TERM and closed the PTY; ESRCH counts as success.
   5. Close the master and join the reader. The reader ends on EIO or after its next 200 ms poll.
   6. Remove the pane from the table.
@@ -493,7 +493,7 @@ The trait merged in #5 (`main` at `091aac3`) differs from `9022867` as follows. 
 5. **Kinds leaving a backend must pass through `backend::dialog_kind`.** Native keeps the raw kind internally (turn comparison, status log) and exports `dialog_kind(raw)`, so an unknown kind reaches Shepherd as `other`.
 6. **`tools::resolve` requires the pane `get` returns to carry exactly the caller's name, and `start_pane` always sets a name.** Native ids `n:<k>` contain `:`, which is outside the name alphabet, so an id never equals a valid name (§9 already relies on this).
 7. **`tools::start_pane` maps `run`'s `ErrorKind::NotFound` to "the program or working directory was not found".** Native therefore maps a spawn ENOENT and an absolute-but-missing cwd to `NotFound` (§3 and §10 said `Other` and `InvalidInput`). A relative cwd, or a cwd that exists but is not a directory, stays `InvalidInput`.
-8. **`Capabilities` still has only the five flags, and the trait still has no `remove`.** The decisions above apply unchanged: the four flags `program_status`, `history`, `native_wait` and `survives_restart` are added, and `remove` is an inherent method on `NativeBackend`.
+8. **`Capabilities` still has only the five flags, and the trait still has no `remove`** (since added; see Q3). The decisions above apply unchanged: the four flags `program_status`, `history`, `native_wait` and `survives_restart` are added, and `remove` is an inherent method on `NativeBackend`.
 
 ## 14. Testability and verification
 
@@ -561,6 +561,7 @@ The trait merged in #5 (`main` at `091aac3`) differs from `9022867` as follows. 
    Resolved (probe, 2026-11-10): exactly `1b 5d 37 35 30 31 3b` + `state=blocked:kind=permission:app=kiro-cli` + `07`, i.e. `\x1b]7501;state=blocked:kind=permission:app=kiro-cli\x07`, BEL-terminated, the same both times. Every other report is `state=<word>:app=kiro-cli`. The field is named `kind`; no parser change.
 2. **Capabilities fields.** Does the merged trait already include `program_status`, `history`, `native_wait` and `survives_restart`, and under which names? This design adds them if absent (§13).
 3. **No `remove` in the trait and no MCP removal tool.** Native panes end only when their program exits, by `interrupt` or by the program's own quit, or when Shepherd exits. With 8 live slots this can fill up. Proposal: a follow-up adding `TerminalBackend::remove` and a `remove_pane` tool (hc: `terminal.kill` + `terminal.rm`). It is out of scope here unless the owner wants it in this PR.
+   Resolved (follow-up): `TerminalBackend::remove` and the `remove_pane` tool (§11; hc: `terminal.get`, `terminal.kill` when live, `terminal.rm`). `list_panes` reports `live_panes` and `live_pane_limit` (`TerminalList.live_limit`, 8 here, none for hc).
 4. **No `RunSpec.env`.** Per-run env exists only as code-set `NativeConfig.extra_env`. Should the trait gain a validated `env` field?
    Resolved (review B2): yes. `RunSpec.env`, the `client_env` capability and `start_pane`'s `env` (§10).
 5. **Turn parity with hc** for `blocked` entered without `working`, and for a kind change while blocked. This design increments in both cases (§6).
@@ -598,5 +599,5 @@ The trait merged in #5 (`main` at `091aac3`) differs from `9022867` as follows. 
   - RIS does not reset kitty flags.
   - 1047 (alternate screen without cursor save) is not emulated.
   - Processes that leave their process group escape removal.
-  - No removal tool yet (Q3).
+  - No removal tool yet (Q3; since added: `remove_pane`).
 - New dependencies: `libc` and `vt100` (with vte, unicode-width, itoa, arrayvec and memchr).

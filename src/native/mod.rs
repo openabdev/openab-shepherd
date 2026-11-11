@@ -21,8 +21,9 @@ pub use status::LogEntry as StatusLogEntry;
 
 use crate::backend::{
     dialog_kind, BackendError, Capabilities, ErrorKind, InputGuard, InterruptOutcome,
-    InterruptResult, Key, KeysResult, ReadLimit, ReadSource, RunSpec, ScreenText, SendResult,
-    State, TerminalBackend, TerminalInfo, TerminalList, TerminalRef, WaitReason, WaitResult,
+    InterruptResult, Key, KeysResult, ReadLimit, ReadSource, RemoveResult, RunSpec, ScreenText,
+    SendResult, State, StopHow, TerminalBackend, TerminalInfo, TerminalList, TerminalRef,
+    WaitReason, WaitResult,
 };
 use crate::input::MAX_INPUT_BYTES;
 use keys::encode as encode_key;
@@ -173,26 +174,6 @@ impl NativeBackend {
                 env,
             }),
         }
-    }
-
-    /// End a pane and forget it: SIGHUP and SIGTERM to its group, up to 2 s
-    /// for the leader to exit, then SIGKILL to the group, which also ends
-    /// members that outlived the leader, and the leader is reaped.
-    pub fn remove(&self, t: &TerminalRef) -> Result<(), BackendError> {
-        let pane = self.inner.resolve(t)?;
-        pane.shutdown.store(true, Ordering::Release);
-        if pane.owns_group() {
-            pane.signal(libc::SIGHUP);
-            pane.signal(libc::SIGTERM);
-            pane.await_exit(Instant::now() + KILL_GRACE);
-        }
-        pane.release();
-        let reader = pane.reader.lock().ok().and_then(|mut slot| slot.take());
-        if let Some(reader) = reader {
-            let _ = reader.join();
-        }
-        self.inner.table()?.panes.retain(|p| !Arc::ptr_eq(p, &pane));
-        Ok(())
     }
 
     /// End every pane now, as dropping the last handle does: what Shepherd
@@ -1082,6 +1063,7 @@ impl TerminalBackend for NativeBackend {
         Ok(TerminalList {
             terminals,
             hidden_finished: Some(hidden),
+            live_limit: Some(MAX_LIVE_PANES as u64),
         })
     }
 
@@ -1264,5 +1246,50 @@ impl TerminalBackend for NativeBackend {
         drop(input);
         let outcome = pane.observe_interrupt(turn0, fg0, timeout.unwrap_or(INTERRUPT_DEFAULT))?;
         Ok(InterruptResult { key, outcome })
+    }
+
+    /// SIGHUP and SIGTERM to the pane's group, up to `grace` (default 2 s)
+    /// for the leader to exit, then SIGKILL to the group, which also ends
+    /// members that outlived the leader; the leader is reaped and the pane
+    /// leaves the table. No key is sent first.
+    fn remove(
+        &self,
+        t: &TerminalRef,
+        grace: Option<Duration>,
+    ) -> Result<RemoveResult, BackendError> {
+        let pane = self.inner.resolve(t)?;
+        let was_live = pane.is_live();
+        pane.shutdown.store(true, Ordering::Release);
+        let mut killed = false;
+        if pane.owns_group() {
+            pane.signal(libc::SIGHUP);
+            pane.signal(libc::SIGTERM);
+            pane.await_exit(Instant::now() + grace.unwrap_or(KILL_GRACE));
+            killed = pane.is_live();
+        }
+        pane.release();
+        let reader = pane.reader.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(reader) = reader {
+            let _ = reader.join();
+        }
+        if killed {
+            // The reaper records the exit code once the SIGKILL lands.
+            pane.await_exit(Instant::now() + KILL_GRACE);
+        }
+        self.inner.table()?.panes.retain(|p| !Arc::ptr_eq(p, &pane));
+        let exit_code = pane
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .exit_code;
+        Ok(RemoveResult {
+            was_live,
+            stopped: was_live.then_some(if killed {
+                StopHow::Killed
+            } else {
+                StopHow::Exited
+            }),
+            exit_code,
+        })
     }
 }

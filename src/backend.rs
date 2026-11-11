@@ -178,6 +178,8 @@ pub struct TerminalList {
     pub terminals: Vec<TerminalInfo>,
     /// Finished panes left out because `all` was false, when the backend says.
     pub hidden_finished: Option<u64>,
+    /// How many panes may run at once, when the backend has a limit.
+    pub live_limit: Option<u64>,
 }
 
 /// What to start. Exactly one of `argv` or `line` is set.
@@ -393,6 +395,37 @@ pub struct InterruptResult {
     pub outcome: InterruptOutcome,
 }
 
+/// How a removed pane's program stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopHow {
+    /// It ended within the grace period after the hangup and terminate
+    /// signals (or on its own).
+    Exited,
+    /// It was still running at the end of the grace period and was killed.
+    Killed,
+    Other,
+}
+
+impl StopHow {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Exited => "exited",
+            Self::Killed => "killed",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveResult {
+    /// Whether the program was running when the removal began.
+    pub was_live: bool,
+    /// How it stopped; None when it had already finished.
+    pub stopped: Option<StopHow>,
+    /// 128 + the signal number when a signal ended it; None when unknown.
+    pub exit_code: Option<i64>,
+}
+
 /// What went wrong, in Shepherd's terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -490,4 +523,14 @@ pub trait TerminalBackend: Send + Sync {
         t: &TerminalRef,
         timeout: Option<Duration>,
     ) -> Result<InterruptResult, BackendError>;
+    /// End the pane's program if it runs, then forget the pane: no later
+    /// call finds it, and its name can be used again. `grace` is how long the
+    /// program gets to end after the hangup and terminate signals before it
+    /// is killed; None is the backend's default. A backend that times its own
+    /// stop ignores it.
+    fn remove(
+        &self,
+        t: &TerminalRef,
+        grace: Option<Duration>,
+    ) -> Result<RemoveResult, BackendError>;
 }

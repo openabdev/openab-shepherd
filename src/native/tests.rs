@@ -636,7 +636,7 @@ fn remove_kills_the_whole_group() {
     let pid = pane_of(&b, &info).pid;
     thread::sleep(Duration::from_millis(300));
     assert!(group_alive(pid));
-    b.remove(&info.reference()).unwrap();
+    b.remove(&info.reference(), None).unwrap();
     assert!(group_gone_within(pid, Duration::from_secs(3)));
     let list = b.list(true).unwrap();
     assert!(list.terminals.iter().all(|p| p.id != info.id));
@@ -644,6 +644,161 @@ fn remove_kills_the_whole_group() {
         b.get(&info.reference()).unwrap_err().kind,
         ErrorKind::NotFound
     );
+}
+
+/// A Shepherd over a fresh native backend, and the backend itself.
+fn native_shepherd() -> (NativeBackend, Shepherd) {
+    let b = backend();
+    let sh = Shepherd::with_policy(b.clone(), LaunchPolicy::arbitrary());
+    (b, sh)
+}
+
+fn start_tool(sh: &Shepherd, dir: &TempDir, name: &str, line: &str) -> Value {
+    tools::call(
+        sh,
+        "start_pane",
+        &args(json!({"name": name, "line": line, "cwd": dir.path()})),
+    )
+    .unwrap()
+}
+
+fn listed_names(sh: &Shepherd) -> Vec<String> {
+    let list = tools::call(sh, "list_panes", &args(json!({"all": true}))).unwrap();
+    list["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// remove_pane on a running pane ends its whole process group, takes it out
+/// of list_panes(all=true), answers later calls with not_found, frees the
+/// name, and does not hang a wait_status in flight on it.
+#[test]
+fn remove_pane_ends_a_live_group_and_frees_the_name() {
+    let dir = TempDir::new("native-rmpane");
+    let (b, sh) = native_shepherd();
+    start_tool(&sh, &dir, "group", "sleep 300 & sleep 300 & wait");
+    start_tool(&sh, &dir, "other", "sleep 300");
+    let pid = pane_of(&b, &b.get(&TerminalRef::new("group")).unwrap()).pid;
+    thread::sleep(Duration::from_millis(300));
+    assert!(group_alive(pid));
+
+    let list = tools::call(&sh, "list_panes", &args(json!({}))).unwrap();
+    assert_eq!(list["live_panes"], 2);
+    assert_eq!(list["live_pane_limit"], MAX_LIVE_PANES);
+
+    let waiter = {
+        let sh = sh.clone();
+        thread::spawn(move || {
+            tools::call(
+                &sh,
+                "wait_status",
+                &args(json!({"terminal": "group", "timeout": 30})),
+            )
+        })
+    };
+    thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    let out = tools::call(&sh, "remove_pane", &args(json!({"terminal": "group"}))).unwrap();
+    assert_eq!(out["name"], "group");
+    assert_eq!(out["was_live"], true);
+    assert_eq!(out["stopped"], "exited", "{out}");
+    // sh ended on the hangup or terminate signal.
+    let code = out["exit_code"].as_i64().unwrap();
+    assert!(code == 128 + 1 || code == 128 + 15, "{out}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(group_gone_within(pid, Duration::from_secs(3)));
+
+    // The wait in flight ends (exited), or started after the removal.
+    match waiter.join().unwrap() {
+        Ok(wait) => assert_eq!(wait["outcome"], "exited", "{wait}"),
+        Err(err) => assert_eq!(err.data["error"], "not_found", "{}", err.text),
+    }
+
+    assert_eq!(listed_names(&sh), ["other"]);
+    let list = tools::call(&sh, "list_panes", &args(json!({}))).unwrap();
+    assert_eq!(list["live_panes"], 1);
+    for (tool, extra) in [
+        ("send_input", json!({"text": "hi"})),
+        ("answer_dialog", json!({"choice": "allow_once"})),
+        ("get_status", json!({})),
+        ("remove_pane", json!({})),
+    ] {
+        let mut a = args(extra);
+        a.insert("terminal".to_string(), json!("group"));
+        let err = tools::call(&sh, tool, &a).unwrap_err();
+        assert_eq!(err.data["error"], "not_found", "{tool}");
+    }
+
+    // The name is free again.
+    let again = start_tool(&sh, &dir, "group", "sleep 300");
+    assert_eq!(again["name"], "group");
+    assert_eq!(again["live"], true);
+    let status = tools::call(&sh, "get_status", &args(json!({"terminal": "group"}))).unwrap();
+    assert_eq!(status["live"], true);
+    assert_eq!(listed_names(&sh), ["other", "group"]);
+}
+
+/// A program that ignores the hangup and terminate signals is killed once the
+/// timeout passes.
+#[test]
+fn remove_pane_kills_a_program_that_ignores_the_signals() {
+    let dir = TempDir::new("native-rmpane-kill");
+    let (b, sh) = native_shepherd();
+    start_tool(
+        &sh,
+        &dir,
+        "stubborn",
+        "trap '' HUP TERM; echo ready; sleep 300",
+    );
+    let info = b.get(&TerminalRef::new("stubborn")).unwrap();
+    let pid = pane_of(&b, &info).pid;
+    wait_for_screen(&b, &info, "ready");
+    let out = tools::call(
+        &sh,
+        "remove_pane",
+        &args(json!({"terminal": "stubborn", "timeout": 0.5})),
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        json!({"name": "stubborn", "was_live": true, "stopped": "killed",
+               "exit_code": 128 + libc::SIGKILL})
+    );
+    assert!(group_gone_within(pid, Duration::from_secs(3)));
+    assert!(listed_names(&sh).is_empty());
+}
+
+/// A finished pane is removed without signals, with its exit code.
+#[test]
+fn remove_pane_removes_a_finished_pane() {
+    let dir = TempDir::new("native-rmpane-done");
+    let (_b, sh) = native_shepherd();
+    start_tool(&sh, &dir, "done", "exit 3");
+    let wait = tools::call(
+        &sh,
+        "wait_status",
+        &args(json!({"terminal": "done", "timeout": 10})),
+    )
+    .unwrap();
+    assert_eq!(wait["outcome"], "exited");
+    let list = tools::call(&sh, "list_panes", &args(json!({}))).unwrap();
+    assert_eq!(list["live_panes"], 0);
+    assert_eq!(list["hidden_finished"], 1);
+    assert_eq!(listed_names(&sh), ["done"]);
+    let out = tools::call(&sh, "remove_pane", &args(json!({"terminal": "done"}))).unwrap();
+    assert_eq!(
+        out,
+        json!({"name": "done", "was_live": false, "stopped": null, "exit_code": 3})
+    );
+    assert!(listed_names(&sh).is_empty());
+    let list = tools::call(&sh, "list_panes", &args(json!({}))).unwrap();
+    assert_eq!(list["hidden_finished"], 0);
+
+    let err = tools::call(&sh, "remove_pane", &args(json!({"terminal": "nope"}))).unwrap_err();
+    assert_eq!(err.data["error"], "not_found");
 }
 
 // (h)
@@ -703,7 +858,9 @@ fn a_group_member_that_outlives_the_leader_is_ended() {
         assert!(process_alive(bg), "{how}: the survivor died early");
         assert!(pane.owns_group(), "{how}: the leader was reaped early");
         match how {
-            "remove" => b.remove(&info.reference()).unwrap(),
+            "remove" => {
+                b.remove(&info.reference(), None).unwrap();
+            }
             "shutdown" => {
                 b.shutdown();
                 assert!(b.list(true).unwrap().terminals.is_empty());

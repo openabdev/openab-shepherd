@@ -77,6 +77,15 @@
       "machine_unknown",
       "not_found",
       "unavailable"
+    ],
+    "terminal.kill": [
+      "machine_unknown",
+      "not_found"
+    ],
+    "terminal.rm": [
+      "live",
+      "machine_unknown",
+      "not_found"
     ]
   }
 }

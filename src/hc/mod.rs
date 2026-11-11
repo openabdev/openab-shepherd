@@ -11,6 +11,7 @@
 //!   keys      -> terminal.keys (no condition: hc has none)
 //!   wait      -> terminal.wait
 //!   interrupt -> terminal.interrupt
+//!   remove    -> terminal.get, terminal.kill (live only), terminal.rm
 
 mod rpc;
 
@@ -21,9 +22,9 @@ mod tests;
 
 use crate::backend::{
     dialog_kind, BackendError, Capabilities, ErrorKind, InputGuard, InterruptOutcome,
-    InterruptResult, Key, KeysResult, ProgramStatus, ReadLimit, ReadSource, RunSpec, ScreenText,
-    SendResult, State, TerminalBackend, TerminalInfo, TerminalList, TerminalRef, WaitReason,
-    WaitResult,
+    InterruptResult, Key, KeysResult, ProgramStatus, ReadLimit, ReadSource, RemoveResult, RunSpec,
+    ScreenText, SendResult, State, StopHow, TerminalBackend, TerminalInfo, TerminalList,
+    TerminalRef, WaitReason, WaitResult,
 };
 use rpc::{HerdrClient, HerdrError, DEFAULT_TIMEOUT, WAIT_SOCKET_SLACK};
 use serde_json::{json, Map, Value};
@@ -123,6 +124,7 @@ impl TerminalBackend for HcBackend {
         Ok(TerminalList {
             terminals,
             hidden_finished: result.get("hidden_finished").and_then(Value::as_u64),
+            live_limit: None,
         })
     }
 
@@ -288,6 +290,36 @@ impl TerminalBackend for HcBackend {
             None => return Err(protocol("terminal.interrupt reply has no `outcome`")),
         };
         Ok(InterruptResult { key, outcome })
+    }
+
+    /// terminal.get, then terminal.kill when the terminal is live (hc's own
+    /// hangup, terminate, kill sequence, so `grace` is not used), then
+    /// terminal.rm.
+    fn remove(
+        &self,
+        t: &TerminalRef,
+        _grace: Option<Duration>,
+    ) -> Result<RemoveResult, BackendError> {
+        let target = || vec![("terminal", json!(t.as_str()))];
+        let before = self.get(t)?;
+        let mut removed = RemoveResult {
+            was_live: before.live,
+            stopped: None,
+            exit_code: before.exit_code,
+        };
+        if before.live {
+            let ended = self.call("terminal.kill", target(), DEFAULT_TIMEOUT)?;
+            let signal = ended.get("signal").and_then(Value::as_i64);
+            let reason = str_field(&ended, "reason");
+            removed.stopped = Some(match (signal, reason.as_deref()) {
+                (Some(9), _) => StopHow::Killed,
+                (Some(_), _) | (None, Some("exited")) => StopHow::Exited,
+                _ => StopHow::Other,
+            });
+            removed.exit_code = ended.get("exit_code").and_then(Value::as_i64);
+        }
+        self.call("terminal.rm", target(), DEFAULT_TIMEOUT)?;
+        Ok(removed)
     }
 }
 

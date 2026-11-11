@@ -41,7 +41,7 @@ later is a contained change.
 | `src/hc/mod.rs` | `HcBackend`: the herdr-core adapter. The only code that knows hc method names, JSON fields, and error kinds |
 | `src/hc/rpc.rs` | JSON-RPC 2.0 client over the herdr-core Unix socket |
 | `src/hc/fake.rs`, `src/hc/tests.rs` | Test-only: a fake hc socket, and tool tests over the hc wire |
-| `src/tools.rs` | The eight tools, their schemas, the safety rules, and the backend calls each one makes |
+| `src/tools.rs` | The nine tools, their schemas, the safety rules, and the backend calls each one makes |
 | `src/dialog.rs` | Text parser for the kiro-cli permission dialog |
 | `src/mcp.rs` | MCP message handling |
 | `src/http.rs` | Loopback Host check, bearer auth, POST handling |
@@ -188,7 +188,7 @@ the pane found carries exactly that name. herdr-core's `get` also accepts an add
 (`t9`), so this check is what keeps addresses out: a call naming an address, whether
 of an unnamed pane or of a named one, fails with `not_found` and nothing else reaches
 the backend. Calls after the lookup use the pane's internal id. `send_input`,
-`interrupt_pane`, and `answer_dialog` resolve the pane twice (see
+`interrupt_pane`, `answer_dialog`, and `remove_pane` resolve the pane twice (see
 [Pane lock](#pane-lock)). The implementing function is in
 `src/tools.rs`; the herdr-core method behind each backend call is listed in
 [Terminal backend](#terminal-backend).
@@ -200,9 +200,10 @@ the backend. Calls after the lookup use the pane's internal id. `send_input`,
 | `read_output` | `get`, `read` | `terminal`, `lines` (0 to 10000) | `text` (escapes stripped), `complete`, `source` (`screen`, `history`, `stitched`, or `other`), `reason` (why only the screen was read: `blocked`, `other`, or null) |
 | `get_status` | `get` | `terminal` | a [pane object](#pane-object) plus `terminal` |
 | `wait_status` | `get`, `wait`, then `get` if it ended blocked without a kind | `terminal`, `timeout` (1 to 1800 s, default 30) | `terminal`, `outcome`, `turn_complete`, `ended`, `reason`, `status` (a state word), `kind`, `exit_code`, `turn`, and `status_now` when the extra `get` ran |
-| `list_panes` | `list` | `all` | `panes` (pane objects), `hidden_finished` (finished panes left out; null if the backend does not say), `profiles` (`name` and `cwds` of each launch profile), `allow_arbitrary_command` |
+| `list_panes` | `list` | `all` | `panes` (pane objects), `hidden_finished` (finished panes left out; null if the backend does not say), `live_panes` (running panes now), `live_pane_limit` (how many may run at once: 8 on the native backend, null on hc), `profiles` (`name` and `cwds` of each launch profile), `allow_arbitrary_command` |
 | `interrupt_pane` | `get` (twice), `interrupt` | `terminal`, `timeout` (1 to 60 s, optional) | `terminal`, `key` (the stop key the backend chose: `esc`, `ctrl+c`, or `other`), `outcome` (`stopped`, `exited`, `still_working`, `unknown`, or `other`) |
 | `answer_dialog` | `get`, `read`, `keys` | `terminal`, `choice` (`allow_once` or `deny_once`) | `terminal`, `choice`, `selected`, `title`, `command`, `options`, `moves`, `keys_result` (`status`, `turn`) |
+| `remove_pane` | `get` (twice), `remove` | `terminal`, `timeout` (0 to 60 s, default 2: the grace before the kill) | `name`, `was_live` (the program was running), `stopped` (`exited`, `killed`, `other`, or null when it had already finished), `exit_code` (128 + the signal number when a signal ended it; null when unknown). See [remove_pane](#remove_pane) |
 
 Tool results carry `structuredContent` and a text copy. Unknown tool names are
 JSON-RPC errors.
@@ -334,9 +335,39 @@ What this guarantees, and what it does not:
   would then select whatever is under the cursor. The design accepts this because
   Shepherd is meant to be the only client of the socket.
 
+### remove_pane
+
+Closes a pane and forgets it, so callers can free a live slot (the native backend
+runs at most 8 panes, and finished panes keep their screen memory until removed).
+
+1. Take the [pane lock](#pane-lock). A call already holding it (an `answer_dialog`,
+   say) finishes first; then the pane is read again, and the removal acts on what it
+   finds then. If the name is gone by then, the result is `not_found`.
+2. If the program is running, stop it with signals, not keys: SIGHUP and SIGTERM to
+   its process group, up to `timeout` seconds (default 2) for the leader to exit,
+   then SIGKILL to the group, which also ends members that outlived the leader.
+   `stopped` is `exited` when the leader was gone by the end of the timeout and
+   `killed` when it had to be killed. Keys were rejected for this step: a program
+   may ignore Esc or Ctrl-C, or sit in a dialog, while signals reach every process
+   in the group. To let the program end its turn cleanly, call `interrupt_pane`
+   first. A finished pane gets no signals except the final SIGKILL to group members
+   that outlived its leader; `stopped` is then null and `exit_code` is the code it
+   ended with.
+3. Remove the pane. `list_panes` (even with `all: true`) no longer shows it, every
+   later call naming it gets `not_found`, and `start_pane` can use the name again.
+
+A `send_input`, `interrupt_pane` or `answer_dialog` that was waiting for the lock
+gets `not_found` once the removal is done, and nothing is typed. A `wait_status` in
+flight on the pane (it takes no lock) returns `outcome: "exited"`. With hc, the
+removal is herdr-core's own `kill` (hangup, terminate, kill, on its own timing, so
+`timeout` is not used) followed by `rm`; `stopped` is `killed` when herdr-core
+reports SIGKILL, `exited` for another signal or a plain exit, else `other`.
+Processes that left the pane's process group (`setsid`, daemonizing) are not
+reached.
+
 ### Pane lock
 
-`send_input`, `interrupt_pane`, and `answer_dialog` hold a per-pane lock for their
+`send_input`, `interrupt_pane`, `answer_dialog`, and `remove_pane` hold a per-pane lock for their
 whole sequence. The lock is keyed by the pane's backend id (internal, never returned), so two calls
 that resolve to the same pane share one lock. To find the id, the tool resolves the
 name (a `get`, checked as above) before taking the lock, then resolves it again inside
@@ -347,12 +378,12 @@ Read-only tools (`read_output`, `get_status`, `wait_status`, `list_panes`) take 
 lock. A call waiting for the lock waits as long as the holder runs (an
 `interrupt_pane` holds it for up to its timeout; an `answer_dialog` holds it for up
 to the 3 s render wait plus its other steps: up to 0.8 s of cursor confirmation and
-each backend call).
+each backend call; a `remove_pane` holds it for up to its timeout plus about 2 s).
 
 ## Terminal backend
 
 `src/backend.rs` defines a synchronous `TerminalBackend` trait: `capabilities`, `run`,
-`get`, `list`, `read`, `send`, `keys`, `wait`, and `interrupt`. The tools in
+`get`, `list`, `read`, `send`, `keys`, `wait`, `interrupt`, and `remove`. The tools in
 `src/tools.rs` call only the trait, and every type they see (`TerminalInfo`,
 `ProgramStatus`, `ScreenText`, `WaitResult`, `Key`, `BackendError`, ...) is Shepherd's
 own. The safety rules stay in Shepherd whatever the backend: input validation, the
@@ -402,9 +433,9 @@ its own PTY, with a `vt100` emulator for the screen. No herdr-core and no
   `invalid_input`). Shepherd's token, token file path, profiles path,
   `OPENAB_SHEPHERD_BACKEND`, `HC_*` and everything else never reach a child. Descriptors are close-on-exec and native spawns are serialized.
 - **Process groups.** Each child is a session and group leader with the PTY as its
-  controlling terminal. Removing a pane (`NativeBackend::remove`, inherent; there is
-  no MCP tool) and Shepherd's exit on SIGINT, SIGTERM or SIGHUP send SIGHUP and
-  SIGTERM to the group, wait up to 2 s for the leader, then SIGKILL the group, which
+  controlling terminal. Removing a pane (`remove_pane`) and Shepherd's exit on
+  SIGINT, SIGTERM or SIGHUP send SIGHUP and SIGTERM to the group, wait up to 2 s
+  (for `remove_pane`, its `timeout`) for the leader, then SIGKILL the group, which
   also ends members that outlived the leader. A finished pane's group is ended the
   same way when the pane is evicted or replaced by name. The leader is not reaped
   until then (it shows as `<defunct>`, at most 40 of them): its zombie keeps the
@@ -441,7 +472,7 @@ its own PTY, with a `vt100` emulator for the screen. No herdr-core and no
 | Paste settle | 100 ms quiet, at most 1 s |
 | Start wait | 2 s |
 | Read sync wait | 150 ms |
-| Kill grace | 2 s |
+| Kill grace | 2 s (`remove_pane` `timeout`: 0 to 60 s) |
 | Interrupt default | 10 s |
 
 Worst case: 8 live and 32 retained finished panes each keep an emulator with full
@@ -464,6 +495,7 @@ herdr-core is optional: only this backend needs it. Trait call to herdr-core met
 | `keys` | `terminal.keys` | no condition |
 | `wait` | `terminal.wait` | socket timeout is the wait plus 15 s |
 | `interrupt` | `terminal.interrupt` | |
+| `remove` | `terminal.get`, then `terminal.kill` if live, then `terminal.rm` | herdr-core times its own stop; the grace is not sent |
 
 hc error kinds map to Shepherd codes: `not_found` and `machine_unknown` to
 `not_found`, `name_taken` to `name_taken`, `blocked` to `pane_blocked`,
@@ -598,9 +630,10 @@ machine that has kiro-cli (it takes only `--keep-dir` and opens no listener).
   when Shepherd exits.
 - **Native: no viewer or attach.** Nobody can watch or type into a native pane
   except through the tools.
-- **Native: no removal tool.** Panes end when their program exits (or by
-  `interrupt_pane`), or when Shepherd exits; `NativeBackend::remove` exists only as
-  an inherent method. With 8 live slots this can fill up.
+- **Native: 8 live panes.** `start_pane` is refused while 8 panes run. Free a slot
+  with `remove_pane`; `list_panes` reports `live_panes` and `live_pane_limit`.
+  Finished panes do not count against the 8 but keep their memory (up to 32 are
+  retained, oldest evicted first) until removed.
 - **Native: RIS does not reset kitty flags**, and mode 1047 (alternate screen
   without cursor save) is not emulated.
 - **Native: processes that leave their process group** (`setsid`, daemonizing)

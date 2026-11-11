@@ -4,14 +4,15 @@
 
 use crate::backend::{
     BackendError, Capabilities, ErrorKind, InputGuard, InterruptResult, Key, KeysResult,
-    ProgramStatus, RunSpec, ScreenText, SendResult, State, TerminalBackend, TerminalInfo,
-    TerminalList, TerminalRef, WaitResult,
+    ProgramStatus, RemoveResult, RunSpec, ScreenText, SendResult, State, StopHow, TerminalBackend,
+    TerminalInfo, TerminalList, TerminalRef, WaitResult,
 };
 use crate::panelock::PaneLocks;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -70,10 +71,13 @@ pub struct FakeState {
     pub keys: Vec<Vec<Key>>,
     /// Specs passed to `run` (which is still refused).
     pub runs: Vec<RunSpec>,
+    /// When set, the next `remove` signals the sender once it has started,
+    /// then waits for the receiver before it removes the pane.
+    pub remove_gate: Option<(Sender<()>, Receiver<()>)>,
 }
 
-/// An in-memory backend. `get`, `send`, and (with [`FakeState::screen`] set)
-/// `read` and `keys` do real work; every other call is recorded and refused as
+/// An in-memory backend. `get`, `send`, `remove`, and (with
+/// [`FakeState::screen`] set) `read` and `keys` do real work; every other call is recorded and refused as
 /// unsupported. With `conditional_input`, `send` refuses a blocked pane itself,
 /// as a backend with an atomic guard would; with `conditional_keys`, `keys`
 /// enforces its guard the same way.
@@ -275,5 +279,26 @@ impl TerminalBackend for FakeBackend {
         _timeout: Option<Duration>,
     ) -> Result<InterruptResult, BackendError> {
         self.unsupported("interrupt")
+    }
+
+    /// Forget the pane; a live one counts as having exited.
+    fn remove(
+        &self,
+        t: &TerminalRef,
+        _grace: Option<Duration>,
+    ) -> Result<RemoveResult, BackendError> {
+        self.record("remove");
+        let gate = self.state.lock().unwrap().remove_gate.take();
+        if let Some((started, proceed)) = gate {
+            started.send(()).unwrap();
+            proceed.recv().unwrap();
+        }
+        let pane = self.find(t)?;
+        self.state.lock().unwrap().panes.retain(|p| p.id != pane.id);
+        Ok(RemoveResult {
+            was_live: pane.live,
+            stopped: pane.live.then_some(StopHow::Exited),
+            exit_code: pane.exit_code,
+        })
     }
 }

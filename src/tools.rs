@@ -1,4 +1,4 @@
-//! The eight MCP tools. They talk only to [`TerminalBackend`]; the safety rules
+//! The nine MCP tools. They talk only to [`TerminalBackend`]; the safety rules
 //! (input validation, the pane lock, refusing to type into a blocked pane, and
 //! answer_dialog's checks) are enforced here, whatever the backend.
 //!
@@ -13,11 +13,12 @@
 //!   list_panes      -> list
 //!   interrupt_pane  -> get (x2, see lock_pane), interrupt
 //!   answer_dialog   -> get, read, keys
+//!   remove_pane     -> get (x2, see lock_pane), remove
 
 use crate::ansi::strip_terminal_escapes;
 use crate::backend::{
     dialog_kind, status_json, BackendError, ErrorKind, InputGuard, Key, KeysResult, RunSpec, State,
-    TerminalBackend, TerminalInfo, TerminalRef, WaitReason,
+    StopHow, TerminalBackend, TerminalInfo, TerminalRef, WaitReason,
 };
 use crate::dialog::{self, Choice};
 use crate::input::{validate_input, validate_name};
@@ -28,7 +29,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-pub const TOOL_NAMES: [&str; 8] = [
+pub const TOOL_NAMES: [&str; 9] = [
     "start_pane",
     "send_input",
     "read_output",
@@ -37,12 +38,18 @@ pub const TOOL_NAMES: [&str; 8] = [
     "list_panes",
     "interrupt_pane",
     "answer_dialog",
+    "remove_pane",
 ];
 pub const READ_MAX_LINES: u64 = 10_000;
 pub const WAIT_MIN_SECONDS: f64 = 1.0;
 pub const WAIT_MAX_SECONDS: f64 = 1800.0;
 pub const WAIT_DEFAULT_SECONDS: f64 = 30.0;
 pub const INTERRUPT_MAX_SECONDS: f64 = 60.0;
+/// remove_pane's grace period: how long a running program gets to end after
+/// the hangup and terminate signals before it is killed.
+pub const REMOVE_MIN_SECONDS: f64 = 0.0;
+pub const REMOVE_MAX_SECONDS: f64 = 60.0;
+pub const REMOVE_DEFAULT_SECONDS: f64 = 2.0;
 /// answer_dialog re-reads the screen up to this many times, waiting for the
 /// cursor to land on the target after the moves (the backend may deliver keys
 /// after a quiet period, and the program redraws after that).
@@ -211,7 +218,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "list_panes",
-            "description": "List panes, each in the same shape start_pane returns. all=true includes finished panes; hidden_finished counts the ones left out. Also returns profiles (each launch profile's name and the directories it allows) and allow_arbitrary_command (whether start_pane takes argv or line).",
+            "description": "List panes, each in the same shape start_pane returns. all=true includes finished panes; hidden_finished counts the ones left out. live_panes counts the running panes and live_pane_limit is how many may run at once (null when the backend sets no limit); start_pane is refused at the limit, so remove panes you no longer need with remove_pane. Also returns profiles (each launch profile's name and the directories it allows) and allow_arbitrary_command (whether start_pane takes argv or line).",
             "inputSchema": {
                 "type": "object",
                 "properties": {"all": {"type": "boolean", "default": false}}
@@ -240,6 +247,18 @@ pub fn definitions() -> Value {
                 },
                 "required": ["terminal", "choice"]
             }
+        },
+        {
+            "name": "remove_pane",
+            "description": "Close a pane and forget it. It waits for any other Shepherd call that types into the same pane to finish first. If the program is running, Shepherd sends its process group the hangup and terminate signals, waits up to timeout seconds (default 2) for it to end, then kills whatever is left of the group. No key is pressed first; use interrupt_pane before it if the program should stop its turn cleanly. Afterwards list_panes (even with all=true) no longer shows the pane, later calls that name it get not_found, and its name can be used again. Returns name, was_live (whether the program was running), stopped (exited: it ended within the timeout; killed: it had to be killed; other: the backend could not say; null when it had already finished) and exit_code (128 + the signal number when a signal ended it; null when unknown). A backend that times its own stop ignores timeout.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "terminal": {"type": "string", "description": "Pane name, as start_pane or list_panes returned it."},
+                    "timeout": {"type": "number", "minimum": REMOVE_MIN_SECONDS, "maximum": REMOVE_MAX_SECONDS, "default": REMOVE_DEFAULT_SECONDS}
+                },
+                "required": ["terminal"]
+            }
         }
     ])
 }
@@ -255,6 +274,7 @@ pub fn call(sh: &Shepherd, name: &str, args: &Args) -> Result<Value, ToolError> 
         "list_panes" => list_panes(sh, args),
         "interrupt_pane" => interrupt_pane(sh, args),
         "answer_dialog" => answer_dialog(sh, args),
+        "remove_pane" => remove_pane(sh, args),
         other => Err(format!("unknown tool: {other}").into()),
     }
 }
@@ -683,10 +703,14 @@ fn list_panes(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         .list(all)
         .map_err(|err| backend_failure(None, err))?;
     let panes: Vec<Value> = list.terminals.iter().map(TerminalInfo::to_json).collect();
+    // Running panes are listed whether or not `all` is set.
+    let live_panes = list.terminals.iter().filter(|pane| pane.live).count();
     let launch = sh.policy.to_json();
     Ok(json!({
         "panes": panes,
         "hidden_finished": list.hidden_finished,
+        "live_panes": live_panes,
+        "live_pane_limit": list.live_limit,
         "profiles": launch["profiles"],
         "allow_arbitrary_command": launch["allow_arbitrary_command"],
     }))
@@ -704,6 +728,26 @@ fn interrupt_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         "terminal": terminal,
         "key": result.key.as_str(),
         "outcome": result.outcome.as_str(),
+    }))
+}
+
+/// Stop the pane's program if it runs, then remove the pane, holding the pane
+/// lock throughout. A call that waited for the lock and finds the name gone
+/// gets not_found from `lock_pane`.
+fn remove_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
+    let terminal = terminal_arg(args)?;
+    let grace = optional_number(args, "timeout", REMOVE_MIN_SECONDS, REMOVE_MAX_SECONDS)?
+        .unwrap_or(REMOVE_DEFAULT_SECONDS);
+    let (_guard, pane, _) = lock_pane(sh, &terminal)?;
+    let removed = sh
+        .backend
+        .remove(&pane, Some(Duration::from_secs_f64(grace)))
+        .map_err(|err| backend_failure(Some(&terminal), err))?;
+    Ok(json!({
+        "name": terminal,
+        "was_live": removed.was_live,
+        "stopped": removed.stopped.as_ref().map(StopHow::as_str),
+        "exit_code": removed.exit_code,
     }))
 }
 
@@ -1176,6 +1220,7 @@ mod tests {
                 ("wait_status", json!({"timeout": 1})),
                 ("interrupt_pane", json!({})),
                 ("answer_dialog", json!({"choice": "allow_once"})),
+                ("remove_pane", json!({})),
             ] {
                 let mut a = args(extra);
                 a.insert("terminal".to_string(), json!(terminal));
@@ -1186,7 +1231,7 @@ mod tests {
         }
         // Only the lookups ran; nothing reached either pane.
         assert!(fake.calls().iter().all(|call| *call == "get"));
-        assert_eq!(fake.calls().len(), 12);
+        assert_eq!(fake.calls().len(), 14);
         assert!(fake.state.lock().unwrap().sent.is_empty());
 
         // The name works, and the result names the pane by it.
@@ -1195,6 +1240,125 @@ mod tests {
         let out = call(&sh, "get_status", &args(json!({"terminal": "work"}))).unwrap();
         assert_eq!(out["terminal"], "work");
         assert_eq!(out["name"], "work");
+    }
+
+    #[test]
+    fn remove_pane_checks_its_arguments_before_any_call() {
+        let fake = FakeBackend::new(true);
+        fake.add_pane("work", State::Idle, None);
+        let sh = shepherd(&fake);
+        for bad in [json!(-1), json!(60.5), json!("2")] {
+            let err = call(
+                &sh,
+                "remove_pane",
+                &args(json!({"terminal": "work", "timeout": bad})),
+            )
+            .unwrap_err();
+            assert_eq!(err.data["error"], "invalid_input", "{bad}");
+        }
+        let err = call(&sh, "remove_pane", &args(json!({}))).unwrap_err();
+        assert_eq!(err.data["error"], "invalid_input");
+        assert!(fake.calls().is_empty());
+
+        // An unknown name: only the lookup runs.
+        let err = call(&sh, "remove_pane", &args(json!({"terminal": "nope"}))).unwrap_err();
+        assert_eq!(err.data["error"], "not_found");
+        assert_eq!(err.data["terminal"], "nope");
+        assert_eq!(fake.calls(), ["get"]);
+    }
+
+    /// Another call holds the pane lock; the pane's program ends meanwhile.
+    /// remove_pane waits for the lock, then reports the state it finds.
+    #[test]
+    fn remove_pane_waits_for_the_lock_and_acts_on_the_state_then() {
+        let fake = FakeBackend::new(true);
+        fake.add_pane("work", State::Working, None);
+        let sh = shepherd(&fake);
+        let held = sh.pane_locks().lock("id-work");
+        let remover = {
+            let sh = sh.clone();
+            thread::spawn(move || call(&sh, "remove_pane", &args(json!({"terminal": "work"}))))
+        };
+        while sh.pane_locks().waiting("id-work") == 0 {
+            thread::yield_now();
+        }
+        assert_eq!(fake.calls(), ["get"]);
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.panes[0].live = false;
+            state.panes[0].status = None;
+            state.panes[0].exit_code = Some(0);
+        }
+        drop(held);
+        let out = remover.join().unwrap().unwrap();
+        assert_eq!(
+            out,
+            json!({"name": "work", "was_live": false, "stopped": null, "exit_code": 0})
+        );
+        assert_eq!(fake.calls(), ["get", "get", "remove"]);
+        assert!(!sh.pane_locks().is_held("id-work"));
+        let err = call(&sh, "get_status", &args(json!({"terminal": "work"}))).unwrap_err();
+        assert_eq!(err.data["error"], "not_found");
+    }
+
+    /// A send_input that arrives while remove_pane holds the pane lock waits
+    /// for it, then finds the pane gone: nothing is typed and nothing hangs.
+    #[test]
+    fn send_input_waiting_behind_remove_pane_gets_not_found() {
+        use std::sync::mpsc;
+        let fake = FakeBackend::new(true);
+        fake.add_pane("work", State::Idle, None);
+        let sh = shepherd(&fake);
+        let (started_tx, started) = mpsc::channel();
+        let (proceed, proceed_rx) = mpsc::channel();
+        fake.state.lock().unwrap().remove_gate = Some((started_tx, proceed_rx));
+        let remover = {
+            let sh = sh.clone();
+            thread::spawn(move || call(&sh, "remove_pane", &args(json!({"terminal": "work"}))))
+        };
+        started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("remove never started");
+        assert!(sh.pane_locks().is_held("id-work"));
+        let sender = {
+            let sh = sh.clone();
+            thread::spawn(move || {
+                call(
+                    &sh,
+                    "send_input",
+                    &args(json!({"terminal": "work", "text": "hi"})),
+                )
+            })
+        };
+        while sh.pane_locks().waiting("id-work") == 0 {
+            thread::yield_now();
+        }
+        proceed.send(()).unwrap();
+        let out = remover.join().unwrap().unwrap();
+        assert_eq!(
+            out,
+            json!({"name": "work", "was_live": true, "stopped": "exited", "exit_code": null})
+        );
+        let err = sender.join().unwrap().unwrap_err();
+        assert_eq!(err.data["error"], "not_found");
+        assert_eq!(err.data["terminal"], "work");
+        // The send's first lookup ran while the remove was in progress; its
+        // lookup inside the lock found the pane gone, so no send call.
+        assert_eq!(fake.calls(), ["get", "get", "remove", "get", "get"]);
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+        assert!(!sh.pane_locks().is_held("id-work"));
+        assert_eq!(sh.pane_locks().waiting("id-work"), 0);
+
+        // Later calls on the removed name get not_found too.
+        fake.state.lock().unwrap().screen = Some("screen".to_string());
+        for (tool, extra) in [
+            ("answer_dialog", json!({"choice": "allow_once"})),
+            ("remove_pane", json!({})),
+        ] {
+            let mut a = args(extra);
+            a.insert("terminal".to_string(), json!("work"));
+            assert_eq!(call(&sh, tool, &a).unwrap_err().data["error"], "not_found");
+        }
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //! `openab-shepherd-kiro-api-key` into that child only. It sends at most
 //! three prompts. Exit 0 only when every step went as expected.
 
-use openab_shepherd::backend::TerminalRef;
+use openab_shepherd::backend::{TerminalBackend, TerminalRef};
 use openab_shepherd::dialog;
 use openab_shepherd::native::{NativeBackend, NativeConfig, StatusLogEntry};
 use openab_shepherd::profiles::LaunchPolicy;
@@ -84,7 +84,7 @@ fn main() -> ExitCode {
     probe.print_transitions();
     let turns_ok = probe.check_turns();
     println!("probe: Kiro prompts used: {}", probe.prompts);
-    if let Err(err) = probe.native.remove(&TerminalRef::new(PANE)) {
+    if let Err(err) = probe.native.remove(&TerminalRef::new(PANE), None) {
         println!("probe: remove failed: {err:?}");
     }
     if keep_dir {
