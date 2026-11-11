@@ -86,6 +86,8 @@ arbitrary commands, so `start_pane` starts nothing (see
   Use one of them, not both.
 - A launch profiles file that is unreadable, inside a git repository, or invalid
   also exits with status 2.
+- An invalid `OPENAB_SHEPHERD_ALLOWED_HOSTS` entry also exits with status 2 (see
+  [Behind tailscale serve](#behind-tailscale-serve)).
 - The startup line names the backend: `(backend: native)` or `(backend: hc)`.
 
 ### Token file rules
@@ -504,9 +506,11 @@ text removes the rest of the text. Newlines and tabs are kept.
 
 ## Authentication and network
 
-- Host header: checked first. It must name a loopback address (`127.0.0.1`, `[::1]`,
-  or `localhost`, with or without a port). Any other value gets HTTP 403, with no
-  token check.
+- Host header: checked first, as protection against DNS rebinding. It must name a
+  loopback address (`127.0.0.1`, `[::1]`, or `localhost`, with or without a port), or
+  match an entry in `OPENAB_SHEPHERD_ALLOWED_HOSTS` (empty by default, see
+  [Behind tailscale serve](#behind-tailscale-serve)). Any other value gets HTTP 403,
+  with no token check.
 - Bearer token: compared in constant time. A missing or wrong token gets HTTP 401.
 - Only `POST /mcp` is served. `GET` gets 405. Notifications get 202.
 - The listener binds the validated loopback address only. The server does not run
@@ -514,6 +518,40 @@ text removes the rest of the text. Newlines and tabs are kept.
   never exposed.
 - Request bodies are capped at 1 MiB, read before the token check. Request bodies
   are not logged.
+
+### Behind tailscale serve
+
+`tailscale serve` can put the loopback listener on the tailnet over HTTPS. It
+forwards the client's Host header, for example
+`mcp-host.example-tailnet.ts.net:8445`, which the Host check refuses unless the
+operator lists it. The server still binds loopback only, and the bearer token is
+still required on every request.
+
+```sh
+tailscale serve --bg --https=8445 http://127.0.0.1:8767
+
+OPENAB_SHEPHERD_TOKEN_FILE=<token-file> \
+OPENAB_SHEPHERD_ALLOWED_HOSTS=mcp-host.example-tailnet.ts.net:8445 \
+./openab-shepherd --port 8767
+```
+
+Clients then use `https://mcp-host.example-tailnet.ts.net:8445/mcp`.
+
+`OPENAB_SHEPHERD_ALLOWED_HOSTS` is a comma-separated list of `name` or `name:port`:
+
+- Names compare exactly and case-insensitively. One trailing dot is dropped from both
+  the entry and the Host header. There are no wildcards, no suffix matching, and no
+  address ranges, so `evil-mcp-host.example-tailnet.ts.net` and
+  `mcp-host.example-tailnet.ts.net.evil.com` are refused.
+- An entry with a port matches only that port. An entry without a port matches the
+  name on any port, or with no port. Prefer the form with a port.
+- An empty item, a scheme (`https://`), a path, a wildcard, whitespace inside an
+  entry, brackets, or a bad port make the server exit with status 2 at startup.
+- The startup log lists the configured entries once.
+
+Keep Funnel off for this port (`tailscale funnel` must not be enabled): Funnel
+publishes the listener to the internet, and only the bearer token would stand
+between it and the panes.
 
 ## Tests
 

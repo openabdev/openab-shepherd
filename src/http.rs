@@ -1,10 +1,12 @@
 //! Streamable HTTP front end on loopback.
 //!
-//! Each request passes four gates in order: loopback Host header, bearer token,
+//! Each request passes four gates in order: allowed Host header (a loopback name
+//! or one the operator listed), bearer token,
 //! the `/mcp` path, and the POST method. Only then is the body parsed and handed
 //! to the MCP layer. Nothing is logged from request bodies, because they can carry
 //! text typed into panes.
 
+use crate::config::AllowedHost;
 use crate::mcp;
 use crate::tools::Shepherd;
 use serde_json::{json, Value};
@@ -21,6 +23,8 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 pub struct AppState {
     pub token: String,
+    /// Extra Host values from `OPENAB_SHEPHERD_ALLOWED_HOSTS`; empty by default.
+    pub allowed_hosts: Vec<AllowedHost>,
     pub shepherd: Shepherd,
 }
 
@@ -50,10 +54,13 @@ fn handle(mut request: Request, state: &AppState) {
 
 fn route(request: &mut Request, state: &AppState, body: Result<Vec<u8>, u16>) -> Body {
     let host = header_value(request, "Host");
-    if !host.as_deref().is_some_and(is_loopback_host) {
+    if !host
+        .as_deref()
+        .is_some_and(|h| is_loopback_host(h) || is_allowed_host(h, &state.allowed_hosts))
+    {
         return json_reply(
             403,
-            json!({"error": "forbidden", "message": "Host must be a loopback name"}),
+            json!({"error": "forbidden", "message": "Host must be a loopback name or an allowed host"}),
             None,
         );
     }
@@ -160,6 +167,35 @@ pub fn is_loopback_host(value: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "localhost")
 }
 
+/// True when the Host header names one of the operator's allowed hosts. The
+/// name compares case-insensitively and exactly, after dropping one trailing
+/// dot; there is no suffix or wildcard matching. An entry with a port needs that
+/// port in the header; an entry without one matches any port (or none).
+pub fn is_allowed_host(value: &str, allowed: &[AllowedHost]) -> bool {
+    if allowed.is_empty() {
+        return false;
+    }
+    let (name, port) = match value.split_once(':') {
+        None => (value, None),
+        Some((name, port)) => {
+            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            match port.parse::<u16>() {
+                Ok(port) => (name, Some(port)),
+                Err(_) => return false,
+            }
+        }
+    };
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.is_empty() {
+        return false;
+    }
+    allowed.iter().any(|entry| {
+        entry.name.eq_ignore_ascii_case(name) && entry.port.is_none_or(|p| port == Some(p))
+    })
+}
+
 /// Compare `Authorization` against `Bearer <token>` without an early exit on the
 /// first differing byte.
 pub fn bearer_matches(header: Option<&str>, token: &str) -> bool {
@@ -231,6 +267,59 @@ mod tests {
     }
 
     #[test]
+    fn allowed_host_matching() {
+        use crate::config::parse_allowed_hosts;
+        let none: Vec<AllowedHost> = Vec::new();
+        assert!(
+            !is_allowed_host("mcp-host.example-tailnet.ts.net:8445", &none),
+            "default allows no extra host"
+        );
+
+        let with_port = parse_allowed_hosts("mcp-host.example-tailnet.ts.net:8445").unwrap();
+        for ok in [
+            "mcp-host.example-tailnet.ts.net:8445",
+            "MCP-HOST.Example-Tailnet.TS.NET:8445",
+            "mcp-host.example-tailnet.ts.net.:8445",
+        ] {
+            assert!(is_allowed_host(ok, &with_port), "{ok} should be allowed");
+        }
+        for bad in [
+            "mcp-host.example-tailnet.ts.net",
+            "mcp-host.example-tailnet.ts.net:443",
+            "mcp-host.example-tailnet.ts.net:08445x",
+            "mcp-host.example-tailnet.ts.net:",
+            "mcp-host.example-tailnet.ts.net..:8445",
+            "evil-mcp-host.example-tailnet.ts.net:8445",
+            "mcp-host.example-tailnet.ts.net.evil.com:8445",
+            "x.mcp-host.example-tailnet.ts.net:8445",
+            "example-tailnet.ts.net:8445",
+            ":8445",
+            "",
+        ] {
+            assert!(!is_allowed_host(bad, &with_port), "{bad} should be refused");
+        }
+
+        // A trailing dot in the entry is dropped too.
+        let any_port = parse_allowed_hosts("mcp-host.example-tailnet.ts.net.").unwrap();
+        for ok in [
+            "mcp-host.example-tailnet.ts.net",
+            "mcp-host.example-tailnet.ts.net.",
+            "mcp-host.example-tailnet.ts.net:8445",
+            "Mcp-Host.example-tailnet.ts.net:443",
+        ] {
+            assert!(is_allowed_host(ok, &any_port), "{ok} should be allowed");
+        }
+        for bad in [
+            "evil-mcp-host.example-tailnet.ts.net",
+            "mcp-host.example-tailnet.ts.net.evil.com",
+            "mcp-host.example-tailnet.ts.net:99999",
+            "[::1]:8445",
+        ] {
+            assert!(!is_allowed_host(bad, &any_port), "{bad} should be refused");
+        }
+    }
+
+    #[test]
     fn bearer_must_match_exactly() {
         assert!(bearer_matches(Some(&format!("Bearer {TOKEN}")), TOKEN));
         assert!(!bearer_matches(None, TOKEN));
@@ -284,27 +373,94 @@ mod tests {
         (status, body)
     }
 
-    #[test]
-    fn end_to_end_auth_host_path_and_method() {
+    /// Start a server on a free loopback port and wait until it accepts connections.
+    fn start_server(allowed_hosts: Vec<AllowedHost>) -> u16 {
         let port = free_port();
         let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let state = Arc::new(AppState {
             token: TOKEN.to_string(),
+            allowed_hosts,
             shepherd: Shepherd::new(crate::testutil::FakeBackend::new(true)),
         });
         thread::spawn(move || {
             let _ = serve(bind, state);
         });
-        // Wait until the listener accepts connections.
         for _ in 0..100 {
             if TcpStream::connect(("127.0.0.1", port)).is_ok() {
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(20));
         }
+        port
+    }
+
+    const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#;
+    const TS_HOST: &str = "mcp-host.example-tailnet.ts.net:8445";
+
+    #[test]
+    fn default_server_rejects_a_ts_net_host() {
+        let port = start_server(Vec::new());
+        let bearer = format!("Bearer {TOKEN}");
+        let (status, body) = raw_request(port, TS_HOST, Some(&bearer), "POST", INIT);
+        assert_eq!(status, 403, "{body}");
+        assert!(body.contains("forbidden"), "{body}");
+    }
+
+    #[test]
+    fn allowed_host_still_needs_the_bearer_token() {
+        let allowed = crate::config::parse_allowed_hosts(TS_HOST).unwrap();
+        let port = start_server(allowed);
+        let bearer = format!("Bearer {TOKEN}");
+
+        let (status, body) = raw_request(port, TS_HOST, None, "POST", INIT);
+        assert_eq!(status, 401, "allowed host without a token: {body}");
+        let (status, _) = raw_request(
+            port,
+            TS_HOST,
+            Some("Bearer wrong-token-0000000000"),
+            "POST",
+            INIT,
+        );
+        assert_eq!(status, 401, "allowed host with a wrong token");
+
+        let (status, body) = raw_request(port, TS_HOST, Some(&bearer), "POST", INIT);
+        assert_eq!(status, 200, "allowed host with the token: {body}");
+        assert!(body.contains("protocolVersion"), "{body}");
+
+        let (status, _) = raw_request(
+            port,
+            "mcp-host.example-tailnet.ts.net:443",
+            Some(&bearer),
+            "POST",
+            INIT,
+        );
+        assert_eq!(status, 403, "port mismatch");
+        let (status, _) = raw_request(
+            port,
+            "mcp-host.example-tailnet.ts.net.evil.com:8445",
+            Some(&bearer),
+            "POST",
+            INIT,
+        );
+        assert_eq!(status, 403, "suffix attack");
+
+        // Loopback names keep working with extra hosts configured.
+        let (status, _) = raw_request(
+            port,
+            &format!("127.0.0.1:{port}"),
+            Some(&bearer),
+            "POST",
+            INIT,
+        );
+        assert_eq!(status, 200, "loopback still allowed");
+    }
+
+    #[test]
+    fn end_to_end_auth_host_path_and_method() {
+        let port = start_server(Vec::new());
 
         let host = format!("127.0.0.1:{port}");
-        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#;
+        let init = INIT;
         let bearer = format!("Bearer {TOKEN}");
 
         let (status, body) = raw_request(port, &host, None, "POST", init);

@@ -21,6 +21,10 @@ Environment:
   OPENAB_SHEPHERD_PROFILES    launch profiles file (JSON, outside any git repo);
                               without it start_pane starts nothing
   HC_SOCKET                   herdr-core Unix socket path (required for hc only)
+  OPENAB_SHEPHERD_ALLOWED_HOSTS
+                              extra Host header values to accept, comma-separated
+                              name or name:port (exact, case-insensitive; a name
+                              without a port matches any port); default none
 
 Native panes get only HOME, PATH, USER, LANG and TERM from this environment,
 plus their launch profile's env, or a caller command's own env.
@@ -155,6 +159,7 @@ fn main() -> ExitCode {
     };
     let state = Arc::new(AppState {
         token: config.token,
+        allowed_hosts: config.allowed_hosts.clone(),
         shepherd,
     });
     eprintln!(
@@ -162,6 +167,14 @@ fn main() -> ExitCode {
         config.bind,
         http::MCP_PATH
     );
+    if !config.allowed_hosts.is_empty() {
+        let list: Vec<String> = config.allowed_hosts.iter().map(|h| h.to_string()).collect();
+        eprintln!(
+            "openab-shepherd: extra allowed Host values ({}): {}",
+            config::ALLOWED_HOSTS_ENV,
+            list.join(", ")
+        );
+    }
     if let Err(err) = http::serve(config.bind, state) {
         eprintln!("openab-shepherd: {err}");
         if let Some(native) = &native_handle {

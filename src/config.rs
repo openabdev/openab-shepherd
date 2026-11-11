@@ -22,6 +22,9 @@ pub const BACKEND_ENV: &str = "OPENAB_SHEPHERD_BACKEND";
 /// The backend used when [`BACKEND_ENV`] is unset or empty. `native` since the
 /// real-Kiro probe passed (kiro-cli 3.1.0, examples/native_probe.rs).
 pub const DEFAULT_BACKEND: &str = "native";
+/// Extra Host header values to accept besides the loopback names, as a
+/// comma-separated list of `name` or `name:port`. Unset or empty means none.
+pub const ALLOWED_HOSTS_ENV: &str = "OPENAB_SHEPHERD_ALLOWED_HOSTS";
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 8765;
 pub const MIN_TOKEN_LENGTH: usize = 16;
@@ -56,11 +59,30 @@ impl BackendChoice {
     }
 }
 
+/// One extra Host header value the operator allows, for example the name a
+/// `tailscale serve` front end forwards. `name` is lowercase with no trailing
+/// dot. A `None` port matches the name on any port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowedHost {
+    pub name: String,
+    pub port: Option<u16>,
+}
+
+impl fmt::Display for AllowedHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.port {
+            Some(port) => write!(f, "{}:{port}", self.name),
+            None => write!(f, "{} (any port)", self.name),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub token: String,
     pub backend: BackendChoice,
     pub bind: SocketAddr,
+    pub allowed_hosts: Vec<AllowedHost>,
 }
 
 /// Validate every startup input. `lookup` reads an environment variable, and
@@ -81,10 +103,79 @@ where
     }
     let token = load_token(&lookup, project_dir)?;
     let backend = load_backend(&lookup)?;
+    let allowed_hosts = parse_allowed_hosts(lookup(ALLOWED_HOSTS_ENV).as_deref().unwrap_or(""))?;
     Ok(Config {
         token,
         backend,
         bind: SocketAddr::new(ip, port),
+        allowed_hosts,
+    })
+}
+
+/// Parse [`ALLOWED_HOSTS_ENV`]. An empty or all-whitespace value means no extra
+/// hosts. Each comma-separated item is trimmed and must be `name` or
+/// `name:port`: letters, digits, `-` and `.` only, no empty labels, port 1 to
+/// 65535. A single trailing dot on the name is dropped and the name is
+/// lowercased. Anything else (an empty item, a scheme, a path, a wildcard,
+/// whitespace inside an item, brackets) refuses the whole value.
+pub fn parse_allowed_hosts(value: &str) -> Result<Vec<AllowedHost>, ConfigError> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value.split(',').map(parse_allowed_host).collect()
+}
+
+fn parse_allowed_host(item: &str) -> Result<AllowedHost, ConfigError> {
+    let entry = item.trim();
+    let invalid = |why: &str| {
+        ConfigError(format!(
+            "{ALLOWED_HOSTS_ENV}: invalid entry {entry:?}: {why}"
+        ))
+    };
+    if entry.is_empty() {
+        return Err(invalid("empty item"));
+    }
+    if entry.contains("://") {
+        return Err(invalid("no scheme allowed; give a host name"));
+    }
+    if entry.contains('/') {
+        return Err(invalid("no path allowed; give a host name"));
+    }
+    if entry.contains('*') {
+        return Err(invalid("wildcards are not allowed"));
+    }
+    if entry.chars().any(char::is_whitespace) {
+        return Err(invalid("whitespace inside the entry"));
+    }
+    let (name, port) = match entry.split_once(':') {
+        None => (entry, None),
+        Some((name, port)) => {
+            let port = port
+                .parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0 && port.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or_else(|| invalid("port must be a number from 1 to 65535"))?;
+            (name, Some(port))
+        }
+    };
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.is_empty() {
+        return Err(invalid("empty host name"));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
+        return Err(invalid(
+            "host name may contain only letters, digits, '-' and '.'",
+        ));
+    }
+    if name.split('.').any(str::is_empty) {
+        return Err(invalid("empty label in host name"));
+    }
+    Ok(AllowedHost {
+        name: name.to_ascii_lowercase(),
+        port,
     })
 }
 
@@ -531,5 +622,98 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.0.contains("port 0"), "{err}");
+    }
+
+    fn host(name: &str, port: Option<u16>) -> AllowedHost {
+        AllowedHost {
+            name: name.to_string(),
+            port,
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_default_to_none() {
+        let dir = TempDir::new("allowed-default");
+        for env in [
+            vec![(TOKEN_ENV, GOOD_TOKEN)],
+            vec![(TOKEN_ENV, GOOD_TOKEN), (ALLOWED_HOSTS_ENV, "")],
+            vec![(TOKEN_ENV, GOOD_TOKEN), (ALLOWED_HOSTS_ENV, "  ")],
+        ] {
+            let config = load_config(env_from(&env), "127.0.0.1", 8765, dir.path()).unwrap();
+            assert!(config.allowed_hosts.is_empty());
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_parsed_and_normalised() {
+        let dir = TempDir::new("allowed-ok");
+        let config = load_config(
+            env_from(&[
+                (TOKEN_ENV, GOOD_TOKEN),
+                (
+                    ALLOWED_HOSTS_ENV,
+                    " MCP-Host.Example-Tailnet.ts.net.:8445 , other.example ",
+                ),
+            ]),
+            "127.0.0.1",
+            8765,
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.allowed_hosts,
+            vec![
+                host("mcp-host.example-tailnet.ts.net", Some(8445)),
+                host("other.example", None),
+            ]
+        );
+        assert_eq!(
+            config.allowed_hosts[0].to_string(),
+            "mcp-host.example-tailnet.ts.net:8445"
+        );
+        assert_eq!(
+            config.allowed_hosts[1].to_string(),
+            "other.example (any port)"
+        );
+    }
+
+    #[test]
+    fn invalid_allowed_hosts_refused() {
+        let dir = TempDir::new("allowed-bad");
+        for value in [
+            "a.example,",
+            ",a.example",
+            "a.example,,b.example",
+            "https://a.example",
+            "a.example/mcp",
+            "*.example",
+            "*",
+            "a .example",
+            "a.example:",
+            "a.example:0",
+            "a.example:70000",
+            "a.example:+80",
+            "a.example:80:80",
+            ".",
+            ":8445",
+            "a..example",
+            ".a.example",
+            "a.example..",
+            "[::1]:8445",
+            "a_b.example",
+        ] {
+            let err = load_config(
+                env_from(&[(TOKEN_ENV, GOOD_TOKEN), (ALLOWED_HOSTS_ENV, value)]),
+                "127.0.0.1",
+                8765,
+                dir.path(),
+            )
+            .unwrap_err();
+            assert!(
+                err.0
+                    .starts_with("OPENAB_SHEPHERD_ALLOWED_HOSTS: invalid entry"),
+                "{value}: {err}"
+            );
+        }
     }
 }
