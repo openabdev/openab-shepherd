@@ -275,6 +275,7 @@ impl NativeBackend {
         spec: &RunSpec,
         argv: Vec<String>,
         cwd: String,
+        marker: &str,
         spawned: pty::Spawned,
     ) -> Result<Arc<Pane>, BackendError> {
         let pty::Spawned { master, mut child } = spawned;
@@ -332,7 +333,7 @@ impl NativeBackend {
                 }),
                 changed: Condvar::new(),
                 input: Mutex::new(()),
-                tree: Mutex::new(procs::Tree::default()),
+                tree: Mutex::new(procs::Tree::new(marker)),
                 stopping: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
                 reader: Mutex::new(None),
@@ -578,12 +579,14 @@ impl Pane {
     }
 
     /// SIGHUP and SIGTERM to the group and to every known descendant, after
-    /// a fresh look for descendants. No key is typed (ADR §11).
+    /// a fresh look for descendants and a sweep for the pane's marker. No
+    /// key is typed (ADR §11).
     fn soft_stop(&self) {
         let mut tree = self.tree.lock().unwrap_or_else(PoisonError::into_inner);
         if self.owns_group() {
             tree.refresh(self.pid);
         }
+        tree.sweep();
         self.signal_group(&[libc::SIGHUP, libc::SIGTERM]);
         tree.signal_all(libc::SIGHUP);
         tree.signal_all(libc::SIGTERM);
@@ -609,19 +612,24 @@ impl Pane {
         }
     }
 
-    /// End the pane's processes for good: look for descendants and SIGSTOP
-    /// them and the group, again until a look finds nobody new (a stopped
-    /// process cannot fork), then SIGKILL the group and every descendant.
+    /// End the pane's processes for good: look for descendants (and sweep
+    /// for the pane's marker) and SIGSTOP them and the group, again until a
+    /// look finds nobody new (a stopped process cannot fork), then SIGKILL
+    /// the group and every descendant.
     /// After this the reaper reaps the leader, and the group id is no longer
     /// reserved. Idempotent.
     fn release(&self) {
         let mut tree = self.tree.lock().unwrap_or_else(PoisonError::into_inner);
         for round in 1..=FREEZE_ROUNDS {
-            let owned = self.owns_group();
-            let added = if owned { tree.refresh(self.pid) } else { 0 };
+            let mut added = if self.owns_group() {
+                tree.refresh(self.pid)
+            } else {
+                0
+            };
+            added += tree.sweep();
             self.signal_group(&[libc::SIGSTOP]);
             tree.signal_all(libc::SIGSTOP);
-            if !owned || (round > 1 && added == 0) {
+            if round > 1 && added == 0 {
                 break;
             }
         }
@@ -1183,11 +1191,15 @@ impl TerminalBackend for NativeBackend {
                 .map(|(key, value)| (OsString::from(key), OsString::from(value.expose()))),
         );
         extra.extend(pty::run_env(&spec.env)?);
-        let env = pty::child_env(&*self.inner.env, &extra)?;
+        let mut env = pty::child_env(&*self.inner.env, &extra)?;
+        // The pane's marker, set last so nothing overrides it (ADR §11).
+        let marker = procs::new_marker();
+        env.retain(|(key, _)| key != procs::MARKER_KEY);
+        env.push((procs::MARKER_KEY.into(), marker.clone().into()));
         let cwd = self.cwd_for(spec.cwd.as_deref())?;
         check_room(&*self.inner.table()?, spec.name.as_deref())?;
         let spawned = pty::spawn(&argv, Path::new(&cwd), &env)?;
-        self.insert(spec, argv, cwd, spawned)?.info()
+        self.insert(spec, argv, cwd, &marker, spawned)?.info()
     }
 
     fn get(&self, t: &TerminalRef) -> Result<TerminalInfo, BackendError> {
@@ -1410,7 +1422,7 @@ impl TerminalBackend for NativeBackend {
         pane.soft_stop();
         let deadline = Instant::now() + grace.unwrap_or(KILL_GRACE);
         pane.await_exit(deadline);
-        let killed = !pane.has_exited();
+        let exited_in_grace = pane.has_exited();
         pane.await_tree_gone(deadline);
         pane.release();
         // The reaper records the exit code (128 + SIGKILL when killed) and
@@ -1427,6 +1439,11 @@ impl TerminalBackend for NativeBackend {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .exit_code;
+        // Killed only if the leader was still running at the deadline and
+        // the kill is what ended it: a leader that exited on the soft stop
+        // in the moment before the kill reports its own code (review N1).
+        let killed = !exited_in_grace
+            && !matches!(exit_code, Some(code) if code != 128 + i64::from(libc::SIGKILL));
         Ok(RemoveResult {
             was_live,
             stopped: was_live.then_some(if killed {
