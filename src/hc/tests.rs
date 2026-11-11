@@ -6,6 +6,7 @@ use super::fake::{reply, serve_once, serve_pane, serve_script, PANE_ADDRESS, PAN
 use super::HcBackend;
 use crate::dialog::fixtures::{dialog_on_allow, dialog_on_deny, PROBE_HEAD, PROBE_TAIL};
 use crate::mcp::handle_message;
+use crate::profiles::LaunchPolicy;
 use crate::testutil::TempDir;
 use crate::tools::{self, Shepherd};
 use serde_json::{json, Value};
@@ -24,7 +25,7 @@ fn tool_out(reply: Option<Value>) -> Value {
 }
 
 fn hc_shepherd(sock: &Path) -> Shepherd {
-    Shepherd::new(HcBackend::new(sock))
+    Shepherd::with_policy(HcBackend::new(sock), LaunchPolicy::arbitrary())
 }
 
 fn text_of(out: &Value) -> String {
@@ -1277,7 +1278,8 @@ fn get_status_and_list_panes_return_normalized_panes() {
     assert_eq!(status["structuredContent"], with_terminal);
     assert_eq!(
         list["structuredContent"],
-        json!({"panes": [expected.clone()], "hidden_finished": 2})
+        json!({"panes": [expected.clone()], "hidden_finished": 2,
+               "profiles": [], "allow_arbitrary_command": true})
     );
     assert_eq!(started["structuredContent"], expected);
     for out in [&status, &list, &started] {

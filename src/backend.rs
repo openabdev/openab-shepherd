@@ -1,8 +1,8 @@
 //! The terminal backend: what Shepherd needs from the program that runs panes.
 //!
 //! The MCP tools in `tools.rs` talk only to [`TerminalBackend`]. Every type here
-//! is Shepherd's own vocabulary; an adapter (today only `hc::HcBackend`) maps
-//! its backend's wire format onto it. Safety rules (input validation, the pane
+//! is Shepherd's own vocabulary; an adapter (`hc::HcBackend`, and the native
+//! core in `native/`) maps its backend's wire format onto it. Safety rules (input validation, the pane
 //! lock, refusing to type into a blocked pane, the answer_dialog checks) live in
 //! Shepherd, not in a backend. [`Capabilities`] tells Shepherd which of them a
 //! backend can also enforce atomically.
@@ -25,8 +25,19 @@ pub struct Capabilities {
     pub client_command: bool,
     /// `run` accepts a client-chosen working directory.
     pub client_cwd: bool,
+    /// `run` accepts extra environment variables for that one run.
+    pub client_env: bool,
     /// `read` returns rendered screen text (not raw output bytes).
     pub screen_text: bool,
+    /// The backend reports the program's OSC 7501 status and counts turns.
+    pub program_status: bool,
+    /// `read` with `history_lines > 0` returns scrollback above the screen.
+    /// When false, `read_output` with `lines > 0` returns `unsupported`.
+    pub history: bool,
+    /// `wait` blocks inside the backend instead of Shepherd polling it.
+    pub native_wait: bool,
+    /// Panes outlive a Shepherd restart.
+    pub survives_restart: bool,
 }
 
 /// A pane as the caller named it, or, after Shepherd resolved the name, the
@@ -169,16 +180,44 @@ pub struct TerminalList {
     pub hidden_finished: Option<u64>,
 }
 
-/// What to start. Exactly one of `argv` or `line` is set unless `profile` is.
+/// What to start. Exactly one of `argv` or `line` is set.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunSpec {
     pub argv: Option<Vec<String>>,
     pub line: Option<String>,
     pub cwd: Option<String>,
     pub name: Option<String>,
-    /// An operator-defined launch profile, for backends that only run those.
-    /// Shepherd does not set it yet.
+    /// Extra environment variables for this run only, in order. Empty means
+    /// none. Backends without `client_env` refuse a non-empty list.
+    pub env: Vec<(String, String)>,
+    /// The operator-defined launch profile Shepherd resolved `argv` and `cwd`
+    /// from (`profiles.rs`), or None for a caller-chosen command.
     pub profile: Option<String>,
+    /// The profile's environment, values already read from their sources.
+    /// Only Shepherd sets it, and only from a profile; a caller's command
+    /// never gets one. Backends without `client_env` refuse a non-empty list.
+    pub profile_env: Vec<(String, Secret)>,
+}
+
+/// A value that may be a credential. Its `Debug` never shows it.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The value, for the child's environment only.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
 }
 
 /// Where a read came from.

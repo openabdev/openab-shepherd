@@ -22,6 +22,7 @@ use crate::backend::{
 use crate::dialog::{self, Choice};
 use crate::input::{validate_input, validate_name};
 use crate::panelock::{PaneGuard, PaneLocks};
+use crate::profiles::{CwdError, LaunchPolicy};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use std::thread;
@@ -68,13 +69,22 @@ pub type Args = Map<String, Value>;
 pub struct Shepherd {
     backend: Arc<dyn TerminalBackend>,
     locks: Arc<PaneLocks>,
+    policy: Arc<LaunchPolicy>,
 }
 
 impl Shepherd {
+    /// A Shepherd with no launch profiles and no arbitrary commands:
+    /// `start_pane` starts nothing.
     pub fn new(backend: impl TerminalBackend + 'static) -> Self {
+        Self::with_policy(backend, LaunchPolicy::default())
+    }
+
+    /// A Shepherd that starts what `policy` allows.
+    pub fn with_policy(backend: impl TerminalBackend + 'static, policy: LaunchPolicy) -> Self {
         Self {
             backend: Arc::new(backend),
             locks: Arc::new(PaneLocks::default()),
+            policy: Arc::new(policy),
         }
     }
 
@@ -141,13 +151,15 @@ pub fn definitions() -> Value {
     json!([
         {
             "name": "start_pane",
-            "description": "Start a program in a new pane. Give exactly one of argv (a program and its arguments) or line (a shell line run by sh -c). Later calls address the pane by its name: give one, or Shepherd picks one (pane-<hex>) and returns it. Returns the pane (name, live, status, reported, turn, status_ms, exit_code, argv, cwd). Input is trimmed and limited to 4096 bytes per field. Control characters (except TAB) are refused, not removed.",
+            "description": "Start a program in a new pane. Give profile: the name of one of the operator's launch profiles (list_panes lists them with the directories each allows); the profile fixes the program, its arguments and its environment. cwd, when given, must be one of the profile's directories or below one (after resolving symlinks); without it the profile's first directory is used. argv (a program and its arguments) or line (a shell line run by sh -c) instead of profile work only when the operator allows arbitrary commands (list_panes: allow_arbitrary_command), and such a pane never gets a profile's environment. Later calls address the pane by its name: give one, or Shepherd picks one (pane-<hex>) and returns it. Returns the pane (name, live, status, reported, turn, status_ms, exit_code, argv, cwd). Input is trimmed and limited to 4096 bytes per field. Control characters (except TAB) are refused, not removed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "argv": {"type": "array", "items": {"type": "string"}, "description": "Program and arguments; non-empty."},
-                    "line": {"type": "string", "description": "Shell line run by sh -c."},
-                    "cwd": {"type": "string", "description": "Working directory."},
+                    "profile": {"type": "string", "description": "Launch profile name, as list_panes shows it."},
+                    "argv": {"type": "array", "items": {"type": "string"}, "description": "Program and arguments; non-empty. Only when arbitrary commands are allowed."},
+                    "line": {"type": "string", "description": "Shell line run by sh -c. Only when arbitrary commands are allowed."},
+                    "cwd": {"type": "string", "description": "Working directory (absolute)."},
+                    "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra environment variables for an argv or line pane only (refused with profile): at most 32, names [A-Z_][A-Z0-9_]*, values under the same input rules (empty allowed; leading and trailing whitespace is trimmed). A backend may refuse protected names (the native backend refuses HOME, PATH, USER, LANG, TERM and DYLD_*/LD_*); a backend without per-run environments returns unsupported."},
                     "name": {"type": "string", "description": "Pane name: 1-32 of a-z, 0-9, '-', '_', '.'. Optional; Shepherd picks one when it is missing."}
                 }
             }
@@ -199,7 +211,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "list_panes",
-            "description": "List panes, each in the same shape start_pane returns. all=true includes finished panes; hidden_finished counts the ones left out.",
+            "description": "List panes, each in the same shape start_pane returns. all=true includes finished panes; hidden_finished counts the ones left out. Also returns profiles (each launch profile's name and the directories it allows) and allow_arbitrary_command (whether start_pane takes argv or line).",
             "inputSchema": {
                 "type": "object",
                 "properties": {"all": {"type": "boolean", "default": false}}
@@ -219,7 +231,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "answer_dialog",
-            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter, because the current backend has no conditional key press. The dialog is parsed from screen text; tested only on kiro-cli 3.1.0 (V3) shell permission dialogs. Follow with wait_status.",
+            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text; tested only on kiro-cli 3.1.0 (V3) shell permission dialogs. Follow with wait_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -248,6 +260,110 @@ pub fn call(sh: &Shepherd, name: &str, args: &Args) -> Result<Value, ToolError> 
 }
 
 fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
+    let mut spec = match optional_str(args, "profile")? {
+        Some(profile) => profile_spec(sh, args, profile)?,
+        None => command_spec(sh, args)?,
+    };
+    // Every pane Shepherd starts has a name: callers address panes by name.
+    let chosen_name = optional_str(args, "name")?;
+    spec.name = Some(match chosen_name {
+        Some(name) => validate_name(name).map_err(|err| format!("name: {err}"))?,
+        None => generated_name(),
+    });
+    // Credentials are read last, when everything else has passed, and only
+    // into the spec of this profile's pane.
+    if let Some(profile) = spec.profile.as_deref().and_then(|p| sh.policy.profile(p)) {
+        spec.profile_env = sh.policy.resolve_env(profile).map_err(|message| {
+            ToolError::new("profile_unavailable", message).with("profile", profile.name.as_str())
+        })?;
+    }
+    let mut info = sh.backend.run(&spec).map_err(|err| match err.kind {
+        ErrorKind::NotFound => ToolError::new(
+            "not_found",
+            "the program or working directory was not found",
+        )
+        .with("backend_detail", err.detail),
+        ErrorKind::NameTaken if chosen_name.is_none() => ToolError::new(
+            "name_taken",
+            "the name Shepherd generated for the pane is already in use; try again",
+        )
+        .with("backend_detail", err.detail),
+        _ => backend_failure(spec.name.as_deref(), err),
+    })?;
+    if info.name.is_none() {
+        info.name = spec.name;
+    }
+    Ok(info.to_json())
+}
+
+/// A launch profile's run: its fixed argv, a cwd it allows, no caller env.
+fn profile_spec(sh: &Shepherd, args: &Args, profile: &str) -> Result<RunSpec, ToolError> {
+    let given = |key: &str| !matches!(args.get(key), None | Some(Value::Null));
+    if given("argv") || given("line") {
+        return Err("give profile, or argv or line, not both".to_string().into());
+    }
+    if given("env") {
+        return Err(
+            "env is not accepted with a profile; the profile sets the environment"
+                .to_string()
+                .into(),
+        );
+    }
+    let name = validate_name(profile).map_err(|err| format!("profile: {err}"))?;
+    let profile = sh.policy.profile(&name).ok_or_else(|| {
+        ToolError::new(
+            "invalid_input",
+            format!("no launch profile is named {name}; list_panes shows the profiles"),
+        )
+        .with("profile", name.as_str())
+    })?;
+    let requested = match optional_str(args, "cwd")? {
+        Some(cwd) => Some(validate_input(cwd).map_err(|err| format!("cwd: {err}"))?),
+        None => None,
+    };
+    let cwd = sh
+        .policy
+        .cwd(profile, requested.as_deref())
+        .map_err(|err| match err {
+            CwdError::NotFound => {
+                ToolError::new("not_found", "the working directory was not found")
+            }
+            CwdError::Invalid(why) => ToolError::from(format!("cwd: {why}")),
+        })?;
+    let caps = sh.backend.capabilities();
+    if !caps.client_cwd {
+        return Err(unsupported("a working directory the caller chooses"));
+    }
+    if !profile.env.is_empty() && !caps.client_env {
+        return Err(unsupported(
+            "a launch profile with an environment (use the native backend)",
+        ));
+    }
+    // Pin the executable before any credential is read, independent of cwd.
+    let program = sh.policy.program(profile).map_err(|why| {
+        ToolError::new("not_found", "the program was not found")
+            .with("profile", name.as_str())
+            .with("backend_detail", why)
+    })?;
+    let mut argv = profile.argv.clone();
+    argv[0] = program.to_string_lossy().into_owned();
+    Ok(RunSpec {
+        argv: Some(argv),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        profile: Some(name),
+        ..RunSpec::default()
+    })
+}
+
+/// A caller-chosen `argv` or `line`, when the operator allows those. It never
+/// gets a profile's environment.
+fn command_spec(sh: &Shepherd, args: &Args) -> Result<RunSpec, ToolError> {
+    if !sh.policy.allow_arbitrary_command {
+        return Err(ToolError::new(
+            "profile_required",
+            "give profile: this server starts only its launch profiles (list_panes shows them)",
+        ));
+    }
     let argv_items = match args.get("argv") {
         None | Some(Value::Null) => None,
         Some(Value::Array(items)) => Some(items),
@@ -279,12 +395,10 @@ fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     if let Some(cwd) = optional_str(args, "cwd")? {
         spec.cwd = Some(validate_input(cwd).map_err(|err| format!("cwd: {err}"))?);
     }
-    // Every pane Shepherd starts has a name: callers address panes by name.
-    let chosen_name = optional_str(args, "name")?;
-    spec.name = Some(match chosen_name {
-        Some(name) => validate_name(name).map_err(|err| format!("name: {err}"))?,
-        None => generated_name(),
-    });
+    spec.env = env_arg(args)?;
+    if let Some(name) = optional_str(args, "name")? {
+        validate_name(name).map_err(|err| format!("name: {err}"))?;
+    }
 
     let caps = sh.backend.capabilities();
     if !caps.client_command {
@@ -293,23 +407,50 @@ fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     if spec.cwd.is_some() && !caps.client_cwd {
         return Err(unsupported("a working directory the caller chooses"));
     }
-    let mut info = sh.backend.run(&spec).map_err(|err| match err.kind {
-        ErrorKind::NotFound => ToolError::new(
-            "not_found",
-            "the program or working directory was not found",
-        )
-        .with("backend_detail", err.detail),
-        ErrorKind::NameTaken if chosen_name.is_none() => ToolError::new(
-            "name_taken",
-            "the name Shepherd generated for the pane is already in use; try again",
-        )
-        .with("backend_detail", err.detail),
-        _ => backend_failure(spec.name.as_deref(), err),
-    })?;
-    if info.name.is_none() {
-        info.name = spec.name;
+    if !spec.env.is_empty() && !caps.client_env {
+        return Err(unsupported("a per-run environment"));
     }
-    Ok(info.to_json())
+    Ok(spec)
+}
+
+/// Most variables one `start_pane` may add.
+const MAX_RUN_ENV: usize = 32;
+
+/// `env`: an object of names (`[A-Z_][A-Z0-9_]*`) to string values. Values
+/// follow the input rules, except that an empty value is allowed. Which
+/// names a backend accepts (it may protect some) is the backend's rule.
+fn env_arg(args: &Args) -> Result<Vec<(String, String)>, String> {
+    let map = match args.get("env") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Object(map)) => map,
+        Some(_) => return Err("env must be an object of names to strings".to_string()),
+    };
+    if map.len() > MAX_RUN_ENV {
+        return Err(format!("env: at most {MAX_RUN_ENV} variables are allowed"));
+    }
+    let mut env = Vec::with_capacity(map.len());
+    for (key, value) in map {
+        let valid_key = key
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+        if !valid_key {
+            return Err("env: a name must match [A-Z_][A-Z0-9_]*".to_string());
+        }
+        let value = value
+            .as_str()
+            .ok_or_else(|| format!("env: {key} must be a string"))?;
+        let value = if value.is_empty() {
+            String::new()
+        } else {
+            validate_input(value).map_err(|err| format!("env: {key}: {err}"))?
+        };
+        env.push((key.clone(), value));
+    }
+    Ok(env)
 }
 
 /// A name for a pane started without one: `pane-` and 12 hex digits.
@@ -446,6 +587,9 @@ fn read_output(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     if !sh.backend.capabilities().screen_text {
         return Err(unsupported("reading screen text"));
     }
+    if lines > 0 && !sh.backend.capabilities().history {
+        return Err(unsupported("reading history"));
+    }
     let pane = resolve(sh, &terminal)?.reference();
     let screen = sh
         .backend
@@ -539,7 +683,13 @@ fn list_panes(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         .list(all)
         .map_err(|err| backend_failure(None, err))?;
     let panes: Vec<Value> = list.terminals.iter().map(TerminalInfo::to_json).collect();
-    Ok(json!({"panes": panes, "hidden_finished": list.hidden_finished}))
+    let launch = sh.policy.to_json();
+    Ok(json!({
+        "panes": panes,
+        "hidden_finished": list.hidden_finished,
+        "profiles": launch["profiles"],
+        "allow_arbitrary_command": launch["allow_arbitrary_command"],
+    }))
 }
 
 fn interrupt_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
@@ -923,6 +1073,7 @@ fn optional_number(args: &Args, key: &str, min: f64, max: f64) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Secret;
     use crate::testutil::FakeBackend;
 
     fn args(value: Value) -> Args {
@@ -931,7 +1082,7 @@ mod tests {
 
     /// A Shepherd over `fake`, with the fake able to see the pane locks.
     fn shepherd(fake: &FakeBackend) -> Shepherd {
-        let sh = Shepherd::new(fake.clone());
+        let sh = Shepherd::with_policy(fake.clone(), LaunchPolicy::arbitrary());
         fake.state.lock().unwrap().locks = Some(Arc::clone(sh.pane_locks()));
         sh
     }
@@ -1047,6 +1198,75 @@ mod tests {
     }
 
     #[test]
+    fn read_output_refuses_history_on_a_backend_without_it() {
+        let mut fake = FakeBackend::new(false);
+        fake.caps.history = false;
+        fake.add_pane("work", State::Done, None);
+        fake.state.lock().unwrap().screen = Some("screen".to_string());
+        let sh = shepherd(&fake);
+
+        let err = call(
+            &sh,
+            "read_output",
+            &args(json!({"terminal": "work", "lines": 5})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "unsupported");
+        assert!(!fake.calls().contains(&"read"));
+
+        let out = call(
+            &sh,
+            "read_output",
+            &args(json!({"terminal": "work", "lines": 0})),
+        )
+        .unwrap();
+        assert_eq!(out["text"], "screen");
+        assert!(fake.calls().contains(&"read"));
+    }
+
+    #[test]
+    fn start_pane_checks_env_before_any_call() {
+        let mut fake = FakeBackend::new(false);
+        fake.caps.client_env = false;
+        let sh = shepherd(&fake);
+        let refused = |env: Value| {
+            call(
+                &sh,
+                "start_pane",
+                &args(json!({"argv": ["true"], "env": env})),
+            )
+            .unwrap_err()
+        };
+        assert_eq!(refused(json!({"A": "b"})).data["error"], "unsupported");
+        for bad in [
+            json!(["A=b"]),
+            json!({"lower": "x"}),
+            json!({"1A": "x"}),
+            json!({"A-B": "x"}),
+            json!({"A": 1}),
+            json!({"A": "x\u{1b}y"}),
+        ] {
+            let err = refused(bad.clone());
+            assert_ne!(err.data["error"], "unsupported", "{bad}");
+        }
+        let many: serde_json::Map<String, Value> = (0..=MAX_RUN_ENV)
+            .map(|i| (format!("K{i}"), json!("v")))
+            .collect();
+        let err = refused(Value::Object(many));
+        assert!(err.text.contains("at most 32"), "{}", err.text);
+        assert!(fake.calls().is_empty());
+        let mut env = env_arg(&args(json!({"env": {"B": " two ", "A": ""}}))).unwrap();
+        env.sort();
+        assert_eq!(
+            env,
+            [
+                ("A".to_string(), String::new()),
+                ("B".to_string(), "two".to_string())
+            ]
+        );
+    }
+
+    #[test]
     fn answer_dialog_leaves_the_pre_enter_check_to_a_backend_with_conditional_keys() {
         let mut fake = FakeBackend::new(false);
         fake.caps.conditional_keys = true;
@@ -1122,5 +1342,231 @@ mod tests {
         );
         assert_eq!(wait_outcome(false, Some(&WaitReason::Other), None), "other");
         assert_eq!(wait_outcome(true, None, Some(&State::Done)), "other");
+    }
+
+    /// An executable `kiro-cli` in `<dir>/bin`, which the policies' PATH names.
+    fn fake_kiro(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let program = bin.join("kiro-cli");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::canonicalize(bin).unwrap()
+    }
+
+    fn kiro_policy(dir: &std::path::Path, arbitrary: bool) -> LaunchPolicy {
+        let bin = fake_kiro(dir).to_string_lossy().into_owned();
+        let text = json!({
+            "allow_arbitrary_command": arbitrary,
+            "profiles": [
+                {"name": "kiro", "argv": ["kiro-cli", "chat"], "extra_args": ["--trust-workspace"],
+                 "cwds": [dir], "env": {"KIRO_API_KEY": "env:KEY_SOURCE"}},
+                {"name": "plain", "argv": ["/bin/sh"], "cwds": [dir]}
+            ]
+        });
+        LaunchPolicy::from_json(&text.to_string())
+            .unwrap()
+            .with_env_lookup(move |key| match key {
+                "KEY_SOURCE" => Some("profile-secret".to_string()),
+                "PATH" => Some(bin.clone()),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn start_pane_refuses_argv_and_line_by_default() {
+        let fake = FakeBackend::new(true);
+        let sh = Shepherd::new(fake.clone());
+        for start in [
+            json!({"argv": ["kiro-cli", "chat"]}),
+            json!({"line": "echo hi"}),
+            json!({}),
+        ] {
+            let err = call(&sh, "start_pane", &args(start.clone())).unwrap_err();
+            assert_eq!(err.data["error"], "profile_required", "{start}");
+        }
+        assert!(fake.calls().is_empty());
+        let dir = crate::testutil::TempDir::new("tools-profile-default");
+        let sh = Shepherd::with_policy(fake.clone(), kiro_policy(dir.path(), false));
+        let err = call(&sh, "start_pane", &args(json!({"argv": ["true"]}))).unwrap_err();
+        assert_eq!(err.data["error"], "profile_required");
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn start_pane_runs_a_profile_with_its_fixed_argv_and_env() {
+        let dir = crate::testutil::TempDir::new("tools-profile-run");
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        let fake = FakeBackend::new(true);
+        let sh = Shepherd::with_policy(fake.clone(), kiro_policy(dir.path(), true));
+        let sub = dir.path().join("sub");
+        call(
+            &sh,
+            "start_pane",
+            &args(json!({"profile": "kiro", "name": "k", "cwd": sub})),
+        )
+        .unwrap_err();
+        call(
+            &sh,
+            "start_pane",
+            &args(json!({"argv": ["kiro-cli"], "name": "a"})),
+        )
+        .unwrap_err();
+        let runs = fake.state.lock().unwrap().runs.clone();
+        assert_eq!(runs.len(), 2);
+        let canonical = std::fs::canonicalize(&sub).unwrap();
+        let pinned = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("bin/kiro-cli");
+        assert_eq!(
+            runs[0].argv.as_deref(),
+            Some(
+                &[
+                    pinned.to_string_lossy().into_owned(),
+                    "chat".into(),
+                    "--trust-workspace".into()
+                ][..]
+            )
+        );
+        assert_eq!(runs[0].cwd.as_deref(), canonical.to_str());
+        assert_eq!(runs[0].profile.as_deref(), Some("kiro"));
+        assert_eq!(
+            runs[0].profile_env,
+            [("KIRO_API_KEY".to_string(), Secret::new("profile-secret"))]
+        );
+        assert!(runs[0].env.is_empty());
+        // An arbitrary command, allowed here, gets no profile environment.
+        assert_eq!(runs[1].profile, None);
+        assert!(runs[1].profile_env.is_empty());
+    }
+
+    #[test]
+    fn start_pane_checks_a_profile_before_any_call() {
+        let dir = crate::testutil::TempDir::new("tools-profile-refuse");
+        let outside = crate::testutil::TempDir::new("tools-profile-outside");
+        let fake = FakeBackend::new(true);
+        let sh = Shepherd::with_policy(fake.clone(), kiro_policy(dir.path(), true));
+        for (start, code) in [
+            (json!({"profile": "nope"}), "invalid_input"),
+            (json!({"profile": "kiro", "argv": ["x"]}), "invalid_input"),
+            (json!({"profile": "kiro", "line": "x"}), "invalid_input"),
+            (
+                json!({"profile": "kiro", "env": {"A": "b"}}),
+                "invalid_input",
+            ),
+            (
+                json!({"profile": "kiro", "cwd": outside.path()}),
+                "invalid_input",
+            ),
+            (
+                json!({"profile": "kiro", "cwd": "relative"}),
+                "invalid_input",
+            ),
+            (
+                json!({"profile": "kiro", "cwd": dir.path().join("missing")}),
+                "not_found",
+            ),
+            (
+                json!({"profile": "kiro", "name": "Bad Name"}),
+                "invalid_input",
+            ),
+        ] {
+            let err = call(&sh, "start_pane", &args(start.clone())).unwrap_err();
+            assert_eq!(err.data["error"], code, "{start}: {err:?}");
+            assert!(!err.text.contains("profile-secret"), "{err:?}");
+        }
+        assert!(fake.calls().is_empty());
+
+        // A source that cannot be read: refused, no run, no value.
+        let bin = fake_kiro(dir.path()).to_string_lossy().into_owned();
+        let unset = kiro_policy(dir.path(), false)
+            .with_env_lookup(move |key| (key == "PATH").then(|| bin.clone()));
+        let sh = Shepherd::with_policy(fake.clone(), unset);
+        let err = call(&sh, "start_pane", &args(json!({"profile": "kiro"}))).unwrap_err();
+        assert_eq!(err.data["error"], "profile_unavailable");
+        assert!(err.text.contains("env:KEY_SOURCE"), "{err:?}");
+        assert!(fake.calls().is_empty());
+
+        // A backend without per-run environments refuses a credential
+        // profile before its source is read, and runs one without env.
+        let mut hc_like = FakeBackend::new(true);
+        hc_like.caps.client_env = false;
+        let sh = Shepherd::with_policy(hc_like.clone(), kiro_policy(dir.path(), false));
+        let err = call(&sh, "start_pane", &args(json!({"profile": "kiro"}))).unwrap_err();
+        assert_eq!(err.data["error"], "unsupported");
+        assert!(hc_like.calls().is_empty());
+        call(&sh, "start_pane", &args(json!({"profile": "plain"}))).unwrap_err();
+        assert_eq!(hc_like.calls(), ["run"]);
+    }
+
+    #[test]
+    fn a_profile_program_is_never_found_through_the_callers_cwd() {
+        // Review SOL2-B1: PATH=.:<empty>:<bin>, an impostor kiro-cli in an
+        // allowed subdirectory, and a profile secret.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::testutil::TempDir::new("tools-profile-impostor");
+        let sub = dir.path().join("work");
+        std::fs::create_dir_all(&sub).unwrap();
+        let impostor = sub.join("kiro-cli");
+        std::fs::write(&impostor, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&impostor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = fake_kiro(dir.path()).to_string_lossy().into_owned();
+        let path = format!(".::work:{bin}");
+        let fake = FakeBackend::new(true);
+        let policy = kiro_policy(dir.path(), false).with_env_lookup(move |key| match key {
+            "KEY_SOURCE" => Some("profile-secret".to_string()),
+            "PATH" => Some(path.clone()),
+            _ => None,
+        });
+        let sh = Shepherd::with_policy(fake.clone(), policy);
+        call(
+            &sh,
+            "start_pane",
+            &args(json!({"profile": "kiro", "name": "k", "cwd": sub})),
+        )
+        .unwrap_err();
+        let runs = fake.state.lock().unwrap().runs.clone();
+        assert_eq!(runs.len(), 1);
+        let argv0 = &runs[0].argv.as_ref().unwrap()[0];
+        assert_eq!(argv0, &format!("{bin}/kiro-cli"));
+        assert!(std::path::Path::new(argv0).is_absolute());
+
+        // With only relative or empty entries, nothing is found and no
+        // credential is read.
+        let fake = FakeBackend::new(true);
+        let policy = kiro_policy(dir.path(), false).with_env_lookup(|key| match key {
+            "KEY_SOURCE" => panic!("a credential was read"),
+            "PATH" => Some(".::work".to_string()),
+            _ => None,
+        });
+        let sh = Shepherd::with_policy(fake.clone(), policy);
+        let err = call(
+            &sh,
+            "start_pane",
+            &args(json!({"profile": "kiro", "cwd": sub})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "not_found", "{err:?}");
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn list_panes_shows_profiles_without_their_environment() {
+        let dir = crate::testutil::TempDir::new("tools-profile-list");
+        let policy = kiro_policy(dir.path(), false);
+        let shown = policy.to_json();
+        assert_eq!(shown["allow_arbitrary_command"], false);
+        assert_eq!(shown["profiles"][0]["name"], "kiro");
+        assert_eq!(
+            shown["profiles"][0]["cwds"][0],
+            std::fs::canonicalize(dir.path()).unwrap().to_str().unwrap()
+        );
+        let text = shown.to_string();
+        assert!(
+            !text.contains("KIRO_API_KEY") && !text.contains("KEY_SOURCE"),
+            "{text}"
+        );
+        assert!(!text.contains("kiro-cli"), "{text}");
     }
 }

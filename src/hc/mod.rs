@@ -41,7 +41,12 @@ const CAPABILITIES: Capabilities = Capabilities {
     conditional_keys: false,
     client_command: true,
     client_cwd: true,
+    client_env: false,
     screen_text: true,
+    program_status: true,
+    history: true,
+    native_wait: true,
+    survives_restart: true,
 };
 
 #[derive(Debug, Clone)]
@@ -76,8 +81,13 @@ impl TerminalBackend for HcBackend {
     }
 
     fn run(&self, spec: &RunSpec) -> Result<TerminalInfo, BackendError> {
-        if let Some(profile) = &spec.profile {
-            return Err(unsupported(format!("launch profile {profile:?}")));
+        if !spec.profile_env.is_empty() {
+            return Err(unsupported(
+                "a launch profile with an environment".to_string(),
+            ));
+        }
+        if !spec.env.is_empty() {
+            return Err(unsupported("a per-run environment".to_string()));
         }
         let result = self.call(
             "terminal.run",
@@ -362,6 +372,7 @@ fn str_field(value: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod mapping_tests {
     use super::*;
+    use crate::backend::Secret;
 
     #[test]
     fn hc_terminal_object_is_normalized() {
@@ -459,7 +470,15 @@ mod mapping_tests {
             assert_eq!(err.code(), "unsupported", "{guard:?}");
         }
         let spec = RunSpec {
+            argv: Some(vec!["true".to_string()]),
             profile: Some("kiro".to_string()),
+            profile_env: vec![("KIRO_API_KEY".to_string(), Secret::new("k"))],
+            ..RunSpec::default()
+        };
+        assert_eq!(backend.run(&spec).unwrap_err().code(), "unsupported");
+        let spec = RunSpec {
+            argv: Some(vec!["true".to_string()]),
+            env: vec![("A".to_string(), "b".to_string())],
             ..RunSpec::default()
         };
         assert_eq!(backend.run(&spec).unwrap_err().code(), "unsupported");

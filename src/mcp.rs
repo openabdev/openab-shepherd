@@ -135,6 +135,7 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profiles::LaunchPolicy;
     use crate::testutil::FakeBackend;
 
     fn call_msg(name: &str, arguments: Value) -> Value {
@@ -151,7 +152,10 @@ mod tests {
     /// a test can show validation ran before any backend call.
     fn fake_client() -> (Shepherd, FakeBackend) {
         let fake = FakeBackend::new(true);
-        (Shepherd::new(fake.clone()), fake)
+        (
+            Shepherd::with_policy(fake.clone(), LaunchPolicy::arbitrary()),
+            fake,
+        )
     }
 
     fn text_of(out: &Value) -> String {

@@ -1,4 +1,5 @@
-//! Startup checks: bearer token, bind address, and the herdr-core socket path.
+//! Startup checks: bearer token, bind address, and the terminal backend (with
+//! the herdr-core socket path when the backend is hc).
 //!
 //! Every check runs before the server opens a listening socket. A failed check
 //! makes the binary exit with status 2 and print the reason on stderr.
@@ -16,6 +17,11 @@ pub const TOKEN_ENV: &str = "OPENAB_SHEPHERD_TOKEN";
 /// error text. Its precedence against HC_SESSION and the config file is unverified,
 /// so this server reads only this variable.
 pub const SOCKET_ENV: &str = "HC_SOCKET";
+/// Which terminal backend runs the panes: `native` or `hc`.
+pub const BACKEND_ENV: &str = "OPENAB_SHEPHERD_BACKEND";
+/// The backend used when [`BACKEND_ENV`] is unset or empty. `native` since the
+/// real-Kiro probe passed (kiro-cli 3.1.0, examples/native_probe.rs).
+pub const DEFAULT_BACKEND: &str = "native";
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 8765;
 pub const MIN_TOKEN_LENGTH: usize = 16;
@@ -31,10 +37,29 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// The terminal backend chosen at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendChoice {
+    /// herdr-core over its Unix socket.
+    Hc { socket: PathBuf },
+    /// Shepherd's own PTY core; needs no socket.
+    Native,
+}
+
+impl BackendChoice {
+    /// The value of [`BACKEND_ENV`] that selects it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Hc { .. } => "hc",
+            Self::Native => "native",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub token: String,
-    pub socket_path: PathBuf,
+    pub backend: BackendChoice,
     pub bind: SocketAddr,
 }
 
@@ -55,10 +80,10 @@ where
         return Err(ConfigError("port 0 is not allowed".to_string()));
     }
     let token = load_token(&lookup, project_dir)?;
-    let socket_path = load_socket_path(&lookup)?;
+    let backend = load_backend(&lookup)?;
     Ok(Config {
         token,
-        socket_path,
+        backend,
         bind: SocketAddr::new(ip, port),
     })
 }
@@ -115,7 +140,7 @@ fn read_token_file(path: &Path, project_dir: &Path) -> Result<String, ConfigErro
     // Resolve symlinks first, so a link inside the repo cannot hide a file outside it.
     let canonical = fs::canonicalize(path)
         .map_err(|err| ConfigError(format!("cannot read token file: {err}")))?;
-    check_outside_repo(&canonical, project_dir)?;
+    check_outside_repo(&canonical, project_dir, "token file")?;
     let meta = fs::metadata(&canonical)
         .map_err(|err| ConfigError(format!("cannot read token file: {err}")))?;
     if !meta.is_file() {
@@ -131,10 +156,15 @@ fn read_token_file(path: &Path, project_dir: &Path) -> Result<String, ConfigErro
     Ok(text.trim().to_string())
 }
 
-/// Refuse a token file that is inside the project folder, or inside any git
-/// repository that the project folder or the token's own folder belongs to.
+/// Refuse a file (the token file, the launch profiles) that is inside the
+/// project folder, or inside any git repository that the project folder or
+/// the file's own folder belongs to. `token` is already canonical.
 /// Repository roots come from `git rev-parse --show-toplevel`, not from a path prefix.
-fn check_outside_repo(token: &Path, project_dir: &Path) -> Result<(), ConfigError> {
+pub(crate) fn check_outside_repo(
+    token: &Path,
+    project_dir: &Path,
+    what: &str,
+) -> Result<(), ConfigError> {
     let project = fs::canonicalize(project_dir)
         .map_err(|err| ConfigError(format!("cannot resolve project folder: {err}")))?;
     let mut boundaries = vec![project.clone()];
@@ -150,9 +180,9 @@ fn check_outside_repo(token: &Path, project_dir: &Path) -> Result<(), ConfigErro
         .iter()
         .any(|boundary| token.starts_with(boundary))
     {
-        return Err(ConfigError(
-            "token file must be outside the git repository and the project folder".to_string(),
-        ));
+        return Err(ConfigError(format!(
+            "{what} must be outside the git repository and the project folder"
+        )));
     }
     Ok(())
 }
@@ -185,6 +215,21 @@ fn git_toplevel(dir: &Path) -> Result<Option<PathBuf>, ConfigError> {
             "git rev-parse failed while checking the token location: {}",
             stderr.trim()
         )))
+    }
+}
+
+/// `native` needs nothing else (HC_SOCKET is ignored); `hc` needs HC_SOCKET.
+fn load_backend<F>(lookup: &F) -> Result<BackendChoice, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let value = non_empty(lookup(BACKEND_ENV).map(|v| v.trim().to_string()));
+    match value.as_deref().unwrap_or(DEFAULT_BACKEND) {
+        "native" => Ok(BackendChoice::Native),
+        "hc" => Ok(BackendChoice::Hc {
+            socket: load_socket_path(lookup)?,
+        }),
+        _ => Err(ConfigError(format!("{BACKEND_ENV} must be native or hc"))),
     }
 }
 
@@ -264,15 +309,79 @@ mod tests {
     fn token_env_and_socket_accepted() {
         let dir = TempDir::new("env-ok");
         let config = load_config(
-            env_from(&[(TOKEN_ENV, GOOD_TOKEN), (SOCKET_ENV, SOCKET)]),
+            env_from(&[
+                (TOKEN_ENV, GOOD_TOKEN),
+                (SOCKET_ENV, SOCKET),
+                (BACKEND_ENV, "hc"),
+            ]),
             "127.0.0.1",
             8765,
             dir.path(),
         )
         .unwrap();
         assert_eq!(config.token, GOOD_TOKEN);
-        assert_eq!(config.socket_path, PathBuf::from(SOCKET));
+        assert_eq!(
+            config.backend,
+            BackendChoice::Hc {
+                socket: PathBuf::from(SOCKET)
+            }
+        );
         assert_eq!(config.bind, "127.0.0.1:8765".parse().unwrap());
+    }
+
+    #[test]
+    fn native_backend_needs_no_socket() {
+        let dir = TempDir::new("native");
+        for env in [
+            vec![(TOKEN_ENV, GOOD_TOKEN), (BACKEND_ENV, "native")],
+            vec![
+                (TOKEN_ENV, GOOD_TOKEN),
+                (BACKEND_ENV, " native "),
+                (SOCKET_ENV, SOCKET),
+            ],
+        ] {
+            let config = load_config(env_from(&env), "127.0.0.1", 8765, dir.path()).unwrap();
+            assert_eq!(config.backend, BackendChoice::Native);
+            assert_eq!(config.backend.name(), "native");
+        }
+    }
+
+    #[test]
+    fn unknown_backend_refused() {
+        let dir = TempDir::new("bad-backend");
+        for value in ["tmux", "NATIVE", "native,hc"] {
+            let err = load_config(
+                env_from(&[
+                    (TOKEN_ENV, GOOD_TOKEN),
+                    (SOCKET_ENV, SOCKET),
+                    (BACKEND_ENV, value),
+                ]),
+                "127.0.0.1",
+                8765,
+                dir.path(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.0, "OPENAB_SHEPHERD_BACKEND must be native or hc",
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn unset_backend_uses_the_default() {
+        let dir = TempDir::new("default-backend");
+        for env in [
+            vec![(TOKEN_ENV, GOOD_TOKEN), (SOCKET_ENV, SOCKET)],
+            vec![
+                (TOKEN_ENV, GOOD_TOKEN),
+                (SOCKET_ENV, SOCKET),
+                (BACKEND_ENV, "  "),
+            ],
+        ] {
+            let config = load_config(env_from(&env), "127.0.0.1", 8765, dir.path()).unwrap();
+            assert_eq!(config.backend.name(), DEFAULT_BACKEND);
+        }
     }
 
     #[test]
@@ -299,7 +408,7 @@ mod tests {
     fn missing_socket_env_refused() {
         let dir = TempDir::new("no-socket");
         let err = load_config(
-            env_from(&[(TOKEN_ENV, GOOD_TOKEN)]),
+            env_from(&[(TOKEN_ENV, GOOD_TOKEN), (BACKEND_ENV, "hc")]),
             "127.0.0.1",
             8765,
             dir.path(),

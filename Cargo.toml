@@ -3,11 +3,13 @@ name = "openab-shepherd"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "MCP server that exposes herdr-core terminal panes as tools (loopback only, bearer token)"
+description = "MCP server that exposes terminal panes as tools, over herdr-core or its own native PTY core (loopback only, bearer token)"
 
 [dependencies]
+libc = "0.2"
 serde_json = "1"
 tiny_http = "0.12"
+vt100 = { version = "=0.18.1", default-features = false }
 
 # Standalone crate: keep cargo from treating a parent directory as its workspace.
 [workspace]

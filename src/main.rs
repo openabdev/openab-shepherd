@@ -1,37 +1,34 @@
-//! OpenAB Shepherd: an MCP server that exposes herdr-core terminal panes as tools.
-//!
-//! The server listens on loopback only, requires a bearer token, and serves each
-//! tool call through a terminal backend (`backend.rs`). The only backend today is
-//! herdr-core over its Unix socket (`hc/`). See README.md for the tool map.
+//! The `openab-shepherd` binary: argument parsing and startup over the library.
 
-mod ansi;
-mod backend;
-mod config;
-mod dialog;
-mod hc;
-mod http;
-mod input;
-mod mcp;
-mod panelock;
-mod tools;
-
-#[cfg(test)]
-mod testutil;
-
-use hc::HcBackend;
-use http::AppState;
+use openab_shepherd::config::BackendChoice;
+use openab_shepherd::hc::HcBackend;
+use openab_shepherd::http::AppState;
+use openab_shepherd::native::{NativeBackend, NativeConfig};
+use openab_shepherd::profiles::LaunchPolicy;
+use openab_shepherd::{config, http, tools};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-const USAGE: &str = "\
+fn usage() -> String {
+    format!(
+        "\
 Usage: openab-shepherd [--host 127.0.0.1] [--port 8765]
 
 Environment:
   OPENAB_SHEPHERD_TOKEN_FILE  path to the bearer token file (preferred)
   OPENAB_SHEPHERD_TOKEN       the bearer token itself (use one of the two)
-  HC_SOCKET                   herdr-core Unix socket path (required)
+  OPENAB_SHEPHERD_BACKEND     native or hc (default {})
+  OPENAB_SHEPHERD_PROFILES    launch profiles file (JSON, outside any git repo);
+                              without it start_pane starts nothing
+  HC_SOCKET                   herdr-core Unix socket path (required for hc only)
 
---host accepts only 127.0.0.1 or ::1. Startup checks run before anything listens.";
+Native panes get only HOME, PATH, USER, LANG and TERM from this environment,
+plus their launch profile's env, or a caller command's own env.
+
+--host accepts only 127.0.0.1 or ::1. Startup checks run before anything listens.",
+        config::DEFAULT_BACKEND
+    )
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
@@ -87,12 +84,12 @@ fn main() -> ExitCode {
         Ok(opts) => opts,
         Err(message) => {
             eprintln!("openab-shepherd: {message}");
-            eprintln!("{USAGE}");
+            eprintln!("{}", usage());
             return ExitCode::from(2);
         }
     };
     if opts.help {
-        println!("{USAGE}");
+        println!("{}", usage());
         return ExitCode::SUCCESS;
     }
 
@@ -117,17 +114,59 @@ fn main() -> ExitCode {
         }
     };
 
+    let policy = match LaunchPolicy::load(|key| std::env::var(key).ok(), &project_dir) {
+        Ok(policy) => policy,
+        Err(err) => {
+            eprintln!("openab-shepherd: refusing to start: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let backend_name = config.backend.name();
+    let mut native_handle = None;
+    let shepherd = match config.backend {
+        BackendChoice::Native => {
+            let native = NativeBackend::new(NativeConfig::default());
+            // Before any other thread starts, so all of them leave these
+            // signals to the handler, which ends the panes before exiting.
+            if let Err(err) = native.end_panes_on_exit_signals() {
+                eprintln!(
+                    "openab-shepherd: refusing to start: cannot install the signal handler \
+                     that ends native panes on exit ({err})"
+                );
+                return ExitCode::from(2);
+            }
+            // The signal thread keeps a handle, so the panes are never
+            // dropped: end them on a main-thread panic and a serve error.
+            let on_panic = native.clone();
+            let default_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                default_hook(info);
+                if std::thread::current().name() == Some("main") {
+                    on_panic.shutdown();
+                }
+            }));
+            native_handle = Some(native.clone());
+            tools::Shepherd::with_policy(native, policy)
+        }
+        BackendChoice::Hc { socket } => {
+            tools::Shepherd::with_policy(HcBackend::new(socket), policy)
+        }
+    };
     let state = Arc::new(AppState {
         token: config.token,
-        shepherd: tools::Shepherd::new(HcBackend::new(config.socket_path)),
+        shepherd,
     });
     eprintln!(
-        "openab-shepherd: listening on http://{}{}",
+        "openab-shepherd: listening on http://{}{} (backend: {backend_name})",
         config.bind,
         http::MCP_PATH
     );
     if let Err(err) = http::serve(config.bind, state) {
         eprintln!("openab-shepherd: {err}");
+        if let Some(native) = &native_handle {
+            native.shutdown();
+        }
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS

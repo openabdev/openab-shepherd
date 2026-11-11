@@ -2,7 +2,38 @@
 
 ## Status
 
-### Current: backend trait refactor (branch `feat/backend-trait`)
+### Current: native core (branch `feat/native-core`)
+
+- **Default backend: `native`** (`config::DEFAULT_BACKEND`). hc stays available with
+  `OPENAB_SHEPHERD_BACKEND=hc` and `HC_SOCKET`.
+- Validation on remote build host (rustc 1.99.1), recorded in the commit messages and the run's
+  `remote build host.log`: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` (lib 170
+  passed, bin 3 passed, 0 failed) and `cargo build --release --all-targets`, each with exit
+  status 0. The native tests run real programs (`sh`, `cat`, `printf`, `env`, `ls`) on a PTY.
+- **Real-Kiro probe: PASS** (2026-11-10, `examples/native_probe.rs` built on remote build host, run on
+  the laptop against kiro-cli 3.1.0 with no listener and no `--host`/`--port`).
+  - Transitions (state@turn): idle@0, working@0, done@1, working@1,
+    blocked kind=permission@2, working@2, done@3, working@3, blocked kind=permission@4,
+    working@4, done@5. Turns 0 → 1 → 2 → 3 → 4 → 5 as expected.
+  - Raw blocked OSC bytes: `1b 5d 37 35 30 31 3b` `state=blocked:kind=permission:app=kiro-cli`
+    `07`, i.e. `\x1b]7501;state=blocked:kind=permission:app=kiro-cli\x07` (BEL-terminated).
+    Every report carries `app=kiro-cli`; the parser ignores it.
+  - Kitty flags pushed by Kiro: 1 (disambiguate); DECCKM off. The Down key for `deny_once`
+    worked under that mode.
+  - `send_input` while blocked → `pane_blocked` (kind `permission`); `dialog::parse` read the
+    native screen unchanged; `deny_once` left no marker file; `allow_once` created it.
+  - Kiro prompts used: 3 in total. The first run stopped at step 1 before any prompt: kiro-cli
+    showed "You are not logged in" because on this laptop it authenticates only through
+    `KIRO_API_KEY`, which the whitelist dropped. `child_env` now passes `KIRO_API_KEY` by name,
+    since review B1 only to an `argv` launch of `kiro-cli`, and since review SOL-B1 only
+    of the `kiro-cli` Shepherd's own `PATH` finds, by canonical path (regression tests
+    `child_env_passes_kiro_api_key_only_to_a_kiro_launch`,
+    `kiro_program_is_only_the_operators_kiro_cli`,
+    `only_a_kiro_cli_launch_sees_kiro_api_key`); the second run passed. That name rule
+    was then replaced by launch profiles (owner decision for SOL-B1); see Known limits.
+- The backend-trait section below is the previous state.
+
+### Previous: backend trait refactor (branch `feat/backend-trait`)
 
 - The crate is committed. The tools call the `TerminalBackend` trait (`src/backend.rs`);
   herdr-core is its only implementation (`src/hc/`).
@@ -215,12 +246,26 @@ curl -s -i $URL -H "$AUTH" -H 'Content-Type: application/json' -d '{"jsonrpc":"2
   (its parameters are `terminal`, `keys`, `caller`), so the re-check and `enter` are two calls. A
   person at the terminal or another herdr-core client on the same host can still change the dialog
   between them. The design accepts this because Shepherd is meant to be the only socket client.
-- **One terminal backend, behind a trait.** The tools now call a `TerminalBackend` trait
-  (`src/backend.rs`); herdr-core is its only implementation (`src/hc/`). The safety rules
-  above stay in Shepherd. A backend with conditional keys would enforce the pre-Enter
-  check atomically; herdr-core cannot, so the race above remains for it. A second backend
-  (openab-pty) is not started: it first needs screen text, program status, and a control
-  API.
+- **Two terminal backends, behind a trait.** The tools call a `TerminalBackend` trait
+  (`src/backend.rs`). The native core (`src/native/`) is the default; herdr-core (`src/hc/`)
+  is optional. The safety rules above stay in Shepherd. The native backend enforces the
+  pre-Enter check atomically (`conditional_keys` true), so the race above remains for hc
+  only. openab-pty is not a backend.
+- **Native: no restart survival.** Native panes are children of Shepherd and end with it.
+  There is also no viewer or attach, and no MCP removal tool (`NativeBackend::remove` is
+  inherent only).
+- **Credentials reach a child only through a launch profile.** `start_pane` starts an
+  operator-defined profile (`OPENAB_SHEPHERD_PROFILES`: fixed argv, allowed cwds, env
+  from `keychain:`/`env:`/literal); caller `argv`/`line` need `allow_arbitrary_command`
+  and never get a profile's env. A profile's program and what it runs (Kiro's tools)
+  still hold its credential; a caller who can prompt that Kiro can try to make it reveal
+  the key. Without a profiles file `start_pane` starts nothing.
+- **Native: finished panes keep a zombie leader** (`<defunct>`, at most 40) until removed,
+  evicted, replaced or Shepherd exits; it keeps the group id ours so the final SIGKILL can
+  never hit an unrelated group. Worst-case memory is about 520 MB (8 live + 32 finished
+  panes, each with full scrollback).
+- **Dialog parsing is still Kiro-specific.** `dialog::parse` knows only the kiro-cli 3.1.0 V3
+  shell permission dialog, on both backends.
 - **Result and error shapes changed after the integration run.** `start_pane`, `get_status`,
   and `list_panes` now return Shepherd pane objects (`name`, `live`, `status {state,
   kind}`, ...) instead of herdr-core JSON. The herdr-core address is no longer returned:
@@ -247,7 +292,7 @@ curl -s -i $URL -H "$AUTH" -H 'Content-Type: application/json' -d '{"jsonrpc":"2
 - **Host check before token check.** A request with a non-loopback Host gets 403 with no token
   check. A request with a loopback Host and a bad token gets 401.
 - **Request body read before auth.** Each request reads up to 1 MiB before the token check.
-- **Socket path.** The herdr-core socket default is unknown. `HC_SOCKET` is required. Its precedence
+- **Socket path (hc).** The herdr-core socket default is unknown. `HC_SOCKET` is required for hc. Its precedence
   against `HC_SESSION` and the config key is unverified.
 - **Token file check-then-read.** The mode and location are checked, then the file is read. Someone
   who can replace files in the token's folder could swap it in between.

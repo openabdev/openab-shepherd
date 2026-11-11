@@ -68,6 +68,8 @@ pub struct FakeState {
     pub screen: Option<String>,
     /// Keys passed to `keys`, one entry per call.
     pub keys: Vec<Vec<Key>>,
+    /// Specs passed to `run` (which is still refused).
+    pub runs: Vec<RunSpec>,
 }
 
 /// An in-memory backend. `get`, `send`, and (with [`FakeState::screen`] set)
@@ -89,7 +91,12 @@ impl FakeBackend {
                 conditional_keys: false,
                 client_command: true,
                 client_cwd: true,
+                client_env: true,
                 screen_text: true,
+                program_status: true,
+                history: true,
+                native_wait: true,
+                survives_restart: false,
             },
             state: Arc::new(Mutex::new(FakeState::default())),
         }
@@ -146,7 +153,8 @@ impl TerminalBackend for FakeBackend {
         self.caps
     }
 
-    fn run(&self, _spec: &RunSpec) -> Result<TerminalInfo, BackendError> {
+    fn run(&self, spec: &RunSpec) -> Result<TerminalInfo, BackendError> {
+        self.state.lock().unwrap().runs.push(spec.clone());
         self.unsupported("run")
     }
 
