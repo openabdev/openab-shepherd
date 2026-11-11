@@ -623,6 +623,34 @@ built by `cargo build --release --all-targets` at
 `target/release/examples/native_probe`; copy it back with `scp` and run it on the
 machine that has kiro-cli (it takes only `--keep-dir` and opens no listener).
 
+## Container image
+
+`Dockerfile` builds a linux/amd64 image: a Rust build stage, then a Debian trixie-slim
+runtime with kiro-cli, git and tini, running as uid 1000. The image holds no token and
+no profiles file. Build it on the remote build host, not the laptop:
+
+```sh
+docker build --platform linux/amd64 -t <registry>/openab-shepherd:<version> .
+docker image ls <registry>/openab-shepherd:<version>
+```
+
+The default command serves on `127.0.0.1:8765` inside the container. Nothing is
+published, so reach it from a container that shares the network namespace (a tailnet
+sidecar, for example). The token file and profiles file must be mounted or copied in
+at runtime, owned by uid 1000, with the modes listed above:
+
+```sh
+docker run --rm --platform linux/amd64 \
+  -v <token-dir>:/shepherd-conf:ro \
+  -e OPENAB_SHEPHERD_TOKEN_FILE=/shepherd-conf/<token-file> \
+  -e OPENAB_SHEPHERD_PROFILES=/shepherd-conf/<profiles-file> \
+  --network container:<sidecar-container> \
+  <registry>/openab-shepherd:<version>
+```
+
+To print the usage text without starting a server, run the binary by name:
+`docker run --rm --platform linux/amd64 <registry>/openab-shepherd:<version> openab-shepherd --help`.
+
 ## Known limits (MVP scope)
 
 - **No multi-client authorization.** Any holder of the token has full control of every
