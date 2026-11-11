@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1080" viewBox="0 0 1200 1080" role="img" aria-labelledby="title desc">
+  <title id="title">OpenAB Shepherd architecture</title>
+  <desc id="desc">An MCP client reaches Shepherd through Tailscale on the tailnet. Shepherd checks the Host header and the bearer token, runs the MCP tools under a per-pane lock and safety rules, and drives a kiro-cli pane through the native core or the hc backend. Side panels show the answer_dialog path and the credential path from a launch profile into the child environment.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3b4252"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f6feb"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c2410c"/>
+    </marker>
+  </defs>
+
+  <rect id="background" x="0" y="0" width="1200" height="1080" fill="#ffffff"/>
+
+  <g font-family="sans-serif" font-size="14" fill="#1a1a1a">
+    <text x="40" y="44" font-size="22" font-weight="bold">OpenAB Shepherd: how a call reaches a kiro-cli pane</text>
+
+    <!-- Main request path -->
+    <g id="client">
+      <rect x="40" y="70" width="600" height="64" rx="8" fill="#eef2f7" stroke="#3b4252" stroke-width="1.5"/>
+      <text x="340" y="96" text-anchor="middle" font-size="16" font-weight="bold">MCP client (for example Grok Bot)</text>
+      <text x="340" y="120" text-anchor="middle">JSON-RPC over HTTPS or HTTP on the tailnet, POST /mcp</text>
+    </g>
+    <line x1="340" y1="134" x2="340" y2="170" stroke="#3b4252" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <g id="tailscale">
+      <rect x="40" y="170" width="600" height="64" rx="8" fill="#eef2f7" stroke="#3b4252" stroke-width="1.5"/>
+      <text x="340" y="196" text-anchor="middle" font-size="16" font-weight="bold">Tailscale: tailnet only, no Funnel</text>
+      <text x="340" y="220" text-anchor="middle">tailscale serve: &lt;host&gt;.example-tailnet.ts.net to the loopback port</text>
+    </g>
+    <line x1="340" y1="234" x2="340" y2="270" stroke="#3b4252" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <g id="server">
+      <rect x="40" y="270" width="600" height="96" rx="8" fill="#e8f1ea" stroke="#3b4252" stroke-width="1.5"/>
+      <text x="340" y="296" text-anchor="middle" font-size="16" font-weight="bold">Shepherd HTTP server, listening on loopback only</text>
+      <text x="60" y="324">1. Host: a loopback name or an OPENAB_SHEPHERD_ALLOWED_HOSTS entry, else 403</text>
+      <text x="60" y="350">2. Authorization: Bearer token, constant-time compare, else 401</text>
+    </g>
+    <line x1="340" y1="366" x2="340" y2="402" stroke="#3b4252" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <g id="tools">
+      <rect x="40" y="402" width="600" height="88" rx="8" fill="#eef2f7" stroke="#3b4252" stroke-width="1.5"/>
+      <text x="340" y="428" text-anchor="middle" font-size="16" font-weight="bold">MCP tools (nine, called by pane name)</text>
+      <text x="340" y="452" text-anchor="middle" font-family="monospace">start_pane send_input read_output get_status</text>
+      <text x="340" y="476" text-anchor="middle" font-family="monospace">wait_status list_panes interrupt_pane answer_dialog remove_pane</text>
+    </g>
+    <line x1="340" y1="490" x2="340" y2="526" stroke="#3b4252" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <g id="safety">
+      <rect x="40" y="526" width="600" height="112" rx="8" fill="#fdf3e7" stroke="#3b4252" stroke-width="1.5"/>
+      <text x="340" y="552" text-anchor="middle" font-size="16" font-weight="bold">Per-pane lock and safety rules (enforced by Shepherd)</text>
+      <text x="60" y="578">One lock per pane id: typing, keys, interrupt and remove never interleave</text>
+      <text x="60" y="602">Known fields checked; a blocked pane refuses typing (pane_blocked)</text>
+      <text x="60" y="626">Launch profiles required, unless the operator sets allow_arbitrary_command</text>
+    </g>
+    <line x1="340" y1="638" x2="340" y2="674" stroke="#3b4252" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="352" y="661">TerminalBackend trait</text>
+
+    <g id="backend">
+      <rect x="40" y="674" width="600" height="196" rx="8" fill="#f5f5f5" stroke="#3b4252" stroke-width="1.5"/>
+      <text x="340" y="698" text-anchor="middle" font-size="16" font-weight="bold">Backend, chosen by OPENAB_SHEPHERD_BACKEND</text>
+      <g id="native">
+        <rect x="56" y="712" width="340" height="144" rx="6" fill="#ffffff" stroke="#3b4252" stroke-width="1.5"/>
+        <text x="226" y="734" text-anchor="middle" font-weight="bold">native core (default)</text>
+        <text x="72" y="758">PTY per pane, own session (setsid)</text>
+        <text x="72" y="782">VT emulator (vt100) draws the screen</text>
+        <text x="72" y="806">OSC 7501 parser: status and turn</text>
+        <text x="72" y="830">Process tree: group and descendants,</text>
+        <text x="72" y="848">signalled on remove, exit, shutdown</text>
+      </g>
+      <g id="hc">
+        <rect x="412" y="712" width="212" height="144" rx="6" fill="#ffffff" stroke="#3b4252" stroke-width="1.5" stroke-dasharray="6 4"/>
+        <text x="518" y="734" text-anchor="middle" font-weight="bold">hc backend (optional)</text>
+        <text x="518" y="762" text-anchor="middle">herdr-core JSON-RPC</text>
+        <text x="518" y="786" text-anchor="middle">over the HC_SOCKET</text>
+        <text x="518" y="810" text-anchor="middle">Unix socket</text>
+      </g>
+    </g>
+
+    <line x1="120" y1="870" x2="120" y2="906" stroke="#3b4252" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="128" y="893">text, keys</text>
+    <line x1="270" y1="906" x2="270" y2="870" stroke="#3b4252" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="278" y="893">output, OSC 7501</text>
+    <line x1="518" y1="870" x2="518" y2="906" stroke="#3b4252" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+    <text x="526" y="893">via herdr-core</text>
+
+    <g id="pane">
+      <rect x="40" y="906" width="600" height="88" rx="8" fill="#e8f1ea" stroke="#3b4252" stroke-width="1.5"/>
+      <text x="340" y="932" text-anchor="middle" font-size="16" font-weight="bold">kiro-cli pane</text>
+      <text x="340" y="956" text-anchor="middle">kiro-cli chat on its terminal, at most 8 live panes</text>
+      <text x="340" y="980" text-anchor="middle">child env: HOME, PATH, USER, LANG, TERM, plus the profile's env</text>
+    </g>
+
+    <!-- answer_dialog path -->
+    <g id="dialog-path">
+      <rect x="690" y="270" width="470" height="368" rx="8" fill="#eef4ff" stroke="#1f6feb" stroke-width="1.5"/>
+      <text x="925" y="296" text-anchor="middle" font-size="16" font-weight="bold" fill="#1f4fa8">answer_dialog path (permission dialog)</text>
+      <rect x="710" y="312" width="430" height="40" rx="6" fill="#ffffff" stroke="#1f6feb"/>
+      <text x="726" y="337">1. wait_status ends: blocked, kind permission</text>
+      <line x1="925" y1="352" x2="925" y2="368" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+      <rect x="710" y="368" width="430" height="40" rx="6" fill="#ffffff" stroke="#1f6feb"/>
+      <text x="726" y="393">2. read_output: read the dialog on the screen</text>
+      <line x1="925" y1="408" x2="925" y2="424" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+      <rect x="710" y="424" width="430" height="40" rx="6" fill="#ffffff" stroke="#1f6feb"/>
+      <text x="726" y="449">3. answer_dialog: allow_once or deny_once only</text>
+      <line x1="925" y1="464" x2="925" y2="480" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+      <rect x="710" y="480" width="430" height="40" rx="6" fill="#ffffff" stroke="#1f6feb"/>
+      <text x="726" y="505">4. Up/Down keys, re-read until on the choice</text>
+      <line x1="925" y1="520" x2="925" y2="536" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+      <rect x="710" y="536" width="430" height="40" rx="6" fill="#ffffff" stroke="#1f6feb"/>
+      <text x="726" y="561">5. Same dialog and turn: Enter; else refuse</text>
+      <text x="710" y="600">Native: the check and Enter are one guarded write.</text>
+      <text x="710" y="622">Rule-creating options are never offered.</text>
+    </g>
+    <line x1="640" y1="446" x2="690" y2="446" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+    <polyline points="710,556 664,556 664,760 640,760" fill="none" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+    <text x="646" y="786" fill="#1f4fa8">keys</text>
+
+    <!-- Credential path -->
+    <g id="cred-path">
+      <rect x="690" y="674" width="470" height="320" rx="8" fill="#fff4ec" stroke="#c2410c" stroke-width="1.5"/>
+      <text x="925" y="700" text-anchor="middle" font-size="16" font-weight="bold" fill="#9a3412">Credential path (start_pane with a profile)</text>
+      <rect x="710" y="716" width="430" height="56" rx="6" fill="#ffffff" stroke="#c2410c"/>
+      <text x="726" y="740">Launch profile file (OPENAB_SHEPHERD_PROFILES)</text>
+      <text x="726" y="762">fixed argv, allowed cwds, env map</text>
+      <line x1="925" y1="772" x2="925" y2="818" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+      <text x="935" y="800" fill="#9a3412">read when the pane starts</text>
+      <rect x="710" y="818" width="430" height="56" rx="6" fill="#ffffff" stroke="#c2410c"/>
+      <text x="726" y="842">keychain:&lt;keychain-item&gt; (macOS Keychain)</text>
+      <text x="726" y="864">or env:&lt;NAME&gt; (Shepherd's own environment)</text>
+      <line x1="925" y1="874" x2="925" y2="920" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+      <rect x="710" y="920" width="430" height="56" rx="6" fill="#ffffff" stroke="#c2410c"/>
+      <text x="726" y="944">Profile env, kept as a redacted secret</text>
+      <text x="726" y="966">native adds it to the child; hc refuses it</text>
+    </g>
+    <line x1="710" y1="948" x2="640" y2="948" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+    <text x="645" y="938" fill="#9a3412" font-size="14">child</text>
+    <text x="645" y="970" fill="#9a3412" font-size="14">only</text>
+
+    <!-- Legend -->
+    <g id="legend">
+      <line x1="40" y1="1040" x2="80" y2="1040" stroke="#3b4252" stroke-width="2" marker-end="url(#arrow)"/>
+      <text x="88" y="1045">request path</text>
+      <line x1="200" y1="1040" x2="240" y2="1040" stroke="#3b4252" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+      <text x="248" y="1045">optional hc backend</text>
+      <line x1="400" y1="1040" x2="440" y2="1040" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+      <text x="448" y="1045">answer_dialog path</text>
+      <line x1="600" y1="1040" x2="640" y2="1040" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+      <text x="648" y="1045">credential path, into the child environment only</text>
+    </g>
+  </g>
+</svg>
