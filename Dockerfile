@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (openab Dockerfile, kiro stage).
 ARG KIRO_CLI_VERSION=3.1.0
 ARG KIRO_SHA256_AMD64=6f43c9ca9811d1ef2d4b47148667243b5af2d4aaea7cdef3e9a6af1c10d4c8ba
-ARG KIRO_SHA256_ARM64=cc8a2df90cd354b569b81ed4653db4796c86a69866568b4eb7fa7906afc95309
+ARG KIRO_SHA256_ARM64=744701a386299ecc562766c591c54850cfae95775c19c0d6e3f4b5eaf55f87b0
 RUN ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then \
       URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-aarch64-linux.zip"; \
