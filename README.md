@@ -115,23 +115,24 @@ Every variable, profile field, tool argument, error code and bound is described 
 
 ## OpenCode CLI
 
-Measured on OpenCode 2.2.7 (`opencode --version`), installed at `~/.bun/bin/opencode`.
-Only the TUI startup was measured, with no model turn and no credentials.
+Observed on a laptop with OpenCode 2.2.7 (`opencode --version`), installed locally with bun.
+Only the TUI startup was observed, with no model turn and no credentials. These
+observations are not yet attached to issue 2.
 
 - Launch with `argv: ["opencode", "--standalone"]`. Without `--standalone`, OpenCode
   starts a background server (`opencode serve --service`) that keeps running after the
   TUI exits. Stop it with `opencode service stop`, which exits 0 and ends the process
-  (measured).
+  (observed on the laptop).
 - Never pass `--auto`, and never set `session.permissions` to `autoaccept`. Both
   approve permission prompts without a dialog.
-- At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. This report is
-  measured. The output filter removes it. Whether herdr-core turns it into a
-  `get_status` result is not yet measured. It is an open point pending a live check.
+- At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. This report was
+  observed on the laptop. The output filter removes it. Whether herdr-core turns it into a
+  `get_status` result is not yet verified. It is an open point pending a live check.
 - OpenCode has a dialect slot but no measured permission dialog. `answer_dialog` refuses an
   OpenCode pane before it reads the screen, and sends no keys. A launch profile may name
   `agent: "opencode"`, but only with `permission_mode` `normal`: no OpenCode mode was measured,
   so `accept-edits` and `bypass` are rejected. Its startup status (`state=idle:app=opencode`) and
-  its ST-terminated `7501;?` query are measured and parsed. Working turns, the `blocked` state for
+  its ST-terminated `7501;?` query were observed on the laptop and are parsed. Working turns, the `blocked` state for
   permission prompts, and the dialog layout are not yet measured.
 
 ## Status and known limits

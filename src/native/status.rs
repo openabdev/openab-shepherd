@@ -235,7 +235,8 @@ mod tests {
 
     #[test]
     fn opencode_startup_report_is_idle() {
-        // Measured: OpenCode's startup report is `state=idle:app=opencode`.
+        // Observed on a laptop (OpenCode 2.2.7, not yet posted to issue 2): the startup
+        // report is `state=idle:app=opencode`.
         assert_eq!(parse("7501;state=idle:app=opencode"), status("idle", None));
     }
 

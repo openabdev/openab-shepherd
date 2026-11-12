@@ -389,7 +389,8 @@ mod tests {
 
     #[test]
     fn status_query_ended_with_st_gets_the_capability_reply() {
-        // Measured: OpenCode's query ends with ST (ESC \), not BEL.
+        // Observed on a laptop (OpenCode 2.2.7, not yet posted to issue 2): the query
+        // ends with ST (ESC \), not BEL.
         let mut emu = Emulator::new();
         emu.process(b"\x1b]7501;?\x1b\\");
         assert_eq!(emu.take_replies(), status::QUERY_REPLY);
