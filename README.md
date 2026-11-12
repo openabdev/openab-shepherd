@@ -21,13 +21,13 @@ which answers a permission dialog may receive.
 - **Blocked-dialog handling.** `send_input` refuses to type while a pane is blocked
   on a dialog and returns `pane_blocked`. `answer_dialog` accepts only `allow_once`
   or `deny_once`; the rule-creating options cannot be chosen. It reads the dialog
-  for the pane's agent (`kiro` or `devin`), re-checks the dialog, its kind and its
+  for the pane's agent (`kiro`, `devin`, or `opencode`), re-checks the dialog, its kind and its
   turn number before it presses Enter. A Devin dialog never selects `Bypass mode`.
 - **Launch profiles.** `start_pane` starts only what the operator's profiles file
   allows: a fixed `argv`, a list of allowed working directories, and environment
   variables. Each variable is a literal value or is read when the pane starts from
   a `keychain:` (macOS Keychain) or `env:` source. A profile names its `agent`
-  (`kiro` or `devin`) and a `permission_mode` (`normal`, `accept-edits`, or
+  (`kiro`, `devin`, or `opencode`) and a `permission_mode` (`normal`, `accept-edits`, or
   `bypass`). Caller-chosen commands are off
   unless the file sets `"allow_arbitrary_command": true`, and such panes never get
   a profile's environment. Without a profiles file, `start_pane` starts nothing.
@@ -127,10 +127,12 @@ Only the TUI startup was measured, with no model turn and no credentials.
 - At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. This report is
   measured. The output filter removes it. Whether herdr-core turns it into a
   `get_status` result is not yet measured. It is an open point pending a live check.
-- OpenCode has no dialect. `answer_dialog` refuses it before any key is sent. A launch
-  profile's `agent` must be `kiro` or `devin`, so an OpenCode profile is rejected today.
-  Working turns, the `blocked` state for permission prompts, and the dialog layout are
-  not yet measured.
+- OpenCode has a dialect slot but no measured permission dialog. `answer_dialog` refuses an
+  OpenCode pane before it reads the screen, and sends no keys. A launch profile may name
+  `agent: "opencode"`, but only with `permission_mode` `normal`: no OpenCode mode was measured,
+  so `accept-edits` and `bypass` are rejected. Its startup status (`state=idle:app=opencode`) and
+  its ST-terminated `7501;?` query are measured and parsed. Working turns, the `blocked` state for
+  permission prompts, and the dialog layout are not yet measured.
 
 ## Status and known limits
 

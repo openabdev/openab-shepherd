@@ -388,6 +388,15 @@ mod tests {
     }
 
     #[test]
+    fn status_query_ended_with_st_gets_the_capability_reply() {
+        // Measured: OpenCode's query ends with ST (ESC \), not BEL.
+        let mut emu = Emulator::new();
+        emu.process(b"\x1b]7501;?\x1b\\");
+        assert_eq!(emu.take_replies(), status::QUERY_REPLY);
+        assert_eq!(emu.take_reports(), [(b"?".to_vec(), Report::Query)]);
+    }
+
+    #[test]
     fn a_report_split_at_every_byte_is_seen_once() {
         let bel = [&b"\x1b]7501;"[..], BLOCKED_BODY, b"\x07"].concat();
         let st = [&b"\x1b]7501;"[..], BLOCKED_BODY, b"\x1b\\"].concat();

@@ -91,7 +91,7 @@ impl Profile {
     /// profile's own `argv`.
     pub fn permission_args(&self) -> Vec<String> {
         match self.agent {
-            Agent::Kiro => Vec::new(),
+            Agent::Kiro | Agent::OpenCode => Vec::new(),
             Agent::Devin => vec![
                 "--permission-mode".to_string(),
                 self.permission_mode.devin_value().to_string(),
@@ -536,10 +536,9 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
 
     let agent = match map.get("agent") {
         None => Agent::Kiro,
-        Some(Value::String(text)) => {
-            Agent::parse(text).ok_or_else(|| err(format!("{at}: agent must be kiro or devin")))?
-        }
-        Some(_) => return Err(err(format!("{at}: agent must be kiro or devin"))),
+        Some(Value::String(text)) => Agent::parse(text)
+            .ok_or_else(|| err(format!("{at}: agent must be kiro, devin or opencode")))?,
+        Some(_) => return Err(err(format!("{at}: agent must be kiro, devin or opencode"))),
     };
     let permission_mode = match map.get("permission_mode") {
         None => PermissionMode::Normal,
@@ -568,6 +567,11 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         (Agent::Kiro, PermissionMode::Bypass) if !allow_bypass => {
             return Err(err(format!(
                 "{at}: permission_mode bypass for kiro needs \"allow_bypass\": true"
+            )))
+        }
+        (Agent::OpenCode, PermissionMode::AcceptEdits | PermissionMode::Bypass) => {
+            return Err(err(format!(
+                "{at}: permission_mode must be normal for opencode: no OpenCode permission mode was measured"
             )))
         }
         (Agent::Devin, _)
@@ -840,8 +844,19 @@ mod tests {
             json!({"profiles": [map]}).to_string()
         };
         let cases = [
-            (json!({"agent": "opencode"}), "agent must be kiro or devin"),
-            (json!({"agent": 1}), "agent must be kiro or devin"),
+            (
+                json!({"agent": "open-code"}),
+                "agent must be kiro, devin or opencode",
+            ),
+            (json!({"agent": 1}), "agent must be kiro, devin or opencode"),
+            (
+                json!({"agent": "opencode", "permission_mode": "accept-edits"}),
+                "permission_mode must be normal for opencode",
+            ),
+            (
+                json!({"agent": "opencode", "permission_mode": "bypass", "allow_bypass": true}),
+                "permission_mode must be normal for opencode",
+            ),
             (
                 json!({"permission_mode": "yolo"}),
                 "permission_mode must be",
@@ -885,6 +900,21 @@ mod tests {
             let message = refused(&profile(extra.clone()));
             assert!(message.contains(want), "{extra}: {message}");
         }
+    }
+
+    #[test]
+    fn an_opencode_profile_is_accepted_in_normal_mode_with_no_mode_flag() {
+        let dir = TempDir::new("profiles-opencode-ok");
+        let d = dir.path().to_string_lossy().into_owned();
+        let text = json!({"profiles": [
+            {"name": "oc", "argv": ["opencode"], "cwds": [d], "agent": "opencode"},
+        ]})
+        .to_string();
+        let policy = parse(&text, true).unwrap();
+        let profile = policy.profile("oc").unwrap();
+        assert_eq!(profile.agent, Agent::OpenCode);
+        assert_eq!(profile.permission_mode, PermissionMode::Normal);
+        assert!(profile.permission_args().is_empty());
     }
 
     #[test]

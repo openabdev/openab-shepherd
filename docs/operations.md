@@ -51,7 +51,7 @@ later is a contained change.
 | `src/tools.rs` | The nine tools, their schemas, the safety rules, and the backend calls each one makes |
 | `src/dialog.rs` | Text parser for the kiro-cli permission dialog |
 | `src/devin_dialog.rs` | Text parser for the Devin CLI permission dialog |
-| `src/agent.rs` | The agents a profile can name (`kiro`, `devin`), their dialects, and `permission_mode` |
+| `src/agent.rs` | The agents a profile can name (`kiro`, `devin`, `opencode`), their dialects, and `permission_mode` |
 | `src/mcp.rs` | MCP message handling |
 | `src/http.rs` | Loopback Host check, bearer auth, POST handling |
 | `src/testutil.rs` | Test-only helpers: scratch dirs, git init, an in-memory `FakeBackend` |
@@ -176,9 +176,10 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
 - `allow_arbitrary_command` (default false): when true, `start_pane` also takes a
   caller-chosen `argv` or `line` (and `env`). Such a pane never gets a profile's
   environment, whatever program it runs.
-- `agent` (optional, default `kiro`): `kiro` or `devin`. It decides which permission
+- `agent` (optional, default `kiro`): `kiro`, `devin` or `opencode`. It decides which permission
   dialog `answer_dialog` reads for panes this profile starts, and, for `devin`, the
-  launch flag below. A pane started any other way has no agent, so `answer_dialog`
+  launch flag below. `opencode` has no measured dialog: `answer_dialog` refuses its panes with
+  no keys sent, and its profiles must use `permission_mode` `normal`. A pane started any other way has no agent, so `answer_dialog`
   refuses it with no keys sent. Panes started before this Shepherd process have no
   record of their agent, so they are refused too.
 - `permission_mode` (optional, default `normal`): what the agent may do without
@@ -354,6 +355,8 @@ must not be `blocked`, then the text is sent, still inside the lock.
    - `devin`: the dialog needs a line reading `Running command`, then `$ <command>`,
      then three option rows in this order: `Allow` (its scope selector may follow on
      the same row), `Bypass mode`, `Deny`, with one `❭` on the highlighted row.
+   - `opencode`: no dialog has been measured, so this step refuses before it reads the screen
+     and sends nothing.
 
    Anything else is refused.
 3. Move the cursor. For `kiro`, `up` or `down` keys (`keys`) go out in one batch:

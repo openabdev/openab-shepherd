@@ -13,6 +13,8 @@ use crate::dialog::{self, Choice};
 pub enum Agent {
     Kiro,
     Devin,
+    /// No permission dialog has been measured for OpenCode. See [`Agent::option`].
+    OpenCode,
 }
 
 impl Agent {
@@ -20,6 +22,7 @@ impl Agent {
         match text {
             "kiro" => Some(Self::Kiro),
             "devin" => Some(Self::Devin),
+            "opencode" => Some(Self::OpenCode),
             _ => None,
         }
     }
@@ -28,6 +31,7 @@ impl Agent {
         match self {
             Self::Kiro => "kiro",
             Self::Devin => "devin",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -41,26 +45,29 @@ impl Agent {
                 cursor: found.cursor,
             }),
             Self::Devin => devin_dialog::parse(screen),
+            Self::OpenCode => Err(unmeasured(self)),
         }
     }
 
-    /// The position of the option `choice` selects in this agent's dialog.
-    pub fn target(self, choice: Choice) -> usize {
+    /// Where `choice` sits in this agent's dialog: the option's position and the
+    /// label the dialog shows for it. None when the dialog has not been measured,
+    /// so the caller must refuse and send no keys.
+    pub fn option(self, choice: Choice) -> Option<(usize, &'static str)> {
         match (self, choice) {
-            (Self::Kiro, _) => choice.index(),
-            (Self::Devin, Choice::AllowOnce) => INDEX_ALLOW,
-            (Self::Devin, Choice::DenyOnce) => INDEX_DENY,
+            (Self::Kiro, _) => Some((choice.index(), choice.label())),
+            (Self::Devin, Choice::AllowOnce) => Some((INDEX_ALLOW, devin_dialog::OPTION_ALLOW)),
+            (Self::Devin, Choice::DenyOnce) => Some((INDEX_DENY, devin_dialog::OPTION_DENY)),
+            (Self::OpenCode, _) => None,
         }
     }
+}
 
-    /// The option's label as this agent's dialog shows it.
-    pub fn label(self, choice: Choice) -> &'static str {
-        match (self, choice) {
-            (Self::Kiro, _) => choice.label(),
-            (Self::Devin, Choice::AllowOnce) => devin_dialog::OPTION_ALLOW,
-            (Self::Devin, Choice::DenyOnce) => devin_dialog::OPTION_DENY,
-        }
-    }
+/// The refusal for an agent whose permission dialog was not measured.
+pub fn unmeasured(agent: Agent) -> String {
+    format!(
+        "the {} permission dialog has not been measured, so no dialect applies",
+        agent.as_str()
+    )
 }
 
 /// A permission dialog as any agent's parser reports it.
@@ -113,26 +120,40 @@ mod tests {
     #[test]
     fn the_devin_bypass_option_is_never_a_target() {
         for choice in [Choice::AllowOnce, Choice::DenyOnce] {
-            assert_ne!(Agent::Devin.target(choice), devin_dialog::INDEX_BYPASS);
+            let target = Agent::Devin.option(choice).map(|(at, _)| at);
+            assert_ne!(target, Some(devin_dialog::INDEX_BYPASS));
         }
     }
 
     #[test]
     fn targets_and_labels_match_each_agent() {
-        assert_eq!(Agent::Kiro.target(Choice::AllowOnce), 0);
-        assert_eq!(Agent::Kiro.target(Choice::DenyOnce), 1);
-        assert_eq!(Agent::Kiro.label(Choice::DenyOnce), "Deny once");
-        assert_eq!(Agent::Devin.target(Choice::AllowOnce), 0);
-        assert_eq!(Agent::Devin.target(Choice::DenyOnce), 2);
-        assert_eq!(Agent::Devin.label(Choice::AllowOnce), "Allow");
-        assert_eq!(Agent::Devin.label(Choice::DenyOnce), "Deny");
+        assert_eq!(
+            Agent::Kiro.option(Choice::AllowOnce),
+            Some((0, "Allow once"))
+        );
+        assert_eq!(Agent::Kiro.option(Choice::DenyOnce), Some((1, "Deny once")));
+        assert_eq!(Agent::Devin.option(Choice::AllowOnce), Some((0, "Allow")));
+        assert_eq!(Agent::Devin.option(Choice::DenyOnce), Some((2, "Deny")));
+    }
+
+    #[test]
+    fn opencode_has_no_measured_dialect_so_no_option_and_no_parse() {
+        for choice in [Choice::AllowOnce, Choice::DenyOnce] {
+            assert_eq!(Agent::OpenCode.option(choice), None);
+        }
+        let err = Agent::OpenCode.parse_dialog("Allow once\n").unwrap_err();
+        assert!(
+            err.contains("opencode permission dialog has not been measured"),
+            "{err}"
+        );
     }
 
     #[test]
     fn agent_names_parse_exactly() {
         assert_eq!(Agent::parse("kiro"), Some(Agent::Kiro));
         assert_eq!(Agent::parse("devin"), Some(Agent::Devin));
-        for other in ["Devin", "opencode", "", "devin "] {
+        assert_eq!(Agent::parse("opencode"), Some(Agent::OpenCode));
+        for other in ["Devin", "OpenCode", "open-code", "", "devin "] {
             assert_eq!(Agent::parse(other), None, "{other}");
         }
     }
