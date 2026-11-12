@@ -15,17 +15,19 @@
 //!   answer_dialog   -> get, read, keys
 //!   remove_pane     -> get (x2, see lock_pane), remove
 
+use crate::agent::{Agent, ParsedDialog};
 use crate::ansi::strip_terminal_escapes;
 use crate::backend::{
     dialog_kind, status_json, BackendError, ErrorKind, InputGuard, Key, KeysResult, RunSpec, State,
     StopHow, TerminalBackend, TerminalInfo, TerminalRef, WaitReason,
 };
-use crate::dialog::{self, Choice};
+use crate::dialog::Choice;
 use crate::input::{validate_input, validate_name};
 use crate::panelock::{PaneGuard, PaneLocks};
 use crate::profiles::{CwdError, LaunchPolicy};
 use serde_json::{json, Map, Value};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -70,13 +72,23 @@ const BLOCKED_NEXT: &str = "read_output, then answer_dialog; nothing was typed";
 
 pub type Args = Map<String, Value>;
 
-/// The tools' shared state: one backend, and the per-pane locks. Clones share
-/// both.
+/// The tools' shared state: one backend, the per-pane locks, and the agent of
+/// each pane a profile started. Clones share all three.
 #[derive(Clone)]
 pub struct Shepherd {
     backend: Arc<dyn TerminalBackend>,
     locks: Arc<PaneLocks>,
     policy: Arc<LaunchPolicy>,
+    panes: Arc<Mutex<HashMap<String, PaneAgent>>>,
+}
+
+/// What this process knows about a pane a profile started, keyed by pane name.
+#[derive(Debug, Clone, Copy)]
+struct PaneAgent {
+    agent: Agent,
+    /// A dialog was answered with Enter or Esc, so an idle state that follows
+    /// is a cancel (see [`wait_outcome`]). Cleared by wait_status.
+    answered: bool,
 }
 
 impl Shepherd {
@@ -92,12 +104,56 @@ impl Shepherd {
             backend: Arc::new(backend),
             locks: Arc::new(PaneLocks::default()),
             policy: Arc::new(policy),
+            panes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     #[cfg(test)]
     pub fn pane_locks(&self) -> &Arc<PaneLocks> {
         &self.locks
+    }
+
+    /// Record that the pane `name` runs `agent`, as if a profile had started it.
+    #[cfg(test)]
+    pub fn assume_agent(&self, name: &str, agent: Agent) {
+        self.remember_agent(name, agent);
+    }
+
+    fn panes(&self) -> MutexGuard<'_, HashMap<String, PaneAgent>> {
+        self.panes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn remember_agent(&self, name: &str, agent: Agent) {
+        self.panes().insert(
+            name.to_string(),
+            PaneAgent {
+                agent,
+                answered: false,
+            },
+        );
+    }
+
+    /// The agent of a pane this process started from a profile. None for a
+    /// pane started any other way, or before this process started.
+    pub(crate) fn agent_of(&self, name: &str) -> Option<Agent> {
+        self.panes().get(name).map(|pane| pane.agent)
+    }
+
+    fn mark_answered(&self, name: &str) {
+        if let Some(pane) = self.panes().get_mut(name) {
+            pane.answered = true;
+        }
+    }
+
+    /// Whether the pane was answered since the last call, and clear the mark.
+    fn take_answered(&self, name: &str) -> bool {
+        self.panes()
+            .get_mut(name)
+            .is_some_and(|pane| std::mem::take(&mut pane.answered))
+    }
+
+    fn forget_agent(&self, name: &str) {
+        self.panes().remove(name);
     }
 }
 
@@ -206,7 +262,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "wait_status",
-            "description": "Wait until a pane stops working, or check in after timeout seconds. Branch on outcome: done (the turn finished), blocked (waiting on a dialog; kind says which, for example permission), timeout (a check-in: still running), exited (the program ended), or other (any other status or reason; read status). turn_complete is true only for done and exited; a blocked pane has not completed its turn even though its turn number advanced. A program that never reports status counts as working until it exits.",
+            "description": "Wait until a pane stops working, or check in after timeout seconds. Branch on outcome: done (the turn finished), blocked (waiting on a dialog; kind says which, for example permission), timeout (a check-in: still running), exited (the program ended), cancelled (the pane went idle after answer_dialog denied or cancelled its dialog; a Devin cancel returns to idle, not done), or other (any other status or reason; read status). turn_complete is true only for done and exited; a blocked pane has not completed its turn even though its turn number advanced. A program that never reports status counts as working until it exits.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -238,7 +294,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "answer_dialog",
-            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text; tested only on kiro-cli 3.1.0 (V3) shell permission dialogs. Follow with wait_status.",
+            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (tested on kiro-cli 3.1.0 V3 shell permission dialogs) or devin (Devin CLI 3000.12.43 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses). A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -310,10 +366,57 @@ fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         .with("backend_detail", err.detail),
         _ => backend_failure(spec.name.as_deref(), err),
     })?;
+    // The profile's agent decides the dialect answer_dialog reads for this pane.
+    let profile_agent = spec
+        .profile
+        .as_deref()
+        .and_then(|p| sh.policy.profile(p))
+        .map(|p| p.agent);
     if info.name.is_none() {
-        info.name = spec.name;
+        info.name = spec.name.clone();
+    }
+    if profile_agent == Some(Agent::Devin) {
+        let pane = info.reference();
+        if trust_prompt_shown(sh, &pane) {
+            // Nothing was typed into the pane, so it is closed, not left waiting.
+            let _ = sh.backend.remove(&pane, Some(Duration::ZERO));
+            return Err(ToolError::new(
+                "trust_prompt",
+                format!(
+                    "Devin asked \"{TRUST_PROMPT}\" for this directory, so the pane was closed before it ran anything. Shepherd never answers this prompt. Trust the directory once in Devin (run devin there and choose 1), then start the pane again"
+                ),
+            )
+            .with("terminal", spec.name.clone()));
+        }
+    }
+    if let (Some(agent), Some(name)) = (profile_agent, info.name.as_deref()) {
+        sh.remember_agent(name, agent);
     }
     Ok(info.to_json())
+}
+
+/// The Devin prompt that asks whether to trust a directory before Devin runs
+/// anything there.
+const TRUST_PROMPT: &str = "Do you trust the authors of this directory?";
+
+/// Read the pane for the trust prompt for the same window answer_dialog uses to
+/// wait for a dialog to render. True as soon as the prompt shows. False when it
+/// never shows in that window, or when the backend has no screen text.
+fn trust_prompt_shown(sh: &Shepherd, pane: &TerminalRef) -> bool {
+    if !sh.backend.capabilities().screen_text {
+        return false;
+    }
+    for attempt in 0..RENDER_READS {
+        if attempt > 0 {
+            thread::sleep(RENDER_POLL_INTERVAL);
+        }
+        if let Ok(screen) = sh.backend.read(pane, 0) {
+            if strip_terminal_escapes(&screen.text).contains(TRUST_PROMPT) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A launch profile's run: its fixed argv, a cwd it allows, no caller env.
@@ -365,8 +468,10 @@ fn profile_spec(sh: &Shepherd, args: &Args, profile: &str) -> Result<RunSpec, To
             .with("profile", name.as_str())
             .with("backend_detail", why)
     })?;
-    let mut argv = profile.argv.clone();
-    argv[0] = program.to_string_lossy().into_owned();
+    // The program, then the agent's permission flag, then the profile's own arguments.
+    let mut argv = vec![program.to_string_lossy().into_owned()];
+    argv.extend(profile.permission_args());
+    argv.extend(profile.argv[1..].iter().cloned());
     Ok(RunSpec {
         argv: Some(argv),
         cwd: Some(cwd.to_string_lossy().into_owned()),
@@ -649,7 +754,8 @@ fn wait_status(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
             }
         })?;
     let state = result.status.as_ref().map(|status| &status.state);
-    let outcome = wait_outcome(result.ended, result.reason.as_ref(), state);
+    let answered = sh.take_answered(&terminal);
+    let outcome = wait_outcome(result.ended, result.reason.as_ref(), state, answered);
     let mut out = json!({
         "terminal": terminal,
         "outcome": outcome,
@@ -681,13 +787,21 @@ fn wait_status(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     Ok(out)
 }
 
-/// What a wait result means. Only `done` and `exited` complete a turn.
-fn wait_outcome(ended: bool, reason: Option<&WaitReason>, state: Option<&State>) -> &'static str {
+/// What a wait result means. Only `done` and `exited` complete a turn. `idle`
+/// after a dialog this process answered is `cancelled`: a Devin deny or cancel
+/// returns the pane to idle, not done.
+fn wait_outcome(
+    ended: bool,
+    reason: Option<&WaitReason>,
+    state: Option<&State>,
+    answered: bool,
+) -> &'static str {
     match (ended, reason, state) {
         (false, Some(WaitReason::Timeout), _) => "timeout",
         (true, Some(WaitReason::Exit), _) => "exited",
         (true, Some(WaitReason::Status), Some(State::Done)) => "done",
         (true, Some(WaitReason::Status), Some(State::Blocked)) => "blocked",
+        (true, Some(WaitReason::Status), Some(State::Idle)) if answered => "cancelled",
         _ => "other",
     }
 }
@@ -743,6 +857,7 @@ fn remove_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         .backend
         .remove(&pane, Some(Duration::from_secs_f64(grace)))
         .map_err(|err| backend_failure(Some(&terminal), err))?;
+    sh.forget_agent(&terminal);
     Ok(json!({
         "name": terminal,
         "was_live": removed.was_live,
@@ -844,6 +959,18 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
             &sent,
         ));
     };
+    // The dialect comes from the profile that started the pane. A pane with
+    // none, or one this process did not start, gets no keys.
+    let Some(agent) = sh.agent_of(&terminal) else {
+        return Err(refusal(
+            &terminal,
+            choice,
+            "the pane was not started from a launch profile by this Shepherd process, so no dialect applies"
+                .to_string(),
+            json!({"status": status}),
+            &sent,
+        ));
+    };
     // Every key goes to this dialog in this turn. A backend with conditional
     // keys enforces it; for one without, the checks below do (non-atomically).
     let key_guard = InputGuard {
@@ -851,6 +978,15 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         if_state: Some(State::Blocked),
         if_kind: Some("permission".to_string()),
         expect_turn: Some(turn),
+    };
+    let ask = Ask {
+        sh,
+        pane: &pane,
+        terminal: &terminal,
+        choice,
+        agent,
+        turn,
+        key_guard: &key_guard,
     };
 
     // 2. Parse the dialog from the screen, waiting for it to render. Between
@@ -883,7 +1019,7 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
             }
         }
         screen = read_screen(sh, &pane, &terminal)?;
-        match dialog::parse(&screen) {
+        match agent.parse_dialog(&screen) {
             Ok(found) => {
                 parsed = Some(found);
                 break;
@@ -904,25 +1040,31 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         ));
     };
 
-    // 3. Move the cursor, if needed.
-    let target = choice.index();
-    let moves = target as isize - first.cursor as isize;
-    if moves != 0 {
-        let key = if moves > 0 { Key::Down } else { Key::Up };
-        let keys = vec![key; moves.unsigned_abs()];
-        let result = press(sh, &pane, &terminal, &keys, &key_guard)?;
-        sent.push(keys.iter().map(|key| key.as_str().to_string()).collect());
-        if result.status != Some(State::Blocked) {
-            let after = result.status.as_ref().map(State::as_str);
-            return Err(refusal(
-                &terminal,
-                choice,
-                format!("after the cursor moves the status is {after:?}, not blocked"),
-                json!({"keys_result": result.to_json()}),
-                &sent,
-            ));
+    // 3. Move the cursor. Kiro: all the moves at once, then one read. Devin:
+    // one key at a time, each checked against the screen, never past the target.
+    let target = agent.target(choice);
+    let moves = if agent == Agent::Devin {
+        step_devin(&ask, &mut sent, &first)?
+    } else {
+        let moves = target as isize - first.cursor as isize;
+        if moves != 0 {
+            let key = if moves > 0 { Key::Down } else { Key::Up };
+            let keys = vec![key; moves.unsigned_abs()];
+            let result = press(sh, &pane, &terminal, &keys, &key_guard)?;
+            sent.push(keys.iter().map(|key| key.as_str().to_string()).collect());
+            if result.status != Some(State::Blocked) {
+                let after = result.status.as_ref().map(State::as_str);
+                return Err(refusal(
+                    &terminal,
+                    choice,
+                    format!("after the cursor moves the status is {after:?}, not blocked"),
+                    json!({"keys_result": result.to_json()}),
+                    &sent,
+                ));
+            }
         }
-    }
+        moves
+    };
 
     // 4. Confirm the cursor is on the target in the same dialog.
     let mut last_seen = String::new();
@@ -933,7 +1075,7 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
             thread::sleep(CONFIRM_INTERVAL);
         }
         last_seen = read_screen(sh, &pane, &terminal)?;
-        match dialog::parse(&last_seen) {
+        match agent.parse_dialog(&last_seen) {
             Ok(now) if now.title != first.title || now.command != first.command => {
                 return Err(refusal(
                     &terminal,
@@ -957,16 +1099,14 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         }
     }
     if !confirmed {
-        return Err(refusal(
-            &terminal,
-            choice,
+        return Err(ask.mismatch(
+            &mut sent,
             format!(
                 "the cursor is not confirmed on {:?} after {CONFIRM_READS} reads ({last_problem})",
-                choice.label()
+                agent.label(choice)
             ),
             json!({"screen": tail(&last_seen)}),
-            &sent,
-        ));
+        )?);
     }
 
     // 5. Re-check, still inside the lock, that the pane is blocked on a
@@ -997,16 +1137,145 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
 
     // 6. Select it.
     let result = press(sh, &pane, &terminal, &[Key::Enter], &key_guard)?;
+    if agent == Agent::Devin {
+        sh.mark_answered(&terminal);
+    }
     Ok(json!({
         "terminal": terminal,
+        "agent": agent.as_str(),
         "choice": choice.as_str(),
-        "selected": choice.label(),
+        "selected": agent.label(choice),
         "title": first.title,
         "command": first.command,
         "options": first.options,
         "moves": moves,
         "keys_result": result.to_json(),
     }))
+}
+
+/// What one answer_dialog call checks and sends keys with, after its pane was
+/// found, its agent known, and its key guard built.
+struct Ask<'a> {
+    sh: &'a Shepherd,
+    pane: &'a TerminalRef,
+    terminal: &'a str,
+    choice: Choice,
+    agent: Agent,
+    turn: u64,
+    key_guard: &'a InputGuard,
+}
+
+impl Ask<'_> {
+    /// A dialog that did not land as expected. Kiro: refuse and send nothing
+    /// more. Devin: when the pane is still blocked on a permission dialog in
+    /// this turn, send Esc to cancel the request, then refuse. Enter is never
+    /// sent here.
+    fn mismatch(
+        &self,
+        sent: &mut Vec<Vec<String>>,
+        reason: String,
+        seen: Value,
+    ) -> Result<ToolError, ToolError> {
+        if self.agent != Agent::Devin {
+            return Ok(refusal(
+                self.terminal,
+                self.choice,
+                reason,
+                seen,
+                sent.as_slice(),
+            ));
+        }
+        let again = get_pane(self.sh, self.pane, self.terminal)?;
+        let changes = pane_changes(&again, self.turn);
+        if !changes.is_empty() {
+            let reason = format!(
+                "{reason}; the pane then changed, so nothing more was sent: {}",
+                changes.join("; ")
+            );
+            return Ok(refusal(
+                self.terminal,
+                self.choice,
+                reason,
+                seen,
+                sent.as_slice(),
+            ));
+        }
+        press(
+            self.sh,
+            self.pane,
+            self.terminal,
+            &[Key::Esc],
+            self.key_guard,
+        )?;
+        sent.push(vec![Key::Esc.as_str().to_string()]);
+        self.sh.mark_answered(self.terminal);
+        let reason = format!("{reason}; Esc cancelled the dialog");
+        Ok(refusal(
+            self.terminal,
+            self.choice,
+            reason,
+            seen,
+            sent.as_slice(),
+        ))
+    }
+}
+
+/// Devin: move the highlight one key at a time toward the target. After each
+/// key the screen is read again, and the highlight must be on the next row.
+/// Any other reading is a mismatch, so the highlight never runs past the
+/// target and Enter is never sent from here. Returns the moves made (negative
+/// for up).
+fn step_devin(
+    ask: &Ask<'_>,
+    sent: &mut Vec<Vec<String>>,
+    first: &ParsedDialog,
+) -> Result<isize, ToolError> {
+    let target = ask.agent.target(ask.choice);
+    let mut cursor = first.cursor;
+    let mut moves: isize = 0;
+    while cursor != target {
+        let (key, step) = if target > cursor {
+            (Key::Down, 1)
+        } else {
+            (Key::Up, -1)
+        };
+        let next = (cursor as isize + step) as usize;
+        let result = press(
+            ask.sh,
+            ask.pane,
+            ask.terminal,
+            std::slice::from_ref(&key),
+            ask.key_guard,
+        )?;
+        sent.push(vec![key.as_str().to_string()]);
+        moves += step;
+        if result.status != Some(State::Blocked) {
+            let after = result.status.as_ref().map(State::as_str);
+            let reason = format!("after a move the status is {after:?}, not blocked");
+            return Err(ask.mismatch(sent, reason, json!({"keys_result": result.to_json()}))?);
+        }
+        let screen = read_screen(ask.sh, ask.pane, ask.terminal)?;
+        let now = match ask.agent.parse_dialog(&screen) {
+            Ok(now) if now.title == first.title && now.command == first.command => now,
+            Ok(_) => {
+                let reason = "a different dialog is on the screen after a move".to_string();
+                return Err(ask.mismatch(sent, reason, json!({"screen": tail(&screen)}))?);
+            }
+            Err(err) => {
+                let reason = format!("cannot parse the dialog after a move: {err}");
+                return Err(ask.mismatch(sent, reason, json!({"screen": tail(&screen)}))?);
+            }
+        };
+        if now.cursor != next {
+            let reason = format!(
+                "after a move the highlight is on {:?}, not on {:?}",
+                now.options[now.cursor], first.options[next]
+            );
+            return Err(ask.mismatch(sent, reason, json!({"screen": tail(&screen)}))?);
+        }
+        cursor = now.cursor;
+    }
+    Ok(moves)
 }
 
 /// What differs between a pane and "blocked with kind permission in turn
@@ -1118,7 +1387,7 @@ fn optional_number(args: &Args, key: &str, min: f64, max: f64) -> Result<Option<
 mod tests {
     use super::*;
     use crate::backend::Secret;
-    use crate::testutil::FakeBackend;
+    use crate::testutil::{FakeBackend, TempDir};
 
     fn args(value: Value) -> Args {
         value.as_object().unwrap().clone()
@@ -1437,6 +1706,7 @@ mod tests {
         fake.add_pane("work", State::Blocked, Some("permission"));
         fake.state.lock().unwrap().screen = Some(crate::dialog::fixtures::dialog_on_allow());
         let sh = shepherd(&fake);
+        sh.assume_agent("work", Agent::Kiro);
         let out = call(
             &sh,
             "answer_dialog",
@@ -1447,6 +1717,213 @@ mod tests {
         // No get between the confirming read and Enter: the guard goes with it.
         assert_eq!(fake.calls(), ["get", "get", "read", "read", "keys"]);
         assert_eq!(fake.state.lock().unwrap().keys, [vec![Key::Enter]]);
+    }
+
+    /// The Devin dialog with the highlight on `cursor` (0 Allow, 1 Bypass mode, 2 Deny).
+    fn devin_screen(cursor: usize) -> String {
+        crate::devin_dialog::fixtures::dialog_with_cursor_on(cursor)
+    }
+
+    /// The keys each `keys` call sent, by name.
+    fn key_names(fake: &FakeBackend) -> Vec<Vec<&'static str>> {
+        fake.state
+            .lock()
+            .unwrap()
+            .keys
+            .iter()
+            .map(|keys| keys.iter().map(Key::as_str).collect())
+            .collect()
+    }
+
+    /// answer_dialog on pane `work`, which is a Devin pane.
+    fn devin_answer(fake: &FakeBackend, choice: &str) -> Result<Value, ToolError> {
+        let sh = shepherd(fake);
+        sh.assume_agent("work", Agent::Devin);
+        call(
+            &sh,
+            "answer_dialog",
+            &args(json!({"terminal": "work", "choice": choice})),
+        )
+    }
+
+    fn blocked_devin_pane(screens: Vec<String>) -> FakeBackend {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", State::Blocked, Some("permission"));
+        let mut state = fake.state.lock().unwrap();
+        let mut screens = screens.into_iter();
+        state.screen = screens.next();
+        state.next_screens = screens.collect();
+        drop(state);
+        fake
+    }
+
+    #[test]
+    fn devin_allow_once_presses_enter_only_when_allow_is_highlighted() {
+        let fake = blocked_devin_pane(vec![devin_screen(0)]);
+        let out = devin_answer(&fake, "allow_once").unwrap();
+        assert_eq!(out["agent"], "devin");
+        assert_eq!(out["selected"], "Allow");
+        assert_eq!(out["moves"], 0);
+        assert_eq!(key_names(&fake), [["enter"]]);
+    }
+
+    #[test]
+    fn devin_deny_once_moves_down_one_key_at_a_time_then_enter() {
+        let fake = blocked_devin_pane(vec![devin_screen(0), devin_screen(1), devin_screen(2)]);
+        let out = devin_answer(&fake, "deny_once").unwrap();
+        assert_eq!(out["selected"], "Deny");
+        assert_eq!(out["moves"], 2);
+        assert_eq!(key_names(&fake), [["down"], ["down"], ["enter"]]);
+    }
+
+    #[test]
+    fn devin_refuses_when_the_highlight_lands_on_bypass_mode_and_never_enters() {
+        // The second Down leaves the highlight on Bypass mode.
+        let fake = blocked_devin_pane(vec![devin_screen(0), devin_screen(1), devin_screen(1)]);
+        let err = devin_answer(&fake, "deny_once").unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        assert!(err.text.contains("not on"), "{}", err.text);
+        assert_eq!(key_names(&fake), [["down"], ["down"], ["esc"]]);
+    }
+
+    #[test]
+    fn devin_refuses_when_a_move_does_not_land_on_the_target() {
+        // The Down key is ignored: the highlight stays on Allow.
+        let fake = blocked_devin_pane(vec![devin_screen(0), devin_screen(0)]);
+        let err = devin_answer(&fake, "deny_once").unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        assert_eq!(key_names(&fake), [["down"], ["esc"]]);
+    }
+
+    #[test]
+    fn devin_never_sends_enter_after_a_failed_check() {
+        let cases: Vec<Vec<String>> = vec![
+            // Cursor stops short of the target.
+            vec![devin_screen(0), devin_screen(0)],
+            // The dialog stops parsing after a move.
+            vec![devin_screen(0), "no dialog here\n".to_string()],
+        ];
+        for screens in cases {
+            let fake = blocked_devin_pane(screens);
+            let err = devin_answer(&fake, "deny_once").unwrap_err();
+            assert_eq!(err.data["error"], "refused");
+            assert!(
+                key_names(&fake).iter().flatten().all(|key| *key != "enter"),
+                "{:?}",
+                key_names(&fake)
+            );
+        }
+    }
+
+    #[test]
+    fn devin_refuses_without_keys_when_the_pane_has_no_recorded_agent() {
+        let fake = blocked_devin_pane(vec![devin_screen(0)]);
+        let sh = shepherd(&fake);
+        let err = call(
+            &sh,
+            "answer_dialog",
+            &args(json!({"terminal": "work", "choice": "allow_once"})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        assert!(err.text.contains("no dialect applies"), "{}", err.text);
+        assert!(key_names(&fake).is_empty());
+    }
+
+    #[test]
+    fn kiro_mismatch_refuses_without_an_escape() {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", State::Blocked, Some("permission"));
+        fake.state.lock().unwrap().screen = Some(crate::dialog::fixtures::dialog_on_allow());
+        let sh = shepherd(&fake);
+        sh.assume_agent("work", Agent::Kiro);
+        let err = call(
+            &sh,
+            "answer_dialog",
+            &args(json!({"terminal": "work", "choice": "deny_once"})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        assert_eq!(key_names(&fake), [["down"]]);
+    }
+
+    #[test]
+    fn remove_pane_forgets_the_pane_agent() {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", State::Done, None);
+        let sh = shepherd(&fake);
+        sh.assume_agent("work", Agent::Devin);
+        call(&sh, "remove_pane", &args(json!({"terminal": "work"}))).unwrap();
+        assert_eq!(sh.agent_of("work"), None);
+    }
+
+    /// A policy with a devin profile (`mode`) and a kiro profile, both
+    /// programs in `<dir>/bin`, which the policy's PATH names.
+    fn agent_policy(dir: &std::path::Path, mode: &str) -> LaunchPolicy {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for program in ["devin", "kiro-cli"] {
+            let path = bin.join(program);
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let bin = bin.to_string_lossy().into_owned();
+        let text = json!({"profiles": [
+            {"name": "devin", "argv": ["devin"], "extra_args": ["--respect-workspace-trust", "false"],
+             "cwds": [dir], "agent": "devin", "permission_mode": mode},
+            {"name": "kiro", "argv": ["kiro-cli", "chat"], "extra_args": ["--trust-workspace"],
+             "cwds": [dir]},
+        ]});
+        LaunchPolicy::from_json(&text.to_string())
+            .unwrap()
+            .with_env_lookup(move |key| (key == "PATH").then(|| bin.clone()))
+    }
+
+    /// The argv `start_pane` asked the backend to run (the fake refuses the run).
+    fn started_argv(profile: &str, mode: &str) -> Vec<String> {
+        let dir = TempDir::new("tools-agent-argv");
+        let fake = FakeBackend::new(true);
+        let sh = Shepherd::with_policy(fake.clone(), agent_policy(dir.path(), mode));
+        let _ = call(
+            &sh,
+            "start_pane",
+            &args(json!({"profile": profile, "name": "p"})),
+        );
+        let runs = fake.state.lock().unwrap().runs.clone();
+        runs[0].argv.clone().unwrap()
+    }
+
+    #[test]
+    fn devin_profile_passes_its_permission_flag_and_no_bypass_by_default() {
+        let argv = started_argv("devin", "normal");
+        assert_eq!(
+            argv[1..].iter().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "--permission-mode",
+                "auto",
+                "--respect-workspace-trust",
+                "false"
+            ]
+        );
+        assert!(!argv.iter().any(|a| a == "dangerous"), "{argv:?}");
+        assert_eq!(
+            started_argv("devin", "accept-edits")[1..3],
+            ["--permission-mode", "accept-edits"]
+        );
+        assert_eq!(
+            started_argv("devin", "bypass")[1..3],
+            ["--permission-mode", "dangerous"]
+        );
+    }
+
+    #[test]
+    fn kiro_profile_argv_is_unchanged_by_the_permission_field() {
+        let argv = started_argv("kiro", "normal");
+        assert_eq!(
+            argv[1..].iter().map(String::as_str).collect::<Vec<_>>(),
+            ["chat", "--trust-workspace"]
+        );
     }
 
     #[test]
@@ -1495,17 +1972,51 @@ mod tests {
     #[test]
     fn wait_outcome_only_completes_on_done_and_exit() {
         let status = Some(&WaitReason::Status);
-        assert_eq!(wait_outcome(true, status, Some(&State::Done)), "done");
-        assert_eq!(wait_outcome(true, status, Some(&State::Blocked)), "blocked");
-        assert_eq!(wait_outcome(true, status, Some(&State::Idle)), "other");
-        assert_eq!(wait_outcome(true, status, Some(&State::Other)), "other");
-        assert_eq!(wait_outcome(true, Some(&WaitReason::Exit), None), "exited");
         assert_eq!(
-            wait_outcome(false, Some(&WaitReason::Timeout), None),
+            wait_outcome(true, status, Some(&State::Done), false),
+            "done"
+        );
+        assert_eq!(
+            wait_outcome(true, status, Some(&State::Blocked), false),
+            "blocked"
+        );
+        assert_eq!(
+            wait_outcome(true, status, Some(&State::Idle), false),
+            "other"
+        );
+        assert_eq!(
+            wait_outcome(true, status, Some(&State::Other), false),
+            "other"
+        );
+        assert_eq!(
+            wait_outcome(true, Some(&WaitReason::Exit), None, false),
+            "exited"
+        );
+        assert_eq!(
+            wait_outcome(false, Some(&WaitReason::Timeout), None, false),
             "timeout"
         );
-        assert_eq!(wait_outcome(false, Some(&WaitReason::Other), None), "other");
-        assert_eq!(wait_outcome(true, None, Some(&State::Done)), "other");
+        assert_eq!(
+            wait_outcome(false, Some(&WaitReason::Other), None, false),
+            "other"
+        );
+        assert_eq!(wait_outcome(true, None, Some(&State::Done), false), "other");
+    }
+
+    #[test]
+    fn idle_after_an_answered_dialog_is_cancelled_not_done() {
+        let status = Some(&WaitReason::Status);
+        assert_eq!(
+            wait_outcome(true, status, Some(&State::Idle), true),
+            "cancelled"
+        );
+        // Without an answer, idle stays what it was.
+        assert_eq!(
+            wait_outcome(true, status, Some(&State::Idle), false),
+            "other"
+        );
+        // Done after an answer is still done.
+        assert_eq!(wait_outcome(true, status, Some(&State::Done), true), "done");
     }
 
     /// An executable `kiro-cli` in `<dir>/bin`, which the policies' PATH names.

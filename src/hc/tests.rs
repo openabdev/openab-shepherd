@@ -4,6 +4,7 @@
 
 use super::fake::{reply, serve_once, serve_pane, serve_script, PANE_ADDRESS, PANE_NAME};
 use super::HcBackend;
+use crate::agent::Agent;
 use crate::dialog::fixtures::{dialog_on_allow, dialog_on_deny, PROBE_HEAD, PROBE_TAIL};
 use crate::mcp::handle_message;
 use crate::profiles::LaunchPolicy;
@@ -25,7 +26,10 @@ fn tool_out(reply: Option<Value>) -> Value {
 }
 
 fn hc_shepherd(sock: &Path) -> Shepherd {
-    Shepherd::with_policy(HcBackend::new(sock), LaunchPolicy::arbitrary())
+    let sh = Shepherd::with_policy(HcBackend::new(sock), LaunchPolicy::arbitrary());
+    // These panes stand for kiro-cli panes started from a profile.
+    sh.assume_agent("work", Agent::Kiro);
+    sh
 }
 
 fn text_of(out: &Value) -> String {
@@ -1675,4 +1679,106 @@ fn known_dialog_kinds_pass_through() {
     }
     assert_eq!(crate::backend::dialog_kind(""), "other");
     assert_eq!(crate::backend::dialog_kind("Permission"), "other");
+}
+
+/// A devin profile over `policy`: its program lives in `<dir>/bin`, and the
+/// policy's PATH names that directory. Returns the policy and the program's
+/// canonical path.
+fn devin_profile_policy(dir: &Path) -> (LaunchPolicy, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    let work = dir.join("work");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let program = bin.join("devin");
+    std::fs::write(&program, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let canonical = std::fs::canonicalize(&program)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let bin_text = bin.to_string_lossy().into_owned();
+    let text = json!({"profiles": [
+        {"name": "devin", "argv": ["devin"], "cwds": [work], "agent": "devin"}
+    ]});
+    let policy = LaunchPolicy::from_json(&text.to_string())
+        .unwrap()
+        .with_env_lookup(move |key| (key == "PATH").then(|| bin_text.clone()));
+    (policy, canonical)
+}
+
+/// A run reply for a pane at `t1`, and then `reads` screen reads of `screen`.
+fn devin_start_script(reads: usize, screen_text: &str) -> Vec<Value> {
+    let mut script = vec![ok(json!({"address": "t1"}))];
+    script.extend((0..reads).map(|_| screen(screen_text)));
+    script
+}
+
+#[test]
+fn start_pane_from_a_devin_profile_records_the_agent_for_answer_dialog() {
+    let dir = TempDir::new("mcp-devin-start");
+    let sock = dir.path().join("core.sock");
+    let (policy, program) = devin_profile_policy(dir.path());
+    // The screen shows no trust prompt for the whole window.
+    let fake = serve_script(&sock, devin_start_script(tools::RENDER_READS, "$ "));
+    let sh = Shepherd::with_policy(HcBackend::new(&sock), policy);
+    let out = tool_out(handle_message(
+        &sh,
+        &call_msg("start_pane", json!({"profile": "devin", "name": "devin1"})),
+    ));
+    let requests = fake.finish();
+    assert_eq!(out["isError"], false, "{}", text_of(&out));
+    assert_eq!(requests[0]["method"], "terminal.run");
+    assert_eq!(
+        requests[0]["params"]["argv"],
+        json!([program, "--permission-mode", "auto"])
+    );
+    assert_eq!(sh.agent_of("devin1"), Some(Agent::Devin));
+    assert_eq!(sh.agent_of("unknown"), None);
+}
+
+#[test]
+fn start_pane_closes_a_devin_pane_stopped_at_the_trust_prompt() {
+    let dir = TempDir::new("mcp-devin-trust");
+    let sock = dir.path().join("core.sock");
+    let (policy, _) = devin_profile_policy(dir.path());
+    let trust = "Do you trust the authors of this directory?\n 1 Yes, trust\n 2 No, exit\n";
+    let fake = serve_script(
+        &sock,
+        vec![
+            ok(json!({"address": "t1"})),
+            screen(trust),
+            // The pane is closed: a get, then kill and remove.
+            get_at("t1"),
+            ok(json!({"reason": "exited"})),
+            ok(json!({"removed": "t1"})),
+        ],
+    );
+    let sh = Shepherd::with_policy(HcBackend::new(&sock), policy);
+    let out = tool_out(handle_message(
+        &sh,
+        &call_msg("start_pane", json!({"profile": "devin", "name": "devin1"})),
+    ));
+    let requests = fake.finish();
+    assert_eq!(out["isError"], true);
+    let text = text_of(&out);
+    assert!(text.contains("trust_prompt"), "{text}");
+    assert!(
+        text.contains("Do you trust the authors of this directory?"),
+        "{text}"
+    );
+    assert_eq!(
+        methods(&requests),
+        [
+            "terminal.run",
+            "terminal.read",
+            "terminal.get",
+            "terminal.kill",
+            "terminal.rm"
+        ]
+    );
+    // Nothing was typed or answered, and the pane is not remembered.
+    assert!(requests.iter().all(|r| r["method"] != "terminal.send"));
+    assert!(requests.iter().all(|r| r["method"] != "terminal.keys"));
+    assert_eq!(sh.agent_of("devin1"), None);
 }

@@ -69,6 +69,9 @@ pub struct FakeState {
     pub screen: Option<String>,
     /// Keys passed to `keys`, one entry per call.
     pub keys: Vec<Vec<Key>>,
+    /// Each `keys` call replaces `screen` with the next of these, when any
+    /// are left: the screen the program draws after the key.
+    pub next_screens: std::collections::VecDeque<String>,
     /// Specs passed to `run` (which is still refused).
     pub runs: Vec<RunSpec>,
     /// When set, the next `remove` signals the sender once it has started,
@@ -262,7 +265,11 @@ impl TerminalBackend for FakeBackend {
                 ));
             }
         }
-        self.state.lock().unwrap().keys.push(keys.to_vec());
+        let mut state = self.state.lock().unwrap();
+        state.keys.push(keys.to_vec());
+        if let Some(next) = state.next_screens.pop_front() {
+            state.screen = Some(next);
+        }
         Ok(KeysResult {
             status: pane.status.map(|s| s.state),
             turn: pane.turn,

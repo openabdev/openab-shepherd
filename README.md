@@ -20,12 +20,15 @@ which answers a permission dialog may receive.
   `answer_dialog` and `remove_pane`. Panes are addressed by name.
 - **Blocked-dialog handling.** `send_input` refuses to type while a pane is blocked
   on a dialog and returns `pane_blocked`. `answer_dialog` accepts only `allow_once`
-  or `deny_once`; the rule-creating options cannot be chosen. It re-checks the
-  dialog, its kind and its turn number before it presses Enter.
+  or `deny_once`; the rule-creating options cannot be chosen. It reads the dialog
+  for the pane's agent (`kiro` or `devin`), re-checks the dialog, its kind and its
+  turn number before it presses Enter. A Devin dialog never selects `Bypass mode`.
 - **Launch profiles.** `start_pane` starts only what the operator's profiles file
   allows: a fixed `argv`, a list of allowed working directories, and environment
   variables. Each variable is a literal value or is read when the pane starts from
-  a `keychain:` (macOS Keychain) or `env:` source. Caller-chosen commands are off
+  a `keychain:` (macOS Keychain) or `env:` source. A profile names its `agent`
+  (`kiro` or `devin`) and a `permission_mode` (`normal`, `accept-edits`, or
+  `bypass`). Caller-chosen commands are off
   unless the file sets `"allow_arbitrary_command": true`, and such panes never get
   a profile's environment. Without a profiles file, `start_pane` starts nothing.
 - **Native terminal core.** The default backend runs each pane on its own PTY with a

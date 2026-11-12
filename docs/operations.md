@@ -50,6 +50,8 @@ later is a contained change.
 | `src/hc/fake.rs`, `src/hc/tests.rs` | Test-only: a fake hc socket, and tool tests over the hc wire |
 | `src/tools.rs` | The nine tools, their schemas, the safety rules, and the backend calls each one makes |
 | `src/dialog.rs` | Text parser for the kiro-cli permission dialog |
+| `src/devin_dialog.rs` | Text parser for the Devin CLI permission dialog |
+| `src/agent.rs` | The agents a profile can name (`kiro`, `devin`), their dialects, and `permission_mode` |
 | `src/mcp.rs` | MCP message handling |
 | `src/http.rs` | Loopback Host check, bearer auth, POST handling |
 | `src/testutil.rs` | Test-only helpers: scratch dirs, git init, an in-memory `FakeBackend` |
@@ -133,6 +135,12 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
       "extra_args": ["--trust-workspace"],
       "cwds": ["/path/to/work"],
       "env": { "KIRO_API_KEY": "keychain:<keychain-item>" }
+    },
+    {
+      "name": "devin",
+      "agent": "devin",
+      "argv": ["devin"],
+      "cwds": ["/path/to/work"]
     }
   ]
 }
@@ -168,6 +176,34 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
 - `allow_arbitrary_command` (default false): when true, `start_pane` also takes a
   caller-chosen `argv` or `line` (and `env`). Such a pane never gets a profile's
   environment, whatever program it runs.
+- `agent` (optional, default `kiro`): `kiro` or `devin`. It decides which permission
+  dialog `answer_dialog` reads for panes this profile starts, and, for `devin`, the
+  launch flag below. A pane started any other way has no agent, so `answer_dialog`
+  refuses it with no keys sent. Panes started before this Shepherd process have no
+  record of their agent, so they are refused too.
+- `permission_mode` (optional, default `normal`): what the agent may do without
+  asking.
+  - `normal`: a `devin` pane runs `devin --permission-mode auto`. Shell commands and
+    writes ask for approval. A `kiro` pane gets no flag; its arguments are its own
+    `argv`.
+  - `accept-edits`: `devin` only, `devin --permission-mode accept-edits`. Refused for
+    `kiro`, because no Kiro mode was measured.
+  - `bypass`: `devin` only, `devin --permission-mode dangerous`, which approves every
+    tool. It is never a default: a profile must say `"permission_mode": "bypass"`.
+    For `kiro` it needs `"allow_bypass": true`, and Shepherd adds no flag. Kiro has no
+    bypass flag that was measured, so the Kiro arguments in `argv` still decide trust.
+- `allow_bypass` (optional, default false): lets a `kiro` profile declare
+  `permission_mode` `bypass`. It has no effect on a `devin` profile.
+- A `devin` profile's directory must already be trusted in Devin. On a fresh directory
+  Devin asks "Do you trust the authors of this directory?". Shepherd never answers
+  that prompt. `start_pane` reads the screen for about 3 s after the start, closes the
+  pane and returns `trust_prompt` when it shows. Trust the directory once (run `devin`
+  there and choose `1`), then start the pane again. A prompt that appears after the
+  window is not detected; `answer_dialog` then finds no dialog and refuses.
+- A `devin` profile may not put `--permission-mode` (or `--permission-mode=`) in
+  `argv` or `extra_args`, or set `DEVIN_PERMISSION_MODE` in `env`. The mode is set
+  in one place only, so the Devin config file cannot change it: Devin's flag takes
+  precedence over its own config, and `normal` passes `auto` explicitly for that reason.
 - Unknown fields are refused, so a typo cannot silently drop a restriction.
 - `list_panes` returns `profiles` (each profile's `name` and `cwds`, never its argv or
   env) and `allow_arbitrary_command`, so a caller can see what it may start.
@@ -263,6 +299,7 @@ for debugging; do not parse it.
 | `unsupported` | The backend cannot do this (for example a screen read from a backend without screen text) |
 | `profile_required` | `start_pane` without `profile` while arbitrary commands are not allowed; nothing started |
 | `profile_unavailable` | A launch profile's `keychain:` or `env:` source could not be read; nothing started |
+| `trust_prompt` | A `devin` pane stopped at "Do you trust the authors of this directory?" within about 3 s of starting. Shepherd never answers it: the pane is closed, and the error names the prompt. Trust the directory once in Devin, then start the pane again |
 | `backend_error` | Any other backend failure, or a reply Shepherd cannot use |
 
 ### wait_status outcome
@@ -274,6 +311,7 @@ Branch on `outcome`:
 | `done` | `ended`, `reason: "status"`, `status: "done"` | true |
 | `exited` | `ended`, `reason: "exit"` | true |
 | `blocked` | `ended`, `reason: "status"`, `status: "blocked"`. `kind` comes from a follow-up `get` when the wait did not report it (herdr-core's wait never does) | false |
+| `cancelled` | `ended`, `reason: "status"`, `status: "idle"`, after `answer_dialog` on this process answered this pane's dialog (a Devin `deny_once` or Esc returns to idle, not done) | false |
 | `timeout` | `ended: false`, `reason: "timeout"`: a check-in, the pane is still running | false |
 | `other` | anything else (`idle`, `error`, a message to the caller, `not_started`). Read `status` and `reason` | false |
 
@@ -307,13 +345,21 @@ must not be `blocked`, then the text is sent, still inside the lock.
    refuses, sending nothing, if the pane is no longer `blocked` with kind
    `permission` or the `turn` changed; the refusal says which. If the dialog still
    does not parse after the wait, it refuses, sending nothing, and says it timed out
-   waiting for the dialog to render. The dialog needs a line ending in
-   `requires approval`, the next line as `<tool> → <command>`, then exactly four
-   options in this order: `Allow once`, `Deny once`, `Create allow rule...`,
-   `Create deny rule...`, with one `❯` cursor. Anything else is refused.
-3. Move the cursor with `up` or `down` (`keys`). `allow_once` from the default
-   cursor needs no moves; `deny_once` needs one `down`. After moving, the status must
-   still be `blocked`.
+   waiting for the dialog to render. The dialect comes from the pane's `agent`:
+   - `kiro`: the dialog needs a line ending in `requires approval`, the next line as
+     `<tool> → <command>`, then exactly four options in this order: `Allow once`,
+     `Deny once`, `Create allow rule...`, `Create deny rule...`, with one `❯` cursor.
+   - `devin`: the dialog needs a line reading `Running command`, then `$ <command>`,
+     then three option rows in this order: `Allow` (its scope selector may follow on
+     the same row), `Bypass mode`, `Deny`, with one `❭` on the highlighted row.
+
+   Anything else is refused.
+3. Move the cursor. For `kiro`, `up` or `down` keys (`keys`) go out in one batch:
+   `allow_once` from the default cursor needs no moves; `deny_once` needs one `down`.
+   For `devin`, one key goes out at a time, and the screen is read after each key. The
+   highlight must be on the next row before another key is sent, so it never passes
+   the target. `deny_once` from `Allow` sends `down`, `down` and stops on `Deny`.
+   After moving, the status must still be `blocked`.
 4. Read the screen again, up to 5 times 200 ms apart, until the same dialog shows the
    cursor on the target option. A different dialog stops it at once.
 5. `get` again: refuse unless the pane is still `blocked` with kind `permission`
@@ -325,10 +371,23 @@ recorded turn). A backend with the `conditional_keys` capability enforces it in 
 same step as the key press, and Shepherd then skips step 5. herdr-core lacks it, so
 for herdr-core step 5 runs as described.
 
-If a check fails, the tool sends nothing more, never sends `enter`, and returns
-error `refused` with `structuredContent` holding `reason`, `seen` (the status or the
-last 40 screen lines), and `keys_sent`. The rule-creating options cannot be chosen.
-Follow a successful answer with `wait_status`.
+If a check fails, the tool never sends `enter`, and returns error `refused` with
+`structuredContent` holding `reason`, `seen` (the status or the last 40 screen lines),
+and `keys_sent`. For `kiro`, it sends nothing more. For `devin`, when the pane is still
+blocked on this turn's permission dialog, it sends `esc`, which cancels the request,
+and then refuses; the cancel is recorded for `wait_status`. The rule-creating options
+cannot be chosen. A Devin dialog never selects `Bypass mode`: the target is `Allow` or
+`Deny` only. Follow a successful answer with `wait_status`.
+
+Devin answers: `allow_once` presses `enter` on `Allow` (the scope defaults to `Once`).
+`deny_once` moves to `Deny` and presses `enter`. The command does not run, and the
+pane goes to `idle`, not `done`; `wait_status` reports that as `cancelled`. Esc has
+the same end state.
+
+The Devin dialog layout was measured in a plain PTY on Devin CLI 3000.12.43. The
+parser is tested on fixtures built from that layout, not on captures from other
+versions.
+
 
 What this guarantees, and what it does not:
 
@@ -671,11 +730,12 @@ To print the usage text without starting a server, run the binary by name:
 
 - **No multi-client authorization.** Any holder of the token has full control of every
   pane.
-- **Permission dialogs: text parsing, one layout.** `answer_dialog` parses the dialog
-  from screen text. It is tested only against kiro-cli 3.1.0 (V3 engine) shell
-  permission dialogs, using the screen captured by the probe. Other tools (fs_write,
-  MCP), other programs, other versions, and `kind` values `question` or `auth` are
-  untested or refused. `force` is never sent.
+- **Permission dialogs: text parsing, two layouts.** `answer_dialog` parses the dialog
+  from screen text, for the pane's agent. Kiro is tested only against kiro-cli 3.1.0
+  (V3 engine) shell permission dialogs, using the screen captured by the probe. Devin
+  is tested against the layout measured on Devin CLI 3000.12.43 for shell commands.
+  Other tools (fs_write, MCP), other programs, other versions, and `kind` values
+  `question` or `auth` are untested or refused. `force` is never sent.
 - **Residual race on Enter (hc only).** With hc, `answer_dialog` is serialized
   against other Shepherd calls and re-checks status and turn just before `enter`, but
   herdr-core has no conditional key press (`conditional_keys` is false). A person at
