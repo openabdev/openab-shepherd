@@ -28,9 +28,16 @@ pub(crate) static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 const DEFAULT_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const DEFAULT_LANG: &str = "en_US.UTF-8";
 const TERM: &str = "xterm-256color";
-/// Names a per-run environment may not set: the fixed baseline, and loader
-/// variables.
-const PROTECTED_KEYS: [&str; 5] = ["HOME", "PATH", "USER", "LANG", "TERM"];
+/// Names a per-run environment may not set: the fixed baseline, the pane
+/// marker, and loader variables.
+const PROTECTED_KEYS: [&str; 6] = [
+    "HOME",
+    "PATH",
+    "USER",
+    "LANG",
+    "TERM",
+    super::procs::MARKER_KEY,
+];
 const PROTECTED_PREFIXES: [&str; 2] = ["DYLD_", "LD_"];
 
 /// A caller's per-run environment, checked: at most 32 entries, names

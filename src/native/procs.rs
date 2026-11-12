@@ -8,22 +8,87 @@
 //! (on macOS: the processes whose controlling terminal is the pane's). The
 //! reader thread refreshes the tree every [`super::TREE_POLL`] while the
 //! leader runs, and the stop path refreshes it again before signalling.
+//!
+//! Every pane's environment also carries [`MARKER_KEY`] with a value unique
+//! to the pane, and every stop sweeps the user's processes for it
+//! ([`Tree::sweep`]), so a descendant that detached before any look could
+//! see it is still found as long as it kept the environment it inherited.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The environment variable that marks a pane's processes (ADR §11).
+pub(crate) const MARKER_KEY: &str = "OPENAB_SHEPHERD_PANE";
+
+/// A marker value no other pane, here or in another Shepherd, shares:
+/// Shepherd's pid, a counter, the time, and 64 random bits.
+pub(crate) fn new_marker() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(n);
+    hasher.write_u64(nanos);
+    format!(
+        "{:x}-{n:x}-{nanos:x}-{:016x}",
+        std::process::id(),
+        hasher.finish()
+    )
+}
 
 /// When a process started, in platform units. With the pid it names one
 /// process: a pid that is reused gets a later start time.
 pub(crate) type Start = u64;
 
 /// The pane's known descendants (the leader itself is not a member).
-#[derive(Default)]
 pub(crate) struct Tree {
     members: HashMap<i32, Start>,
     /// macOS: the controlling terminal of the leader's session.
     tty: Option<u32>,
+    /// `MARKER_KEY=<value>`, as it appears in the pane's environment.
+    marker: Vec<u8>,
 }
 
 impl Tree {
+    /// The tree of a pane whose environment has `MARKER_KEY=marker`.
+    pub(crate) fn new(marker: &str) -> Self {
+        Self {
+            members: HashMap::new(),
+            tty: None,
+            marker: format!("{MARKER_KEY}={marker}").into_bytes(),
+        }
+    }
+
+    /// Add every process of this user that carries the pane's marker in
+    /// the environment it was started with, wherever it is in the process
+    /// table. Unlike `refresh`, this needs no link to the leader, so it
+    /// finds a descendant that detached (reparented, own session) before
+    /// any look saw it. Safe after the leader is reaped. Returns how many
+    /// processes were new.
+    pub(crate) fn sweep(&mut self) -> usize {
+        let me = std::process::id() as i32;
+        let mut reader = os::EnvReader::new();
+        let mut added = 0;
+        for pid in os::own_pids() {
+            if pid <= 1 || pid == me || self.members.contains_key(&pid) {
+                continue;
+            }
+            // The start time before and after the read must agree, so the
+            // environment read belongs to the process recorded.
+            let Some(start) = os::start_time(pid) else {
+                continue;
+            };
+            if reader.has(pid, &self.marker) && os::start_time(pid) == Some(start) {
+                self.members.insert(pid, start);
+                added += 1;
+            }
+        }
+        added
+    }
+
     /// Add the leader's current descendants and drop members that are gone
     /// (or whose pid now names another process). Call only while the
     /// leader's pid is reserved (it runs, or is an unreaped zombie), because
@@ -139,6 +204,98 @@ mod os {
         buf
     }
 
+    /// `PROC_UID_ONLY` in `<sys/proc_info.h>`: processes of one effective uid.
+    const PROC_UID_ONLY: u32 = 4;
+    /// `KERN_PROCARGS2` and `KERN_ARGMAX` in `<sys/sysctl.h>`.
+    const KERN_PROCARGS2: libc::c_int = 49;
+    const KERN_ARGMAX: libc::c_int = 8;
+
+    /// The processes of Shepherd's effective uid (the only ones it may
+    /// signal).
+    pub(super) fn own_pids() -> Vec<i32> {
+        // SAFETY: geteuid cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        // proc_listpids returns bytes, not a count.
+        // SAFETY: the buffer and its size come from `pids`.
+        pids(|buf, size| unsafe {
+            libc::proc_listpids(PROC_UID_ONLY, uid, buf, size) / size_of::<i32>() as i32
+        })
+    }
+
+    /// Reads a process's arguments and the environment it was started with
+    /// (`sysctl KERN_PROCARGS2`, what `ps -E` shows), into one buffer.
+    pub(super) struct EnvReader {
+        buf: Vec<u8>,
+    }
+
+    impl EnvReader {
+        pub(super) fn new() -> Self {
+            let mut argmax: libc::c_int = 0;
+            let mut size = size_of::<libc::c_int>();
+            let mut mib = [libc::CTL_KERN, KERN_ARGMAX];
+            // SAFETY: an int-sized output buffer and its size.
+            let rc = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    2,
+                    (&mut argmax as *mut libc::c_int).cast(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            let len = if rc == 0 && argmax > 0 {
+                argmax as usize
+            } else {
+                1 << 20
+            };
+            Self { buf: vec![0; len] }
+        }
+
+        /// Whether `entry` (`KEY=value`) is in `pid`'s environment. False
+        /// when the kernel does not answer (gone, a zombie, not ours).
+        pub(super) fn has(&mut self, pid: i32, entry: &[u8]) -> bool {
+            let mut mib = [libc::CTL_KERN, KERN_PROCARGS2, pid];
+            let mut size = self.buf.len();
+            // SAFETY: the buffer and its length; the kernel writes at most
+            // `size` bytes and sets `size` to what it wrote.
+            let rc = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    3,
+                    self.buf.as_mut_ptr().cast(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            rc == 0 && procargs_has(&self.buf[..size.min(self.buf.len())], entry)
+        }
+    }
+
+    /// `KERN_PROCARGS2` layout: `int argc`, the executable path, NUL
+    /// padding, `argc` NUL-terminated arguments, then the environment
+    /// strings up to an empty one.
+    pub(super) fn procargs_has(data: &[u8], entry: &[u8]) -> bool {
+        let Some(argc) = data.get(..4) else {
+            return false;
+        };
+        let argc = i32::from_ne_bytes([argc[0], argc[1], argc[2], argc[3]]).max(0);
+        let mut parts = data[4..].split(|&b| b == 0);
+        if parts.next().is_none() {
+            return false;
+        }
+        let mut parts = parts.skip_while(|part| part.is_empty());
+        for _ in 0..argc {
+            if parts.next().is_none() {
+                return false;
+            }
+        }
+        parts
+            .take_while(|part| !part.is_empty())
+            .any(|part| part == entry)
+    }
+
     /// macOS asks the kernel per question; nothing is cached.
     pub(super) struct Snapshot {
         tty: Option<u32>,
@@ -215,6 +372,31 @@ mod os {
         stat(pid).map(|s| s.start)
     }
 
+    /// Every pid in `/proc`; `EnvReader` cannot read another user's.
+    pub(super) fn own_pids() -> Vec<i32> {
+        std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+            .collect()
+    }
+
+    /// Reads `/proc/<pid>/environ`: the environment the process was
+    /// started with (readable only for processes Shepherd may trace).
+    pub(super) struct EnvReader;
+
+    impl EnvReader {
+        pub(super) fn new() -> Self {
+            Self
+        }
+
+        pub(super) fn has(&mut self, pid: i32, entry: &[u8]) -> bool {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|data| data.split(|&b| b == 0).any(|part| part == entry))
+        }
+    }
+
     /// One read of every process in `/proc`.
     pub(super) struct Snapshot {
         procs: HashMap<i32, Stat>,
@@ -272,14 +454,15 @@ mod tests {
             .unwrap();
         let pid = child.id() as i32;
         let start = os::start_time(pid).expect("the child's start time");
-        let mut tree = Tree::default();
+        let mut tree = Tree::new("test");
         tree.members.insert(pid, start + 1);
         tree.signal_all(libc::SIGKILL);
         thread_sleep(200);
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "a reused pid was signalled"
-        );
+        let spared = child.try_wait().unwrap().is_none();
+        if !spared {
+            let _ = child.kill();
+        }
+        assert!(spared, "a reused pid was signalled");
         tree.members.insert(pid, start);
         tree.signal_all(libc::SIGKILL);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -290,6 +473,49 @@ mod tests {
             );
             thread_sleep(20);
         }
+    }
+
+    /// A sweep finds a process by the marker in its environment alone (it
+    /// is no descendant of any pane), and not a process with another value.
+    #[test]
+    fn a_sweep_finds_processes_by_their_marker_only() {
+        let marker = new_marker();
+        let spawn = |value: &str| {
+            Command::new("/bin/sleep")
+                .arg("30")
+                .env(MARKER_KEY, value)
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut ours = spawn(&marker);
+        let mut other = spawn(&new_marker());
+        let mut tree = Tree::new(&marker);
+        let added = tree.sweep();
+        let found = tree.members.contains_key(&(ours.id() as i32));
+        let wrong = tree.members.contains_key(&(other.id() as i32));
+        let _ = ours.kill();
+        let _ = other.kill();
+        let _ = ours.wait();
+        let _ = other.wait();
+        assert!(found, "the marked process was not found");
+        assert!(!wrong, "a process with another marker was taken");
+        assert_eq!(added, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn procargs_parsing_reads_the_environment_only() {
+        let mut data = 2i32.to_ne_bytes().to_vec();
+        data.extend_from_slice(
+            b"/bin/x\0\0\0/bin/x\0OPENAB_SHEPHERD_PANE=a\0K=v\0OPENAB_SHEPHERD_PANE=b\0\0junk\0",
+        );
+        assert!(os::procargs_has(&data, b"OPENAB_SHEPHERD_PANE=b"));
+        assert!(os::procargs_has(&data, b"K=v"));
+        // An argument, and anything after the environment, do not count.
+        assert!(!os::procargs_has(&data, b"OPENAB_SHEPHERD_PANE=a"));
+        assert!(!os::procargs_has(&data, b"junk"));
+        assert!(!os::procargs_has(&data[..3], b"K=v"));
     }
 
     fn thread_sleep(ms: u64) {

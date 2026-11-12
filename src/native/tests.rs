@@ -313,7 +313,14 @@ fn the_child_sees_only_the_whitelisted_environment() {
         .collect();
     assert_eq!(
         keys,
-        BTreeSet::from(["HOME", "LANG", "PATH", "TERM", "USER"]),
+        BTreeSet::from([
+            "HOME",
+            "LANG",
+            "OPENAB_SHEPHERD_PANE",
+            "PATH",
+            "TERM",
+            "USER"
+        ]),
         "{text}"
     );
     assert!(text.lines().any(|l| l == "TERM=xterm-256color"), "{text}");
@@ -473,6 +480,7 @@ fn a_per_run_environment_reaches_only_its_own_pane() {
         "USER",
         "LANG",
         "TERM",
+        "OPENAB_SHEPHERD_PANE",
         "DYLD_INSERT_LIBRARIES",
         "LD_PRELOAD",
         "lower",
@@ -1238,5 +1246,104 @@ fn shutdown_and_drop_end_descendants_outside_the_group() {
                 "{how} drop={drop_it}: leader {pid} was not reaped"
             );
         }
+    }
+}
+
+// Review round 3 of #10: a descendant that detaches at once (a daemon's
+// double fork: it calls setsid and every ancestor between it and the pane
+// exits within milliseconds) leaves no ppid, process-group, session or
+// terminal link to the pane before any process-table look can see it. The
+// marker in its environment (ADR §11) is then the only way to find it. No
+// delay before cleanup in these tests: cleanup must find it by the marker
+// alone.
+
+/// A helper that detaches fully, then prints `gc:<pid>` and sleeps: it
+/// `setsid`s into a new session, forks, the leader exits (so the printing
+/// process is reparented to pid 1 in a session it does not lead and with no
+/// controlling terminal), and the child closes its stdio and sleeps. It is
+/// a locally built, unsigned binary, so the marker it inherits is visible on
+/// macOS (`KERN_PROCARGS2` hides the environment of SIP-restricted binaries
+/// such as /bin/sh or perl, not of a binary like this one). Returns its
+/// path; the caller runs it through a pane so it inherits the pane marker.
+fn detach_helper(dir: &TempDir) -> String {
+    let src = dir.path().join("detach.c");
+    let bin = dir.path().join("detach");
+    std::fs::write(
+        &src,
+        "#include <unistd.h>\n#include <stdio.h>\n#include <sys/types.h>\n\
+         int main(void){\n\
+         if (setsid() == -1) return 1;\n\
+         pid_t p = fork();\n\
+         if (p < 0) return 1;\n\
+         if (p > 0) _exit(0);\n\
+         printf(\"gc:%d\\n\", (int)getpid()); fflush(stdout);\n\
+         close(0); close(1); close(2);\n\
+         sleep(300);\n\
+         return 0;\n}\n",
+    )
+    .unwrap();
+    let ok = Command::new("cc")
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .expect("cc to build the detach helper")
+        .success();
+    assert!(ok, "the detach helper did not compile");
+    bin.to_string_lossy().into_owned()
+}
+
+/// Wait for `gc` to end; kill it if it did not, so a failure leaves nothing.
+fn detached_ended(gc: i32) -> bool {
+    let gone = process_gone_within(gc, Duration::from_secs(5));
+    if !gone {
+        // SAFETY: a test's own grandchild, still alive a moment ago.
+        unsafe {
+            libc::kill(gc, libc::SIGKILL);
+        }
+    }
+    gone
+}
+
+#[test]
+fn remove_ends_a_descendant_that_detached_at_once() {
+    let dir = TempDir::new("native-fast-rm");
+    let b = backend();
+    let line = format!("{} & sleep 60", detach_helper(&dir));
+    let info = b.run(&spec_line("fast", &line, &dir)).unwrap();
+    let gc = printed_pid(&b, &info, "gc:");
+    b.remove(&info.reference(), None).unwrap();
+    assert!(detached_ended(gc), "grandchild {gc} outlived remove");
+}
+
+#[test]
+fn pane_exit_ends_a_descendant_that_detached_at_once() {
+    let dir = TempDir::new("native-fast-exit");
+    let b = backend();
+    let line = format!("{} & sleep 1; exit 4", detach_helper(&dir));
+    let info = b.run(&spec_line("fast", &line, &dir)).unwrap();
+    let gc = printed_pid(&b, &info, "gc:");
+    let ended = b.wait(&info.reference(), LONG).unwrap();
+    assert_eq!(ended.exit_code, Some(4));
+    assert!(detached_ended(gc), "grandchild {gc} outlived its pane");
+}
+
+#[test]
+fn shutdown_and_drop_end_a_descendant_that_detached_at_once() {
+    for drop_it in [false, true] {
+        let dir = TempDir::new("native-fast-drop");
+        let b = backend();
+        let line = format!("{} & sleep 60", detach_helper(&dir));
+        let info = b.run(&spec_line("fast", &line, &dir)).unwrap();
+        let gc = printed_pid(&b, &info, "gc:");
+        if drop_it {
+            drop(b);
+        } else {
+            b.shutdown();
+        }
+        assert!(
+            detached_ended(gc),
+            "drop={drop_it}: grandchild {gc} survived"
+        );
     }
 }
