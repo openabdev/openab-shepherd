@@ -227,7 +227,8 @@ Only the TUI startup was measured, with no model turn and no credentials.
 
 - Launch with `argv: ["opencode", "--standalone"]`. Without `--standalone`, OpenCode
   starts a background server (`opencode serve --service`) that keeps running after the
-  TUI exits. Stop it with `opencode service stop`.
+  TUI exits. Stop it with `opencode service stop`, which exits 0 and ends the process
+  (measured).
 - Never pass `--auto`, and never set `session.permissions` to `autoaccept`. Both
   approve permission prompts without a dialog.
 - At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. This report is
