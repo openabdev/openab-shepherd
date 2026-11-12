@@ -220,6 +220,22 @@ in BEL or ST, including OSC 7501 status reports), DCS, SOS, PM, and APC strings,
 two-byte and nF escapes, and lone ESC bytes. An unterminated sequence at the end of the
 text removes the rest of the text. Newlines and tabs are kept.
 
+## OpenCode CLI
+
+Measured on OpenCode 2.2.7 (`opencode --version`), installed at `~/.bun/bin/opencode`.
+Only the TUI startup was measured, with no model turn and no credentials.
+
+- Launch with `argv: ["opencode", "--standalone"]`. Without `--standalone`, OpenCode
+  starts a background server (`opencode serve --service`) that keeps running after the
+  TUI exits. Stop it with `opencode service stop`.
+- Never pass `--auto`, and never set `session.permissions` to `autoaccept`. Both
+  approve permission prompts without a dialog.
+- At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. The output
+  filter removes the report, and `get_status` reads the state through herdr-core.
+- `answer_dialog` does not support OpenCode. Its parser reads only the kiro-cli
+  layout, so it refuses before any key is sent. Working turns, the `blocked` state
+  for permission prompts, and the dialog layout are not yet measured.
+
 ## Authentication and network
 
 - Host header: checked first. It must name a loopback address (`127.0.0.1`, `[::1]`,
@@ -261,7 +277,8 @@ test there, then copy `target/release/openab-shepherd` back.
   from screen text. It is tested only against kiro-cli 3.1.0 (V3 engine) shell
   permission dialogs, using the screen captured by the probe. Other tools (fs_write,
   MCP), other programs, other versions, and `kind` values `question` or `auth` are
-  untested or refused. `force` is never sent.
+  untested or refused. `force` is never sent. The parser is kiro-only: OpenCode
+  dialogs are refused without a key sent.
 - **Residual race on Enter.** `answer_dialog` is serialized against other Shepherd
   calls and re-checks status and turn just before `enter`, but herdr-core has no
   conditional key press. A person at the terminal or another herdr-core client can
