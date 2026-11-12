@@ -153,7 +153,7 @@ mod tests {
     // The ST form is measured from OpenCode 2.2.7 TUI startup (four captured runs).
     // The BEL form is a generic OSC terminator case, not observed from OpenCode.
     #[test]
-    fn opencode_startup_status_bel_and_st_stripped() {
+    fn opencode_startup_status_st_measured_bel_generic_stripped() {
         let bel = "\u{1b}]7501;state=idle:app=opencode\u{7}Build · Big Pickle";
         assert_eq!(strip_terminal_escapes(bel), "Build · Big Pickle");
         let st = "\u{1b}]7501;state=idle:app=opencode\u{1b}\\Build · Big Pickle";
