@@ -230,8 +230,9 @@ Only the TUI startup was measured, with no model turn and no credentials.
   TUI exits. Stop it with `opencode service stop`.
 - Never pass `--auto`, and never set `session.permissions` to `autoaccept`. Both
   approve permission prompts without a dialog.
-- At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. The output
-  filter removes the report, and `get_status` reads the state through herdr-core.
+- At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. This report is
+  measured. The output filter removes it. Whether herdr-core turns it into a
+  `get_status` result is not yet measured. It is an open point pending a live check.
 - `answer_dialog` does not support OpenCode. Its parser reads only the kiro-cli
   layout, so it refuses before any key is sent. Working turns, the `blocked` state
   for permission prompts, and the dialog layout are not yet measured.
