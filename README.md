@@ -113,6 +113,25 @@ put it behind `tailscale serve` and allow that name, for example
 Every variable, profile field, tool argument, error code and bound is described in
 [docs/operations.md](docs/operations.md).
 
+## OpenCode CLI
+
+Measured on OpenCode 2.2.7 (`opencode --version`), installed at `~/.bun/bin/opencode`.
+Only the TUI startup was measured, with no model turn and no credentials.
+
+- Launch with `argv: ["opencode", "--standalone"]`. Without `--standalone`, OpenCode
+  starts a background server (`opencode serve --service`) that keeps running after the
+  TUI exits. Stop it with `opencode service stop`, which exits 0 and ends the process
+  (measured).
+- Never pass `--auto`, and never set `session.permissions` to `autoaccept`. Both
+  approve permission prompts without a dialog.
+- At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. This report is
+  measured. The output filter removes it. Whether herdr-core turns it into a
+  `get_status` result is not yet measured. It is an open point pending a live check.
+- OpenCode has no dialect. `answer_dialog` refuses it before any key is sent. A launch
+  profile's `agent` must be `kiro` or `devin`, so an OpenCode profile is rejected today.
+  Working turns, the `blocked` state for permission prompts, and the dialog layout are
+  not yet measured.
+
 ## Status and known limits
 
 Shepherd is an MVP (version 0.1.0). The native backend was verified against
@@ -124,7 +143,8 @@ kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 - **Two dialog choices only.** `answer_dialog` answers `allow_once` or `deny_once`
   and nothing else. Other dialog kinds (`question`, `auth`) are not answered.
 - **Text-based dialog parsing.** The dialog is parsed from screen text and is tested
-  only against kiro-cli 3.1.0 (V3) shell permission dialogs.
+  only against kiro-cli 3.1.0 (V3) shell permission dialogs. OpenCode has no dialect,
+  so its dialogs are refused without a key sent.
 - **A fast detached descendant escapes cleanup.** A descendant that is re-parented
   and fully detaches (new session, no terminal, parents gone) within the 250 ms
   between looks at the process table is never seen and survives. macOS has no
