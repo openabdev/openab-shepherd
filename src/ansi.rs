@@ -150,8 +150,8 @@ mod tests {
         assert_eq!(strip_terminal_escapes(text), text);
     }
 
-    // The BEL form is measured from OpenCode 2.2.7 TUI startup (see .agents measurements).
-    // The ST form is a generic OSC terminator case, not observed from OpenCode.
+    // The ST form is measured from OpenCode 2.2.7 TUI startup (four captured runs).
+    // The BEL form is a generic OSC terminator case, not observed from OpenCode.
     #[test]
     fn opencode_startup_status_bel_and_st_stripped() {
         let bel = "\u{1b}]7501;state=idle:app=opencode\u{7}Build · Big Pickle";
@@ -162,7 +162,9 @@ mod tests {
 
     #[test]
     fn opencode_startup_queries_stripped() {
-        let text = "\u{1b}]7501;?\u{7}\u{1b}[>0q\u{1b}[>4;1mAsk anything";
+        let text = "\u{1b}]7501;?\u{1b}\\\u{1b}[>0q\u{1b}[>4;1mAsk anything";
         assert_eq!(strip_terminal_escapes(text), "Ask anything");
+        let bel = "\u{1b}]7501;?\u{7}Ask anything";
+        assert_eq!(strip_terminal_escapes(bel), "Ask anything");
     }
 }
