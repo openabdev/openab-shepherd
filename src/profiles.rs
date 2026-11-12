@@ -15,6 +15,7 @@
 //! using only absolute entries, so the directory a caller picks never decides
 //! which executable gets the profile's environment.
 
+use crate::agent::{Agent, PermissionMode};
 use crate::backend::Secret;
 use crate::config::{check_outside_repo, ConfigError};
 use crate::input::{validate_input, validate_name};
@@ -76,6 +77,27 @@ pub struct Profile {
     /// Canonical directories; a pane's cwd is one of them or below one.
     pub cwds: Vec<PathBuf>,
     pub env: Vec<(String, EnvSource)>,
+    /// Which agent runs; decides the permission dialog answer_dialog reads.
+    pub agent: Agent,
+    pub permission_mode: PermissionMode,
+    /// Lets a kiro profile declare `permission_mode` bypass. Ignored for devin.
+    pub allow_bypass: bool,
+}
+
+impl Profile {
+    /// Arguments Shepherd inserts right after the program. A devin profile gets
+    /// `--permission-mode` with the value for its mode, so the mode never
+    /// depends on a config file. A kiro profile gets none: its arguments are the
+    /// profile's own `argv`.
+    pub fn permission_args(&self) -> Vec<String> {
+        match self.agent {
+            Agent::Kiro => Vec::new(),
+            Agent::Devin => vec![
+                "--permission-mode".to_string(),
+                self.permission_mode.devin_value().to_string(),
+            ],
+        }
+    }
 }
 
 /// Why a requested working directory was refused.
@@ -478,7 +500,20 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         .ok_or_else(|| err(format!("profile {index} needs a name")))?;
     let name = validate_name(name).map_err(|e| err(format!("profile {index}: {e}")))?;
     let at = format!("profile {name}");
-    only_keys(map, &["name", "argv", "extra_args", "cwds", "env"], &at)?;
+    only_keys(
+        map,
+        &[
+            "name",
+            "agent",
+            "permission_mode",
+            "allow_bypass",
+            "argv",
+            "extra_args",
+            "cwds",
+            "env",
+        ],
+        &at,
+    )?;
 
     let mut argv = strings(map.get("argv"), &format!("{at}: argv"))?;
     if argv.is_empty() {
@@ -497,6 +532,63 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         return Err(err(format!(
             "{at}: argv and extra_args have more than {MAX_ARGV} elements"
         )));
+    }
+
+    let agent = match map.get("agent") {
+        None => Agent::Kiro,
+        Some(Value::String(text)) => {
+            Agent::parse(text).ok_or_else(|| err(format!("{at}: agent must be kiro or devin")))?
+        }
+        Some(_) => return Err(err(format!("{at}: agent must be kiro or devin"))),
+    };
+    let permission_mode = match map.get("permission_mode") {
+        None => PermissionMode::Normal,
+        Some(Value::String(text)) => PermissionMode::parse(text).ok_or_else(|| {
+            err(format!(
+                "{at}: permission_mode must be normal, accept-edits or bypass"
+            ))
+        })?,
+        Some(_) => {
+            return Err(err(format!(
+                "{at}: permission_mode must be normal, accept-edits or bypass"
+            )))
+        }
+    };
+    let allow_bypass = match map.get("allow_bypass") {
+        None => false,
+        Some(Value::Bool(allow)) => *allow,
+        Some(_) => return Err(err(format!("{at}: allow_bypass must be true or false"))),
+    };
+    match (agent, permission_mode) {
+        (Agent::Kiro, PermissionMode::AcceptEdits) => {
+            return Err(err(format!(
+                "{at}: permission_mode accept-edits is not supported for kiro: no Kiro mode was measured"
+            )))
+        }
+        (Agent::Kiro, PermissionMode::Bypass) if !allow_bypass => {
+            return Err(err(format!(
+                "{at}: permission_mode bypass for kiro needs \"allow_bypass\": true"
+            )))
+        }
+        (Agent::Devin, _)
+            if argv
+                .iter()
+                .any(|a| a == "--permission-mode" || a.starts_with("--permission-mode=")) =>
+        {
+            return Err(err(format!(
+                "{at}: argv and extra_args may not set --permission-mode for devin; use permission_mode"
+            )))
+        }
+        (Agent::Devin, _)
+            if argv.iter().any(|a| {
+                a == "--respect-workspace-trust" || a.starts_with("--respect-workspace-trust=")
+            }) =>
+        {
+            return Err(err(format!(
+                "{at}: argv and extra_args may not set --respect-workspace-trust for devin: the trust check stays on, and a new directory must be trusted in Devin first"
+            )))
+        }
+        _ => {}
     }
 
     let dirs = strings(map.get("cwds"), &format!("{at}: cwds"))?;
@@ -536,6 +628,11 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
                 "{at}: env: a name must match [A-Z_][A-Z0-9_]*"
             )));
         }
+        if agent == Agent::Devin && key == "DEVIN_PERMISSION_MODE" {
+            return Err(err(format!(
+                "{at}: env may not set DEVIN_PERMISSION_MODE for devin; use permission_mode"
+            )));
+        }
         if PROTECTED_KEYS.contains(&key.as_str())
             || PROTECTED_PREFIXES.iter().any(|p| key.starts_with(p))
             || is_shepherd_own(key)
@@ -552,6 +649,9 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         argv,
         cwds,
         env,
+        agent,
+        permission_mode,
+        allow_bypass,
     })
 }
 
@@ -687,6 +787,117 @@ mod tests {
         let many_args: Vec<String> = (0..MAX_ARGV).map(|i| i.to_string()).collect();
         let text = json!({"profiles": [{"name": "p", "argv": ["a"], "extra_args": many_args, "cwds": [d]}]});
         assert!(refused(&text.to_string()).contains("more than"));
+    }
+
+    #[test]
+    fn agent_and_permission_mode_default_to_kiro_and_normal() {
+        let dir = TempDir::new("profiles-agent-default");
+        let d = dir.path();
+        let p = policy(
+            &json!({"profiles": [
+                {"name": "k", "argv": ["kiro-cli"], "cwds": [d]},
+                {"name": "dn", "argv": ["devin"], "cwds": [d], "agent": "devin"},
+                {"name": "da", "argv": ["devin"], "cwds": [d], "agent": "devin", "permission_mode": "accept-edits"},
+                {"name": "db", "argv": ["devin"], "cwds": [d], "agent": "devin", "permission_mode": "bypass"},
+                {"name": "kb", "argv": ["kiro-cli"], "cwds": [d], "permission_mode": "bypass", "allow_bypass": true},
+            ]})
+            .to_string(),
+        );
+        let kiro = p.profile("k").unwrap();
+        assert_eq!(kiro.agent, Agent::Kiro);
+        assert_eq!(kiro.permission_mode, PermissionMode::Normal);
+        assert!(!kiro.allow_bypass);
+        assert!(kiro.permission_args().is_empty());
+        assert_eq!(
+            p.profile("kb").unwrap().permission_mode,
+            PermissionMode::Bypass
+        );
+        assert!(p.profile("kb").unwrap().permission_args().is_empty());
+
+        let devin = p.profile("dn").unwrap();
+        assert_eq!(devin.agent, Agent::Devin);
+        assert_eq!(devin.permission_mode, PermissionMode::Normal);
+        assert_eq!(devin.permission_args(), ["--permission-mode", "auto"]);
+        assert_eq!(
+            p.profile("da").unwrap().permission_args(),
+            ["--permission-mode", "accept-edits"]
+        );
+        assert_eq!(
+            p.profile("db").unwrap().permission_args(),
+            ["--permission-mode", "dangerous"]
+        );
+    }
+
+    #[test]
+    fn agent_and_permission_mode_refusals() {
+        let dir = TempDir::new("profiles-agent-bad");
+        let d = dir.path().to_string_lossy().into_owned();
+        let profile = |extra: Value| {
+            let mut map = json!({"name": "p", "argv": ["x"], "cwds": [d]});
+            for (key, value) in extra.as_object().unwrap() {
+                map[key] = value.clone();
+            }
+            json!({"profiles": [map]}).to_string()
+        };
+        let cases = [
+            (json!({"agent": "opencode"}), "agent must be kiro or devin"),
+            (json!({"agent": 1}), "agent must be kiro or devin"),
+            (
+                json!({"permission_mode": "yolo"}),
+                "permission_mode must be",
+            ),
+            (json!({"permission_mode": true}), "permission_mode must be"),
+            (
+                json!({"allow_bypass": "yes"}),
+                "allow_bypass must be true or false",
+            ),
+            (
+                json!({"permission_mode": "accept-edits"}),
+                "accept-edits is not supported for kiro",
+            ),
+            (
+                json!({"permission_mode": "bypass"}),
+                "needs \"allow_bypass\": true",
+            ),
+            (
+                json!({"agent": "devin", "argv": ["devin", "--permission-mode", "dangerous"]}),
+                "may not set --permission-mode for devin",
+            ),
+            (
+                json!({"agent": "devin", "extra_args": ["--permission-mode=dangerous"]}),
+                "may not set --permission-mode for devin",
+            ),
+            (
+                json!({"agent": "devin", "extra_args": ["--respect-workspace-trust", "false"]}),
+                "may not set --respect-workspace-trust for devin",
+            ),
+            (
+                json!({"agent": "devin", "argv": ["devin", "--respect-workspace-trust=false"]}),
+                "may not set --respect-workspace-trust for devin",
+            ),
+            (
+                json!({"agent": "devin", "env": {"DEVIN_PERMISSION_MODE": "dangerous"}}),
+                "may not set DEVIN_PERMISSION_MODE for devin",
+            ),
+            (json!({"allow_bypasss": true}), "unknown field"),
+        ];
+        for (extra, want) in cases {
+            let message = refused(&profile(extra.clone()));
+            assert!(message.contains(want), "{extra}: {message}");
+        }
+    }
+
+    #[test]
+    fn bypass_is_accepted_for_devin_only_when_set_explicitly_or_with_allow_bypass_for_kiro() {
+        let dir = TempDir::new("profiles-bypass-ok");
+        let d = dir.path().to_string_lossy().into_owned();
+        let text = json!({"profiles": [
+            {"name": "db", "argv": ["devin"], "cwds": [d], "agent": "devin", "permission_mode": "bypass"},
+            {"name": "kb", "argv": ["kiro-cli"], "cwds": [d], "permission_mode": "bypass", "allow_bypass": true},
+            {"name": "ka", "argv": ["kiro-cli"], "cwds": [d], "permission_mode": "normal", "allow_bypass": false},
+        ]})
+        .to_string();
+        assert!(parse(&text, true).is_ok());
     }
 
     #[test]
