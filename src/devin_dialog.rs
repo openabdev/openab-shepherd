@@ -24,6 +24,9 @@ pub const CURSOR: char = '❭';
 pub const OPTION_ALLOW: &str = "Allow";
 pub const OPTION_BYPASS: &str = "Bypass mode";
 pub const OPTION_DENY: &str = "Deny";
+/// The scope that `allow_once` approves, and the arrow before the scope label.
+pub const SCOPE_ONCE: &str = "Once";
+const SCOPE_ARROW: char = '→';
 /// Positions of the three options, top to bottom.
 pub const INDEX_ALLOW: usize = 0;
 pub const INDEX_BYPASS: usize = 1;
@@ -108,6 +111,16 @@ fn is_allow_row(text: &str) -> bool {
     text == OPTION_ALLOW || text.starts_with("Allow ")
 }
 
+/// Whether the Allow row's scope selector reads `Once`, the scope `allow_once`
+/// approves. The scope label is the first word after the `→`, as in
+/// `Allow ← ◼ ◼◼◼ → Once Exec(...)`. A row with no scope, or another scope, is not Once.
+pub fn allow_scope_is_once(allow_row: &str) -> bool {
+    allow_row
+        .split_once(SCOPE_ARROW)
+        .and_then(|(_, scope)| scope.split_whitespace().next())
+        == Some(SCOPE_ONCE)
+}
+
 fn skip_blank(lines: &[&str], mut index: usize) -> usize {
     while lines.get(index).is_some_and(|line| line.trim().is_empty()) {
         index += 1;
@@ -164,6 +177,19 @@ mod tests {
             "Allow ← ◼ ◼◼◼ → Once Exec(touch shepherd_marker.txt)"
         );
         assert_eq!(dialog.options[2], "Deny");
+    }
+
+    #[test]
+    fn allow_scope_is_read_from_the_allow_row() {
+        assert!(allow_scope_is_once(
+            "Allow ← ◼ ◼◼◼ → Once Exec(touch shepherd_marker.txt)"
+        ));
+        assert!(allow_scope_is_once("Allow ← ◼ ◼◼◼ → Once"));
+        assert!(!allow_scope_is_once("Allow"));
+        assert!(!allow_scope_is_once(
+            "Allow ← ◼ ◼◼◼ → Session Exec(touch shepherd_marker.txt)"
+        ));
+        assert!(!allow_scope_is_once("Allow ← ◼ → Onceler"));
     }
 
     #[test]

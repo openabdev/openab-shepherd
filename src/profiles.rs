@@ -579,6 +579,15 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
                 "{at}: argv and extra_args may not set --permission-mode for devin; use permission_mode"
             )))
         }
+        (Agent::Devin, _)
+            if argv.iter().any(|a| {
+                a == "--respect-workspace-trust" || a.starts_with("--respect-workspace-trust=")
+            }) =>
+        {
+            return Err(err(format!(
+                "{at}: argv and extra_args may not set --respect-workspace-trust for devin: the trust check stays on, and a new directory must be trusted in Devin first"
+            )))
+        }
         _ => {}
     }
 
@@ -857,6 +866,14 @@ mod tests {
             (
                 json!({"agent": "devin", "extra_args": ["--permission-mode=dangerous"]}),
                 "may not set --permission-mode for devin",
+            ),
+            (
+                json!({"agent": "devin", "extra_args": ["--respect-workspace-trust", "false"]}),
+                "may not set --respect-workspace-trust for devin",
+            ),
+            (
+                json!({"agent": "devin", "argv": ["devin", "--respect-workspace-trust=false"]}),
+                "may not set --respect-workspace-trust for devin",
             ),
             (
                 json!({"agent": "devin", "env": {"DEVIN_PERMISSION_MODE": "dangerous"}}),

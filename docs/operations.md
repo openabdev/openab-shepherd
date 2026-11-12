@@ -204,6 +204,8 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
   `argv` or `extra_args`, or set `DEVIN_PERMISSION_MODE` in `env`. The mode is set
   in one place only, so the Devin config file cannot change it: Devin's flag takes
   precedence over its own config, and `normal` passes `auto` explicitly for that reason.
+  It may not set `--respect-workspace-trust` either (any value): that flag turns off the
+  trust check Shepherd relies on for `trust_prompt`.
 - Unknown fields are refused, so a typo cannot silently drop a restriction.
 - `list_panes` returns `profiles` (each profile's `name` and `cwds`, never its argv or
   env) and `allow_arbitrary_command`, so a caller can see what it may start.
@@ -359,6 +361,8 @@ must not be `blocked`, then the text is sent, still inside the lock.
    For `devin`, one key goes out at a time, and the screen is read after each key. The
    highlight must be on the next row before another key is sent, so it never passes
    the target. `deny_once` from `Allow` sends `down`, `down` and stops on `Deny`.
+   The highlight must start on `Allow`, or the tool sends `esc` and refuses. `up` is
+   never sent.
    After moving, the status must still be `blocked`.
 4. Read the screen again, up to 5 times 200 ms apart, until the same dialog shows the
    cursor on the target option. A different dialog stops it at once.
@@ -380,6 +384,7 @@ cannot be chosen. A Devin dialog never selects `Bypass mode`: the target is `All
 `Deny` only. Follow a successful answer with `wait_status`.
 
 Devin answers: `allow_once` presses `enter` on `Allow` (the scope defaults to `Once`).
+It refuses, sending `esc`, when the Allow row shows another scope than `Once`.
 `deny_once` moves to `Deny` and presses `enter`. The command does not run, and the
 pane goes to `idle`, not `done`; `wait_status` reports that as `cancelled`. Esc has
 the same end state.

@@ -72,8 +72,13 @@ pub struct FakeState {
     /// Each `keys` call replaces `screen` with the next of these, when any
     /// are left: the screen the program draws after the key.
     pub next_screens: std::collections::VecDeque<String>,
-    /// Specs passed to `run` (which is still refused).
+    /// Specs passed to `run`. Refused unless `runnable` is set.
     pub runs: Vec<RunSpec>,
+    /// When set, `run` starts a live pane named after the spec and returns it.
+    pub runnable: bool,
+    /// Results `wait` returns, one per call, in order. `wait` is unsupported
+    /// when this is empty.
+    pub waits: std::collections::VecDeque<WaitResult>,
     /// When set, the next `remove` signals the sender once it has started,
     /// then waits for the receiver before it removes the pane.
     pub remove_gate: Option<(Sender<()>, Receiver<()>)>,
@@ -161,8 +166,32 @@ impl TerminalBackend for FakeBackend {
     }
 
     fn run(&self, spec: &RunSpec) -> Result<TerminalInfo, BackendError> {
-        self.state.lock().unwrap().runs.push(spec.clone());
-        self.unsupported("run")
+        let runnable = {
+            let mut state = self.state.lock().unwrap();
+            state.runs.push(spec.clone());
+            state.runnable
+        };
+        if !runnable {
+            return self.unsupported("run");
+        }
+        self.record("run");
+        let info = TerminalInfo {
+            id: format!("id-{}", spec.name.as_deref().unwrap_or("anon")),
+            name: spec.name.clone(),
+            live: true,
+            exit_code: None,
+            status: Some(ProgramStatus {
+                state: State::Idle,
+                kind: None,
+            }),
+            reported: true,
+            turn: Some(1),
+            status_ms: None,
+            argv: spec.argv.clone(),
+            cwd: spec.cwd.clone(),
+        };
+        self.state.lock().unwrap().panes.push(info.clone());
+        Ok(info)
     }
 
     fn get(&self, t: &TerminalRef) -> Result<TerminalInfo, BackendError> {
@@ -277,7 +306,14 @@ impl TerminalBackend for FakeBackend {
     }
 
     fn wait(&self, _t: &TerminalRef, _timeout: Duration) -> Result<WaitResult, BackendError> {
-        self.unsupported("wait")
+        let next = self.state.lock().unwrap().waits.pop_front();
+        match next {
+            Some(result) => {
+                self.record("wait");
+                Ok(result)
+            }
+            None => self.unsupported("wait"),
+        }
     }
 
     fn interrupt(
