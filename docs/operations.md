@@ -679,21 +679,27 @@ The operator end-to-end runbook, which drives real Devin and OpenCode panes thro
 secrets and only read access to the repository.
 
 - `test` runs on `ubuntu-latest` and `macos-latest`: `cargo fmt --check`,
-  `cargo clippy --all-targets -- -D warnings`, `cargo test --no-fail-fast`.
-- `docker-build` builds the `Dockerfile` with its default build arguments (no Devin CLI),
-  pushes nothing, and runs `openab-shepherd --help` in the image.
+  `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked --no-fail-fast`.
+  It times out after 20 minutes.
+- `docker-build` checks that the Dockerfile's `rust:<version>-bookworm` builder matches
+  `rust-toolchain.toml`, builds the `Dockerfile` with its default build arguments (no
+  Devin CLI), pushes nothing, and runs `openab-shepherd --help` in the image. It times out
+  after 15 minutes.
 
-To reproduce the `test` job locally, run these three commands in the crate directory:
+To reproduce the `test` job, run these three commands in the crate directory on the build
+host (see "Build offload"), never on the laptop:
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --no-fail-fast
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --no-fail-fast
 ```
 
-CI installs the stable Rust toolchain on the runner. The project itself is built on a
-separate build host (see "Build offload"), so a newer stable release can add clippy
-warnings that the build host does not show yet.
+`rust-toolchain.toml` pins the Rust version for CI, the build host and the Docker build
+stage, so a new stable release does not change results on its own. rustup on the build
+host installs the pinned version on first use. To move to a newer Rust, change `channel`
+in `rust-toolchain.toml` and the `FROM rust:<version>-bookworm` line in the `Dockerfile`
+in the same commit, then fix any new clippy or rustfmt findings.
 
 ## Build offload
 
