@@ -119,7 +119,9 @@ pub fn verify_selected(screen: &StyledScreen) -> Result<OpenCodeDialog, String> 
             return Err(format!("{label:?} has no visible character"));
         };
         if bgs.iter().any(|bg| *bg != first) {
-            return Err(format!("{label:?} is only partly drawn with one background"));
+            return Err(format!(
+                "{label:?} is only partly drawn with one background"
+            ));
         }
         drawn.push(first);
         at += label.chars().count();
@@ -521,7 +523,10 @@ mod tests {
 
     #[test]
     fn all_three_the_same_is_refused() {
-        for (sel, un) in [(SELECTED, UNSELECTED), (PALETTE_SELECTED, PALETTE_UNSELECTED)] {
+        for (sel, un) in [
+            (SELECTED, UNSELECTED),
+            (PALETTE_SELECTED, PALETTE_UNSELECTED),
+        ] {
             for c in [sel, un] {
                 let screen = styled_with(&shell_dialog(), c, c, c);
                 assert!(verify_selected(&screen)
@@ -536,7 +541,10 @@ mod tests {
 
     #[test]
     fn allow_once_equal_to_one_other_with_the_third_differing_is_refused() {
-        for (sel, un) in [(SELECTED, UNSELECTED), (PALETTE_SELECTED, PALETTE_UNSELECTED)] {
+        for (sel, un) in [
+            (SELECTED, UNSELECTED),
+            (PALETTE_SELECTED, PALETTE_UNSELECTED),
+        ] {
             for (a, b, c) in [(sel, sel, un), (sel, un, sel), (un, un, sel), (un, sel, un)] {
                 let screen = styled_with(&shell_dialog(), a, b, c);
                 assert!(verify_selected(&screen).is_err(), "{a:?} {b:?} {c:?}");
