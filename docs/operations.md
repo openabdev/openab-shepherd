@@ -215,14 +215,32 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
   - `cooldown_secs` (optional, default `idle_timeout_secs`): 0 to 86400, the
     least time between two nudges to the same pane.
   - `max_consecutive_nudges` (optional, default 3): 1 to 100. After that many
-    nudges without the turn number advancing, the watchdog stops for the pane
-    and logs that it gave up; an advancing turn clears both the count and the
-    stop.
+    nudges without progress the watchdog did not cause, the watchdog stops
+    for the pane and logs that it gave up. The turn a nudge itself causes —
+    the nudge's turn plus one, when the agent answers the nudge and finishes
+    again — does not count as progress and does not clear the count or the
+    stop; a later advance does. Failed or refused nudge attempts also count
+    toward the cap and are spaced by the cooldown, so a pane that refuses
+    every nudge is not retried on every check. Without a `todo_file`, every
+    finished turn is a nudge candidate, so a pane whose work is in fact
+    complete will still be nudged up to this cap; set a `todo_file` when
+    that distinction matters.
   - `todo_file` (optional): a path relative to the pane's working directory,
     with no `..`. When set, a nudge also needs an unchecked item — a line whose
     first non-blank characters are `- [ ]` — in that file. No unchecked item
     (every item checked, or no items at all) counts as finished work, and the
     pane is never nudged; a file that cannot be read is never nudged either.
+    The match is a plain line scan, so `- [ ]` inside a fenced code block
+    counts too. The file is read defensively: it must be a regular file, a
+    symlink or a file over 256 KiB counts as unreadable, and the transition
+    to unreadable is logged once.
+  The watchdog's audit trail is Shepherd's stderr log: every nudge (with
+  the pane's idle seconds), every give-up and every failed attempt is a
+  line there, and nowhere else — a client cannot tell a watchdog nudge
+  from its own input except that the pane's turn counter advances, which a
+  watchdog nudge does like any typed prompt. Registrations live only in
+  memory: a Shepherd restart forgets every watched pane, and a pane is
+  watched again only when a watchdog profile starts it again.
 - A `devin` profile's directory must already be trusted in Devin. On a fresh directory
   Devin asks "Do you trust the authors of this directory?". Shepherd never answers
   that prompt. `start_pane` reads the screen for about 3 s after the start, closes the
