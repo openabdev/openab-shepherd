@@ -43,6 +43,34 @@ RUN ARCH=$(dpkg --print-architecture) && \
     chmod +x /usr/local/bin/kiro-cli* && \
     rm -rf /tmp/kirocli /tmp/kirocli.zip
 
+# Optional: Devin CLI, OFF by default. The published image is public, and the Devin CLI
+# terms for redistribution and unattended server use have not been verified, so the
+# default image must not contain the Devin binary. A private or operator-built image
+# can opt in: docker build --build-arg INSTALL_DEVIN=1 .
+# The SHA-256 values come from https://static.devin.ai/cli/3000.12.57/manifest.json,
+# which is served from the same host as the tarballs, so the check guards against
+# corruption only. No credentials are baked in; see docs/credentials.md.
+ARG INSTALL_DEVIN=0
+ARG DEVIN_CLI_VERSION=3000.12.57
+ARG DEVIN_SHA256_AMD64=0946784ef886d716e82a8026f76933bf0a6e4f0a804a23722bb62047e8c07d4a
+ARG DEVIN_SHA256_ARM64=e0f03ce263e30940122547f73e1c57d4f163391553fd37c6c856b366463d766f
+RUN if [ "$INSTALL_DEVIN" = "1" ]; then \
+      ARCH=$(dpkg --print-architecture) && \
+      if [ "$ARCH" = "arm64" ]; then \
+        TARGET="aarch64-unknown-linux"; SHA256="$DEVIN_SHA256_ARM64"; \
+      else \
+        TARGET="x86_64-unknown-linux"; SHA256="$DEVIN_SHA256_AMD64"; \
+      fi && \
+      URL="https://static.devin.ai/cli/${DEVIN_CLI_VERSION}/devin-${DEVIN_CLI_VERSION}-${TARGET}.tar.gz" && \
+      curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 5 "$URL" -o /tmp/devin.tar.gz && \
+      echo "$SHA256  /tmp/devin.tar.gz" | sha256sum -c - && \
+      mkdir -p /opt/devin && \
+      tar -xzf /tmp/devin.tar.gz -C /opt/devin && \
+      printf '#!/bin/sh\n# Writable data path for the credentials copied in at run time.\n: "${XDG_DATA_HOME:=/home/shepherd/.local/share}"\nexport XDG_DATA_HOME\nexec /opt/devin/bin/devin "$@"\n' > /usr/local/bin/devin && \
+      chmod 755 /usr/local/bin/devin && \
+      rm -f /tmp/devin.tar.gz; \
+    fi
+
 RUN useradd -m -s /bin/bash -u 1000 shepherd && \
     mkdir -p /home/shepherd/.local/share/kiro-cli /home/shepherd/.kiro && \
     chown -R shepherd:shepherd /home/shepherd

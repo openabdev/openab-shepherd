@@ -743,6 +743,34 @@ docker run --rm --platform linux/amd64 \
 To print the usage text without starting a server, run the binary by name:
 `docker run --rm --platform linux/amd64 <registry>/openab-shepherd:<version> openab-shepherd --help`.
 
+### Optional: Devin CLI (`INSTALL_DEVIN`)
+
+The image can include the Devin CLI, but only when built with
+`--build-arg INSTALL_DEVIN=1`. The default is `0`, so the published image has no
+`devin` binary. Reason: the published GHCR image is public, and the Devin CLI terms for
+redistribution and unattended server use have not been verified. A private or
+operator-built image can opt in:
+
+```sh
+docker build --build-arg INSTALL_DEVIN=1 -t <registry>/openab-shepherd:<version> .
+```
+
+The Dockerfile pins Devin CLI 3000.12.57 for x86_64 and aarch64 Linux
+(`DEVIN_CLI_VERSION`, `DEVIN_SHA256_AMD64`, `DEVIN_SHA256_ARM64`, from
+`https://static.devin.ai/cli/3000.12.57/manifest.json`). The build fails on a checksum
+mismatch. The checksum comes from the same host as the tarball, so it guards against
+corruption, not tampering. The tarball is extracted to `/opt/devin`, and
+`/usr/local/bin/devin` is a small wrapper that defaults `XDG_DATA_HOME` to
+`/home/shepherd/.local/share` (writable) and runs the binary.
+
+The image holds no Devin credentials. Provide them at run time as described in
+[credentials.md](credentials.md): one interactive operator login, `credentials.toml`
+kept as a Kubernetes Secret, copied to a writable path with mode 600.
+
+Not verified: the Devin CLI terms of use; mounting the Secret in a pod; disabling
+auto-update in the image (no config key was verified, so none is set; the CLI may
+try to update itself at run time).
+
 ## Known limits (MVP scope)
 
 - **No multi-client authorization.** Any holder of the token has full control of every
