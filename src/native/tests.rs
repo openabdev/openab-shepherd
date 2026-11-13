@@ -1061,7 +1061,10 @@ fn a_reaper_that_cannot_start_leaves_no_zombie() {
 fn a_lost_group_is_never_signalled() {
     let dir = TempDir::new("native-group-lost");
     let b = backend();
-    let info = b.run(&spec_line("lost", "sleep 300", &dir)).unwrap();
+    // Unmarked on purpose: the marker sweep in `release` ends every marked
+    // process by pid, so only an unmarked one shows whether the group is signalled.
+    let argv = ["env", "-u", procs::MARKER_KEY, "sleep", "300"];
+    let info = b.run(&spec_argv("lost", &argv, &dir)).unwrap();
     let pane = pane_of(&b, &info);
     pane.state.lock().unwrap().group_lost = true;
     assert!(!pane.owns_group());
