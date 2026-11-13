@@ -232,8 +232,8 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
     pane is never nudged; a file that cannot be read is never nudged either.
     The match is a plain line scan, so `- [ ]` inside a fenced code block
     counts too. The file is read defensively: it must be a regular file, a
-    symlink or a file over 256 KiB counts as unreadable, and the transition
-    to unreadable is logged once.
+    symlink in any component of its path or a file over 256 KiB counts as
+    unreadable, and the transition to unreadable is logged once.
   The watchdog's audit trail is Shepherd's stderr log: every nudge (with
   the pane's idle seconds), every give-up and every failed attempt is a
   line there, and nowhere else — a client cannot tell a watchdog nudge
