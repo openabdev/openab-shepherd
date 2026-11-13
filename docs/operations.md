@@ -46,6 +46,7 @@ later is a contained change.
 | `examples/native_probe.rs` | The real-Kiro probe for the native backend |
 | `examples/native_leak_check.rs` | Real-Kiro leak check: removes a pane and verifies no descendant process survives (issue #10) |
 | `src/tools.rs` | The nine tools, their schemas, the safety rules, and the backend calls each one makes |
+| `src/watchdog.rs` | The per-pane watchdog state and its nudge decision (the tools run its thread) |
 | `src/dialog.rs` | Text parser for the kiro-cli permission dialog |
 | `src/devin_dialog.rs` | Text parser for the Devin CLI permission dialog |
 | `src/opencode_dialog.rs` | Text parser for the OpenCode permission dialog and the styled-cell highlight check |
@@ -196,6 +197,32 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
     bypass flag that was measured, so the Kiro arguments in `argv` still decide trust.
 - `allow_bypass` (optional, default false): lets a `kiro` profile declare
   `permission_mode` `bypass`. It has no effect on a `devin` profile.
+- `watchdog` (optional): Shepherd's own liveness check on this profile's panes,
+  checked every 5 s. A coding CLI's main session sometimes ends a turn with work
+  left and stops — not working, not blocked, waiting on nothing. When a pane's
+  turn has finished (`done`; for `opencode`, `idle` after at least one turn, the
+  same rule as `wait_status`) and the turn number then sits untouched for
+  `idle_timeout_secs`, the watchdog types `nudge_text` into the pane through the
+  same path and refusal rules as `send_input`, and logs the nudge (pane, turn,
+  reason). It never types into a blocked pane and never answers a dialog.
+  Whether the remaining work is worth doing stays the client's judgment; the
+  watchdog is off unless a profile sets it, and it watches only panes this
+  Shepherd process started from the profile (a pane name reused by any other
+  start drops the registration). Fields:
+  - `idle_timeout_secs` (required): 10 to 86400.
+  - `nudge_text` (required): the text typed, under the `send_input` input rules
+    (trimmed, at most 4096 bytes, no control characters except TAB).
+  - `cooldown_secs` (optional, default `idle_timeout_secs`): 0 to 86400, the
+    least time between two nudges to the same pane.
+  - `max_consecutive_nudges` (optional, default 3): 1 to 100. After that many
+    nudges without the turn number advancing, the watchdog stops for the pane
+    and logs that it gave up; an advancing turn clears both the count and the
+    stop.
+  - `todo_file` (optional): a path relative to the pane's working directory,
+    with no `..`. When set, a nudge also needs an unchecked item — a line whose
+    first non-blank characters are `- [ ]` — in that file. No unchecked item
+    (every item checked, or no items at all) counts as finished work, and the
+    pane is never nudged; a file that cannot be read is never nudged either.
 - A `devin` profile's directory must already be trusted in Devin. On a fresh directory
   Devin asks "Do you trust the authors of this directory?". Shepherd never answers
   that prompt. `start_pane` reads the screen for about 3 s after the start, closes the
