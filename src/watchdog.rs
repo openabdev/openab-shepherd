@@ -36,22 +36,51 @@ pub enum Todo {
     Unreadable,
 }
 
+/// The most todo-file bytes the watchdog will read. A todo list is small;
+/// anything larger is treated as unreadable rather than read into memory.
+pub const MAX_TODO_BYTES: u64 = 256 * 1024;
+
 /// Read the todo file at `path`. An unchecked item is a line whose first
 /// non-blank characters are `- [ ]`; `- [x]`, other bullets and prose do
-/// not count.
+/// not count. (`- [ ]` inside a fenced code block counts too; the check is
+/// a plain line scan, not a Markdown parse.)
+///
+/// The file is read defensively: the supervised agent writes in the same
+/// directory, so the path could be a FIFO (which would block a plain read
+/// forever and stall the single watchdog thread), a symlink out of the
+/// directory, or an unbounded file. The open is non-blocking and refuses
+/// symlinks (on Unix), the handle must be a regular file, and at most
+/// [`MAX_TODO_BYTES`] are read. Any failure, or a file over the limit,
+/// maps to [`Todo::Unreadable`]: fail closed, no nudge.
 pub fn read_todo(path: &Path) -> Todo {
-    match fs::read_to_string(path) {
-        Ok(text) => {
-            if text
-                .lines()
-                .any(|line| line.trim_start().starts_with("- [ ]"))
-            {
-                Todo::Unchecked
-            } else {
-                Todo::Finished
-            }
-        }
-        Err(_) => Todo::Unreadable,
+    use std::io::Read as _;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let Ok(mut file) = options.open(path) else {
+        return Todo::Unreadable;
+    };
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        _ => return Todo::Unreadable,
+    }
+    let mut buf = Vec::new();
+    let read = file.by_ref().take(MAX_TODO_BYTES + 1).read_to_end(&mut buf);
+    if read.is_err() || buf.len() as u64 > MAX_TODO_BYTES {
+        return Todo::Unreadable;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("- [ ]"))
+    {
+        Todo::Unchecked
+    } else {
+        Todo::Finished
     }
 }
 
@@ -92,9 +121,20 @@ pub struct PaneWatch {
     config: WatchdogConfig,
     cwd: PathBuf,
     agent: Agent,
-    /// The turn counter at the last observation. A turn that advances clears
-    /// the consecutive count and a give-up: progress is the reset.
+    /// The backend id of the pane this watch was registered for. A name
+    /// reused by a later start is a different pane and never this watch's.
+    pane_id: String,
+    /// The turn counter at the last observation. A turn that advances on
+    /// its own clears the consecutive count and a give-up: progress is the
+    /// reset. The turn a nudge itself causes (nudged turn + 1) does not
+    /// clear anything — otherwise every answered nudge would reset the
+    /// cap and the watchdog would nudge forever.
     last_turn: Option<u64>,
+    /// The turn the last successful nudge was sent on.
+    nudged_turn: Option<u64>,
+    /// Whether the todo file was unreadable at the last observation, so a
+    /// transition into unreadable can be logged once.
+    todo_unreadable: bool,
     /// The turn the pane was first seen finished at, and when. The idle
     /// clock runs from here, so time spent working on that turn never
     /// counts as idle.
@@ -106,12 +146,15 @@ pub struct PaneWatch {
 }
 
 impl PaneWatch {
-    pub fn new(config: WatchdogConfig, cwd: PathBuf, agent: Agent) -> Self {
+    pub fn new(config: WatchdogConfig, cwd: PathBuf, agent: Agent, pane_id: String) -> Self {
         Self {
             config,
             cwd,
             agent,
+            pane_id,
             last_turn: None,
+            nudged_turn: None,
+            todo_unreadable: false,
             finished_turn: None,
             finished_since: None,
             consecutive: 0,
@@ -128,8 +171,34 @@ impl PaneWatch {
         &self.cwd
     }
 
-    pub fn agent(&self) -> Agent {
-        self.agent
+    pub fn pane_id(&self) -> &str {
+        &self.pane_id
+    }
+
+    /// Record a todo reading; returns true when it is the first unreadable
+    /// reading after a readable (or not-configured) one, so the caller can
+    /// log the transition once instead of every tick.
+    pub fn note_todo(&mut self, todo: Todo) -> bool {
+        let unreadable = matches!(todo, Todo::Unreadable);
+        let transition = unreadable && !self.todo_unreadable;
+        self.todo_unreadable = unreadable;
+        transition
+    }
+
+    /// How long the current finished turn has sat untouched, if one is
+    /// being timed.
+    pub fn idle_for(&self, now: Instant) -> Option<Duration> {
+        self.finished_since
+            .map(|since| now.saturating_duration_since(since))
+    }
+
+    /// The status state that is this watch's agent's finished turn, for
+    /// conditioning a nudge send on the state that was observed.
+    pub fn finished_state(&self) -> State {
+        match self.agent {
+            Agent::OpenCode => State::Idle,
+            Agent::Kiro | Agent::Devin => State::Done,
+        }
     }
 
     /// Whether this reading of the pane is a finished turn. Most agents
@@ -151,12 +220,18 @@ impl PaneWatch {
     /// observation ([`Todo::NotConfigured`] when the profile names none).
     pub fn observe(&mut self, info: &TerminalInfo, todo: Todo, now: Instant) -> WatchEvent {
         // Turn bookkeeping runs even while the watchdog is stopped for this
-        // pane, because an advancing turn is what clears the stop.
+        // pane, because an advancing turn is what clears the stop. The one
+        // exception is the turn a nudge itself causes: a nudge sent on turn
+        // N makes the agent run turn N+1, and that advance is the watchdog's
+        // own doing, not progress — it must not reset the cap, or an agent
+        // that answers every nudge would be nudged forever.
         if info.turn != self.last_turn {
             if let (Some(before), Some(after)) = (self.last_turn, info.turn) {
-                if after > before {
+                let nudge_caused = self.nudged_turn == Some(before) && after == before + 1;
+                if after > before && !nudge_caused {
                     self.consecutive = 0;
                     self.gave_up = false;
+                    self.nudged_turn = None;
                 }
             }
             self.last_turn = info.turn;
@@ -206,8 +281,18 @@ impl PaneWatch {
         })
     }
 
-    /// Record that the nudge text went in at `now`.
-    pub fn note_nudged(&mut self, now: Instant) {
+    /// Record that the nudge text went in at `now`, on turn `turn`.
+    pub fn note_nudged(&mut self, now: Instant, turn: Option<u64>) {
+        self.consecutive += 1;
+        self.last_nudge = Some(now);
+        self.nudged_turn = turn;
+    }
+
+    /// Record that a nudge was refused or failed at `now`. A failed attempt
+    /// counts toward the cooldown and the consecutive cap, so a pane that
+    /// refuses every nudge is not retried (and logged) on every 5 s tick
+    /// forever.
+    pub fn note_failed(&mut self, now: Instant) {
         self.consecutive += 1;
         self.last_nudge = Some(now);
     }
@@ -230,7 +315,7 @@ mod tests {
     }
 
     fn pane_watch(agent: Agent) -> PaneWatch {
-        PaneWatch::new(config(), PathBuf::from("/work"), agent)
+        PaneWatch::new(config(), PathBuf::from("/work"), agent, "t1".to_string())
     }
 
     fn info(state: State, turn: Option<u64>) -> TerminalInfo {
@@ -399,7 +484,7 @@ mod tests {
             watch.observe(&done, Todo::NotConfigured, at(t0, 60)),
             WatchEvent::Nudge(_)
         ));
-        watch.note_nudged(at(t0, 60));
+        watch.note_nudged(at(t0, 60), Some(3));
         // Inside the 30 s cooldown: nothing, even though the pane is idle.
         assert_eq!(
             watch.observe(&done, Todo::NotConfigured, at(t0, 89)),
@@ -411,7 +496,7 @@ mod tests {
                 watch.observe(&done, Todo::NotConfigured, at(t0, at_secs)),
                 WatchEvent::Nudge(_)
             ));
-            watch.note_nudged(at(t0, at_secs));
+            watch.note_nudged(at(t0, at_secs), Some(3));
         }
         // The cap is 3: the next due observation gives up, once.
         assert_eq!(
@@ -435,13 +520,16 @@ mod tests {
                 watch.observe(&done, Todo::NotConfigured, at(t0, at_secs)),
                 WatchEvent::Nudge(_)
             ));
-            watch.note_nudged(at(t0, at_secs));
+            watch.note_nudged(at(t0, at_secs), Some(3));
         }
         assert_eq!(
             watch.observe(&done, Todo::NotConfigured, at(t0, 150)),
             WatchEvent::GaveUp
         );
-        // The agent picks the work up: working, then done at the next turn.
+        // The agent picks the work up on its own and runs past the turn a
+        // nudge could have caused: a jump from turn 3 to turn 5 is not the
+        // single step a nudge on turn 3 would produce, so it is progress
+        // and clears both the count and the give-up.
         assert_eq!(
             watch.observe(
                 &info(State::Working, Some(3)),
@@ -450,7 +538,7 @@ mod tests {
             ),
             WatchEvent::None
         );
-        let next = info(State::Done, Some(4));
+        let next = info(State::Done, Some(5));
         assert_eq!(
             watch.observe(&next, Todo::NotConfigured, at(t0, 300)),
             WatchEvent::None
@@ -459,6 +547,111 @@ mod tests {
             watch.observe(&next, Todo::NotConfigured, at(t0, 360)),
             WatchEvent::Nudge(NudgeReason::NoTodoFile)
         );
+    }
+
+    #[test]
+    fn nudge_caused_turns_do_not_reset_the_cap() {
+        // The loop the cap exists to stop: the agent answers every nudge
+        // with a turn that finishes immediately, and each such turn is the
+        // nudge's own turn + 1. The count must keep climbing to the cap.
+        let t0 = Instant::now();
+        let mut watch = pane_watch(Agent::Kiro);
+        let mut turn = 3u64;
+        let mut at_secs = 0u64;
+        // First sighting starts the idle clock.
+        assert_eq!(
+            watch.observe(&info(State::Done, Some(turn)), Todo::NotConfigured, t0),
+            WatchEvent::None
+        );
+        for _ in 0..3 {
+            at_secs += 60;
+            let done = info(State::Done, Some(turn));
+            assert!(
+                matches!(
+                    watch.observe(&done, Todo::NotConfigured, at(t0, at_secs)),
+                    WatchEvent::Nudge(_)
+                ),
+                "turn {turn}"
+            );
+            watch.note_nudged(at(t0, at_secs), Some(turn));
+            // The agent answers the nudge: exactly one new finished turn.
+            turn += 1;
+            at_secs += 1;
+            assert_eq!(
+                watch.observe(
+                    &info(State::Done, Some(turn)),
+                    Todo::NotConfigured,
+                    at(t0, at_secs)
+                ),
+                WatchEvent::None
+            );
+        }
+        // Three nudges in, the next due observation gives up even though
+        // the turn counter advanced after every nudge.
+        at_secs += 60;
+        assert_eq!(
+            watch.observe(
+                &info(State::Done, Some(turn)),
+                Todo::NotConfigured,
+                at(t0, at_secs)
+            ),
+            WatchEvent::GaveUp
+        );
+    }
+
+    #[test]
+    fn read_todo_refuses_a_fifo_a_symlink_and_an_oversized_file() {
+        let dir = TempDir::new("watchdog-todo-guards");
+        // A FIFO would block a plain read forever; it is not a regular
+        // file, so it is unreadable without reading.
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("fifo.md");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo");
+            assert!(made.success());
+            assert_eq!(read_todo(&fifo), Todo::Unreadable);
+            // A symlink is refused even when its target is a normal todo
+            // file inside the same directory.
+            let target = dir.path().join("real.md");
+            std::fs::write(&target, "- [ ] left\n").unwrap();
+            let link = dir.path().join("link.md");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert_eq!(read_todo(&link), Todo::Unreadable);
+        }
+        // Over the read limit: unreadable, even with an unchecked item.
+        let big = dir.path().join("big.md");
+        let mut text = "- [ ] left\n".to_string();
+        text.push_str(&"x".repeat(MAX_TODO_BYTES as usize));
+        std::fs::write(&big, text).unwrap();
+        assert_eq!(read_todo(&big), Todo::Unreadable);
+    }
+
+    #[test]
+    fn a_zero_cooldown_allows_the_next_nudge_at_the_next_observation() {
+        let t0 = Instant::now();
+        let mut watch = PaneWatch::new(
+            WatchdogConfig {
+                cooldown: Duration::ZERO,
+                ..config()
+            },
+            PathBuf::from("/work"),
+            Agent::Kiro,
+            "t1".to_string(),
+        );
+        let done = info(State::Done, Some(3));
+        watch.observe(&done, Todo::NotConfigured, t0);
+        assert!(matches!(
+            watch.observe(&done, Todo::NotConfigured, at(t0, 60)),
+            WatchEvent::Nudge(_)
+        ));
+        watch.note_nudged(at(t0, 60), Some(3));
+        assert!(matches!(
+            watch.observe(&done, Todo::NotConfigured, at(t0, 61)),
+            WatchEvent::Nudge(_)
+        ));
     }
 
     #[test]
