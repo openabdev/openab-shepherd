@@ -1,0 +1,7 @@
+# Rust toolchain used by CI, the build host and the Docker build stage.
+# Bump it deliberately, together with the `FROM rust:<version>-bookworm` line in the
+# Dockerfile. CI fails if the two differ.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

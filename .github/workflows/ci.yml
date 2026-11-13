@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --no-fail-fast
+
+  docker-build:
+    name: docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Dockerfile Rust version matches rust-toolchain.toml
+        run: |
+          want=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          got=$(sed -n 's/^FROM rust:\([^ -]*\)-bookworm AS builder$/\1/p' Dockerfile)
+          echo "rust-toolchain.toml: ${want:-<none>}  Dockerfile: ${got:-<none>}"
+          test -n "$want" && test "$want" = "$got"
+      - name: Build image (no push)
+        run: docker build --tag openab-shepherd:ci .
+      - name: Binary prints usage
+        run: docker run --rm openab-shepherd:ci openab-shepherd --help
