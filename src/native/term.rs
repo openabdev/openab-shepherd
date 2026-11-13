@@ -6,6 +6,7 @@
 
 use super::keys::KeyboardMode;
 use super::status::{self, Report};
+use crate::backend::{Color, StyledCell, StyledScreen};
 use std::num::NonZeroU16;
 use std::time::{Duration, Instant};
 
@@ -250,6 +251,33 @@ impl Emulator {
         join_rows(visible_rows(self.parser.screen()))
     }
 
+    /// The visible screen with each cell's colours and reverse attribute,
+    /// from the same cells `screen_text` reads.
+    pub(crate) fn styled_screen(&self) -> StyledScreen {
+        let screen = self.parser.screen();
+        let rows = (0..ROWS)
+            .map(|row| {
+                (0..COLS)
+                    .map(|col| match screen.cell(row, col) {
+                        Some(cell) => StyledCell {
+                            text: cell.contents().to_string(),
+                            fg: color(cell.fgcolor()),
+                            bg: color(cell.bgcolor()),
+                            reverse: cell.inverse(),
+                        },
+                        None => StyledCell {
+                            text: String::new(),
+                            fg: Color::Default,
+                            bg: Color::Default,
+                            reverse: false,
+                        },
+                    })
+                    .collect()
+            })
+            .collect();
+        StyledScreen { rows }
+    }
+
     /// The last `lines` scrollback rows (as many as there are) followed by the
     /// screen. `complete` is false when more was asked for than is kept and
     /// rows have been dropped. The scrollback offset is back at 0 on return.
@@ -268,6 +296,14 @@ impl Emulator {
         rows.extend(visible_rows(screen));
         let complete = !(lines > len && self.parser.callbacks().evicted > 0);
         (join_rows(rows), complete)
+    }
+}
+
+fn color(c: vt100::Color) -> Color {
+    match c {
+        vt100::Color::Default => Color::Default,
+        vt100::Color::Idx(i) => Color::Idx(i),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
 }
 
@@ -592,6 +628,28 @@ mod tests {
         assert!(emu.sync_open(Instant::now()));
         emu.process(b"\x1b[?2026;25l");
         assert!(!emu.sync_open(Instant::now()));
+    }
+
+    #[test]
+    fn styled_screen_carries_truecolor_palette_and_reverse() {
+        let mut emu = Emulator::new();
+        emu.process(
+            b"\x1b[38;2;10;10;10m\x1b[48;2;250;178;131mAllow\x1b[0m \x1b[48;5;250mB\x1b[0m\x1b[7mR\x1b[0m",
+        );
+        let styled = emu.styled_screen();
+        let row = &styled.rows[0];
+        assert_eq!(row.len(), usize::from(COLS));
+        assert_eq!(styled.rows.len(), usize::from(ROWS));
+        assert_eq!(row[0].text, "A");
+        assert_eq!(row[0].fg, Color::Rgb(10, 10, 10));
+        assert_eq!(row[0].bg, Color::Rgb(0xfa, 0xb2, 0x83));
+        assert!(!row[0].reverse);
+        assert_eq!(row[5].bg, Color::Default);
+        assert_eq!(row[6].bg, Color::Idx(250));
+        assert!(row[7].reverse);
+        assert_eq!(row[7].bg, Color::Default);
+        // The text of the styled screen is the plain screen text.
+        assert_eq!(styled.text(), emu.screen_text());
     }
 
     #[test]

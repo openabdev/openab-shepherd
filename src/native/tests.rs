@@ -889,6 +889,46 @@ fn a_refused_multi_key_call_writes_no_key() {
     assert!(b.raw_output(&cat.reference()).unwrap().is_empty());
 }
 
+/// The screen check runs in the same step as the write: a refusal writes
+/// nothing, an acceptance writes the key, and the check sees the live cells.
+#[test]
+fn keys_if_screen_checks_the_cells_then_writes() {
+    let dir = TempDir::new("native-keys-if-screen");
+    let b = backend();
+    let cat = b.run(&spec_argv("cat", &["cat"], &dir)).unwrap();
+    let t = cat.reference();
+    let guard = InputGuard::default();
+
+    let err = b
+        .keys_if_screen(&t, &[Key::Enter], &guard, &|_| Err("no".to_string()))
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::ScreenRefused);
+    assert_eq!(err.detail, "no");
+    let bad_guard = InputGuard {
+        expect_turn: Some(99),
+        ..InputGuard::default()
+    };
+    let err = b
+        .keys_if_screen(&t, &[Key::Enter], &bad_guard, &|_| Ok(()))
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::StatusMismatch);
+    thread::sleep(Duration::from_millis(300));
+    assert!(b.raw_output(&t).unwrap().is_empty());
+
+    let seen = std::sync::Mutex::new(None);
+    b.keys_if_screen(&t, &[Key::Enter], &guard, &|screen| {
+        *seen.lock().unwrap() = Some(screen.rows.len());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(*seen.lock().unwrap(), Some(usize::from(term::ROWS)));
+    let end = Instant::now() + LONG;
+    while b.raw_output(&t).unwrap().is_empty() && Instant::now() < end {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!b.raw_output(&t).unwrap().is_empty());
+}
+
 // (i)
 #[test]
 fn bounds_and_spawn_errors() {

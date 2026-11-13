@@ -70,6 +70,9 @@ pub struct FakeState {
     pub screen: Option<String>,
     /// Keys passed to `keys`, one entry per call.
     pub keys: Vec<Vec<Key>>,
+    /// What `keys_if_screen` shows its check. `None` makes it unsupported,
+    /// as for a backend that cannot read cell colours.
+    pub styled: Option<crate::backend::StyledScreen>,
     /// Each `keys` call replaces `screen` with the next of these, when any
     /// are left: the screen the program draws after the key.
     pub next_screens: std::collections::VecDeque<String>,
@@ -300,6 +303,45 @@ impl TerminalBackend for FakeBackend {
         if let Some(next) = state.next_screens.pop_front() {
             state.screen = Some(next);
         }
+        Ok(KeysResult {
+            status: pane.status.map(|s| s.state),
+            turn: pane.turn,
+        })
+    }
+
+    fn keys_if_screen(
+        &self,
+        t: &TerminalRef,
+        keys: &[Key],
+        guard: &InputGuard,
+        check: crate::backend::ScreenCheck<'_>,
+    ) -> Result<KeysResult, BackendError> {
+        let Some(styled) = self.state.lock().unwrap().styled.clone() else {
+            return self.unsupported("keys_if_screen");
+        };
+        self.record("keys_if_screen");
+        let pane = self.find(t)?;
+        if self.caps.conditional_keys {
+            let state = pane.status.as_ref().map(|s| &s.state);
+            let kind = pane.status.as_ref().and_then(|s| s.kind.as_deref());
+            let holds = guard
+                .if_state
+                .as_ref()
+                .is_none_or(|want| state == Some(want))
+                && guard
+                    .if_kind
+                    .as_deref()
+                    .is_none_or(|want| kind == Some(want))
+                && guard.expect_turn.is_none_or(|want| pane.turn == Some(want));
+            if !holds {
+                return Err(BackendError::new(
+                    ErrorKind::StatusMismatch,
+                    "fake: key guard did not hold",
+                ));
+            }
+        }
+        check(&styled).map_err(|reason| BackendError::new(ErrorKind::ScreenRefused, reason))?;
+        self.state.lock().unwrap().keys.push(keys.to_vec());
         Ok(KeysResult {
             status: pane.status.map(|s| s.state),
             turn: pane.turn,

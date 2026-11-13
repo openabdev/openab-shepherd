@@ -23,9 +23,9 @@ pub use status::LogEntry as StatusLogEntry;
 
 use crate::backend::{
     dialog_kind, BackendError, Capabilities, ErrorKind, InputGuard, InterruptOutcome,
-    InterruptResult, Key, KeysResult, ReadLimit, ReadSource, RemoveResult, RunSpec, ScreenText,
-    SendResult, State, StopHow, TerminalBackend, TerminalInfo, TerminalList, TerminalRef,
-    WaitReason, WaitResult,
+    InterruptResult, Key, KeysResult, ReadLimit, ReadSource, RemoveResult, RunSpec, ScreenCheck,
+    ScreenText, SendResult, State, StopHow, TerminalBackend, TerminalInfo, TerminalList,
+    TerminalRef, WaitReason, WaitResult,
 };
 use crate::input::MAX_INPUT_BYTES;
 use keys::encode as encode_key;
@@ -1318,6 +1318,47 @@ impl TerminalBackend for NativeBackend {
         // key was written.
         if !keys.is_empty() {
             pane.write_guarded(Some(guard), |st| {
+                let mode = st.emu.mode();
+                let mut bytes = Vec::new();
+                for key in keys {
+                    bytes.extend_from_slice(encode_key(key, mode)?);
+                }
+                Ok(bytes)
+            })?;
+        }
+        let st = pane.lock_state()?;
+        Ok(KeysResult {
+            status: st.tracker.state().cloned(),
+            turn: Some(st.tracker.turn()),
+        })
+    }
+
+    /// The status guard, the screen check and the write are one critical
+    /// section on the pane state, so the check sees the cells the key meets.
+    /// A synchronized update still open means the screen is mid-redraw: refuse.
+    fn keys_if_screen(
+        &self,
+        t: &TerminalRef,
+        keys: &[Key],
+        guard: &InputGuard,
+        check: ScreenCheck<'_>,
+    ) -> Result<KeysResult, BackendError> {
+        for key in keys {
+            encode_key(key, KeyboardMode::default())?;
+        }
+        let pane = self.inner.resolve(t)?;
+        let _input = pane.lock_input()?;
+        pane.flush_replies();
+        if !keys.is_empty() {
+            pane.write_guarded(Some(guard), |st| {
+                if st.emu.sync_open(Instant::now()) {
+                    return Err(BackendError::new(
+                        ErrorKind::ScreenRefused,
+                        "the screen is in the middle of a synchronized update",
+                    ));
+                }
+                check(&st.emu.styled_screen())
+                    .map_err(|reason| BackendError::new(ErrorKind::ScreenRefused, reason))?;
                 let mode = st.emu.mode();
                 let mut bytes = Vec::new();
                 for key in keys {

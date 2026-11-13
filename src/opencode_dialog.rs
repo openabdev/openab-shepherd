@@ -14,10 +14,12 @@
 //! ```
 //!
 //! The highlighted option is drawn with a background colour (selected `fab283`),
-//! not with reverse video or a glyph, so it is not in the screen text. Shepherd's
-//! screen read returns plain text, which means this module can establish that the
-//! dialog is the expected one but never which option is highlighted. See
-//! [`highlight_unverifiable`]. Anything that does not match is refused.
+//! not with reverse video or a glyph, so it is not in the screen text. The
+//! styled screen carries it: [`verify_selected`] parses the text and then
+//! requires exactly one of the three labels to be drawn with that background,
+//! and that label to be `Allow once`. Anything that does not match is refused.
+
+use crate::backend::{row_text, Color, StyledCell, StyledScreen};
 
 pub const HEADING: &str = "△ Permission required";
 pub const SHELL_PREFIX: &str = "$ ";
@@ -49,11 +51,102 @@ pub struct OpenCodeDialog {
     pub options: Vec<String>,
 }
 
-/// The refusal for `allow_once`: the text read from the pane carries no colour.
-pub fn highlight_unverifiable() -> String {
+/// The background of the selected option, measured (OpenCode v2.2.7).
+pub const SELECTED_BG: Color = Color::Rgb(0xfa, 0xb2, 0x83);
+
+/// The refusal for `allow_once` on a backend that cannot read cell colours.
+pub fn colours_unavailable() -> String {
     format!(
-        "the highlighted option cannot be verified: OpenCode draws the highlight with a background colour, and Shepherd's screen read returns text without colours, so it cannot establish that {OPTION_ALLOW_ONCE:?} is the highlighted option"
+        "the highlighted option cannot be verified: this terminal backend cannot read cell colours, and OpenCode draws the highlight with a background colour, so it cannot establish that {OPTION_ALLOW_ONCE:?} is the highlighted option"
     )
+}
+
+/// How much of one label is drawn with the selected background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drawn {
+    All,
+    None,
+    Part,
+}
+
+/// Parse the dialog from the styled screen's text, then require that exactly
+/// one label is drawn with [`SELECTED_BG`] and that it is `Allow once`. A
+/// cell with reverse video does not count as selected.
+pub fn verify_selected(screen: &StyledScreen) -> Result<OpenCodeDialog, String> {
+    let dialog = parse(&screen.text())?;
+    let rows: Vec<&Vec<StyledCell>> = screen
+        .rows
+        .iter()
+        .filter(|row| content(&row_text(row)).starts_with(OPTION_ALLOW_ONCE))
+        .collect();
+    let &[row] = rows.as_slice() else {
+        return Err(format!(
+            "expected one option row in the styled screen, found {}",
+            rows.len()
+        ));
+    };
+    // One entry per character, with the column of the cell that holds it.
+    let mut chars: Vec<(char, usize)> = Vec::new();
+    for (column, cell) in row.iter().enumerate() {
+        if cell.text.is_empty() {
+            chars.push((' ', column));
+        } else {
+            chars.extend(cell.text.chars().map(|c| (c, column)));
+        }
+    }
+    let mut at = chars
+        .iter()
+        .position(|(c, _)| !(c.is_whitespace() || *c == BAR))
+        .unwrap_or(chars.len());
+    let mut drawn = Vec::with_capacity(3);
+    for label in [OPTION_ALLOW_ONCE, OPTION_ALWAYS, OPTION_REJECT] {
+        let span = chars
+            .get(at..at + label.chars().count())
+            .filter(|span| span.iter().map(|(c, _)| *c).eq(label.chars()));
+        let Some(span) = span else {
+            return Err(format!("{label:?} is not where the text puts it"));
+        };
+        let lit: Vec<bool> = span
+            .iter()
+            .filter(|(c, _)| !c.is_whitespace())
+            .map(|(_, column)| {
+                let cell = &row[*column];
+                cell.bg == SELECTED_BG && !cell.reverse
+            })
+            .collect();
+        drawn.push(if lit.iter().all(|on| *on) {
+            Drawn::All
+        } else if lit.iter().any(|on| *on) {
+            Drawn::Part
+        } else {
+            Drawn::None
+        });
+        at += label.chars().count();
+        while chars.get(at).is_some_and(|(c, _)| c.is_whitespace()) {
+            at += 1;
+        }
+    }
+    let labels = [OPTION_ALLOW_ONCE, OPTION_ALWAYS, OPTION_REJECT];
+    if drawn.contains(&Drawn::Part) {
+        return Err("an option is only partly drawn with the selected background".to_string());
+    }
+    let selected: Vec<&str> = labels
+        .iter()
+        .zip(&drawn)
+        .filter(|(_, d)| **d == Drawn::All)
+        .map(|(label, _)| *label)
+        .collect();
+    match selected.as_slice() {
+        [] => Err("no option is drawn with the selected background".to_string()),
+        [only] if *only == OPTION_ALLOW_ONCE => Ok(dialog),
+        [only] => Err(format!(
+            "the highlighted option is {only:?}, not {OPTION_ALLOW_ONCE:?}"
+        )),
+        many => Err(format!(
+            "{} options are drawn with the selected background: {many:?}",
+            many.len()
+        )),
+    }
 }
 
 /// Parse the one permission dialog on the screen.
@@ -160,6 +253,85 @@ fn parse_options(row: &str) -> Result<Vec<String>, String> {
 /// Screens built from the measured layout above.
 #[cfg(test)]
 pub mod fixtures {
+    use crate::backend::{Color, StyledCell, StyledScreen};
+
+    /// Measured colours: selected fg `0a0a0a` on bg `fab283`; unselected fg
+    /// `eeeeee` on bg `1e1e1e`.
+    pub const SELECTED: (Color, Color) =
+        (Color::Rgb(0x0a, 0x0a, 0x0a), Color::Rgb(0xfa, 0xb2, 0x83));
+    pub const UNSELECTED: (Color, Color) =
+        (Color::Rgb(0xee, 0xee, 0xee), Color::Rgb(0x1e, 0x1e, 0x1e));
+
+    /// The styled form of `text`: every cell default-coloured, except that the
+    /// characters of each label on the option row take the colours `paint`
+    /// gives that label (None leaves them default). A character that is
+    /// two columns wide is not used in the fixtures.
+    pub fn styled(
+        text: &str,
+        paint: impl Fn(&str) -> Option<((Color, Color), bool)>,
+    ) -> StyledScreen {
+        let rows = text
+            .lines()
+            .map(|line| {
+                let chars: Vec<char> = line.chars().collect();
+                let mut cells: Vec<StyledCell> = chars
+                    .iter()
+                    .map(|c| StyledCell {
+                        text: c.to_string(),
+                        fg: Color::Default,
+                        bg: Color::Default,
+                        reverse: false,
+                    })
+                    .collect();
+                if line.contains("Allow once") && line.contains("Reject") {
+                    for label in ["Allow once", "Always allow", "Reject"] {
+                        let start = find(&chars, label);
+                        if let Some(((fg, bg), reverse)) = paint(label) {
+                            for cell in &mut cells[start..start + label.chars().count()] {
+                                cell.fg = fg;
+                                cell.bg = bg;
+                                cell.reverse = reverse;
+                            }
+                        }
+                    }
+                }
+                cells.resize(
+                    200,
+                    StyledCell {
+                        text: String::new(),
+                        fg: Color::Default,
+                        bg: Color::Default,
+                        reverse: false,
+                    },
+                );
+                cells
+            })
+            .collect();
+        StyledScreen { rows }
+    }
+
+    fn find(hay: &[char], label: &str) -> usize {
+        let needle: Vec<char> = label.chars().collect();
+        (0..hay.len())
+            .find(|i| hay[*i..].starts_with(&needle))
+            .expect("label on the row")
+    }
+
+    /// The measured styled dialog with `selected` drawn as the highlight and
+    /// the other labels as unselected.
+    pub fn styled_with_selected(text: &str, selected: &str) -> StyledScreen {
+        styled(text, |label| {
+            Some((
+                if label == selected {
+                    SELECTED
+                } else {
+                    UNSELECTED
+                },
+                false,
+            ))
+        })
+    }
+
     const OPTIONS: &str =
         "  ┃   Allow once   Always allow   Reject  ctrl+f fullscreen  ⇆ select  enter confirm\n";
 
@@ -183,7 +355,9 @@ pub mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{edit_dialog, shell_dialog};
+    use super::fixtures::{
+        edit_dialog, shell_dialog, styled, styled_with_selected, SELECTED, UNSELECTED,
+    };
     use super::*;
 
     #[test]
@@ -275,8 +449,132 @@ mod tests {
         assert!(parse("  ┃  △ Permission required\n").is_err());
     }
 
+    fn selected(text: &str, label: &str) -> StyledScreen {
+        styled_with_selected(text, label)
+    }
+
     #[test]
-    fn the_highlight_is_never_verified_from_text() {
-        assert!(highlight_unverifiable().contains("cannot be verified"));
+    fn the_measured_highlight_on_allow_once_is_verified() {
+        for text in [shell_dialog(), edit_dialog()] {
+            let dialog = verify_selected(&selected(&text, "Allow once")).unwrap();
+            assert_eq!(dialog, parse(&text).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_highlight_on_another_option_is_refused() {
+        for label in ["Always allow", "Reject"] {
+            let err = verify_selected(&selected(&shell_dialog(), label)).unwrap_err();
+            assert!(err.contains(label), "{err}");
+        }
+    }
+
+    #[test]
+    fn two_highlighted_options_are_refused() {
+        let screen = styled(&shell_dialog(), |label| {
+            Some((
+                if label == "Reject" {
+                    UNSELECTED
+                } else {
+                    SELECTED
+                },
+                false,
+            ))
+        });
+        let err = verify_selected(&screen).unwrap_err();
+        assert!(err.contains("2 options"), "{err}");
+    }
+
+    #[test]
+    fn no_highlight_is_refused() {
+        let all_plain = styled(&shell_dialog(), |_| Some((UNSELECTED, false)));
+        assert!(verify_selected(&all_plain)
+            .unwrap_err()
+            .contains("no option"));
+        let no_colours = styled(&shell_dialog(), |_| None);
+        assert!(verify_selected(&no_colours).is_err());
+    }
+
+    #[test]
+    fn reverse_video_alone_is_not_a_highlight() {
+        let screen = styled(&shell_dialog(), |label| {
+            Some((UNSELECTED, label == "Allow once"))
+        });
+        assert!(verify_selected(&screen).unwrap_err().contains("no option"));
+        // The selected background with reverse set shows inverted: not selected.
+        let inverted = styled(&shell_dialog(), |label| {
+            Some((
+                if label == "Allow once" {
+                    SELECTED
+                } else {
+                    UNSELECTED
+                },
+                label == "Allow once",
+            ))
+        });
+        assert!(verify_selected(&inverted).is_err());
+    }
+
+    #[test]
+    fn a_different_colour_is_not_the_highlight() {
+        let other = Color::Rgb(0xfa, 0xb2, 0x84);
+        let screen = styled(&shell_dialog(), |label| {
+            Some((
+                if label == "Allow once" {
+                    (SELECTED.0, other)
+                } else {
+                    UNSELECTED
+                },
+                false,
+            ))
+        });
+        assert!(verify_selected(&screen).is_err());
+        // A palette index is never the truecolor value.
+        let idx = styled(&shell_dialog(), |label| {
+            Some((
+                if label == "Allow once" {
+                    (SELECTED.0, Color::Idx(0xfa))
+                } else {
+                    UNSELECTED
+                },
+                false,
+            ))
+        });
+        assert!(verify_selected(&idx).unwrap_err().contains("no option"));
+        let default_bg = styled(&shell_dialog(), |label| {
+            Some((
+                if label == "Allow once" {
+                    (SELECTED.0, Color::Default)
+                } else {
+                    UNSELECTED
+                },
+                false,
+            ))
+        });
+        assert!(verify_selected(&default_bg).is_err());
+    }
+
+    #[test]
+    fn a_partly_drawn_label_is_refused() {
+        let mut screen = selected(&shell_dialog(), "Allow once");
+        let row = screen
+            .rows
+            .iter_mut()
+            .find(|row| crate::backend::row_text(row).contains("Allow once"))
+            .unwrap();
+        let at = row.iter().position(|c| c.text == "A").unwrap();
+        row[at + 9].bg = UNSELECTED.1; // the final "e"
+        assert!(verify_selected(&screen).unwrap_err().contains("partly"));
+    }
+
+    #[test]
+    fn the_text_checks_still_apply_to_the_styled_screen() {
+        let wrong =
+            shell_dialog().replace("Allow once   Always allow", "Always allow   Allow once");
+        assert!(verify_selected(&selected_any(&wrong)).is_err());
+    }
+
+    fn selected_any(text: &str) -> StyledScreen {
+        styled(text, |_| None)
     }
 }
