@@ -1,6 +1,6 @@
 # ADR: Native terminal core (NativeBackend)
 
-- **Status:** Accepted
+- **Status:** Accepted. Update: the herdr-core (hc) backend was later removed and native is the only backend; the text below is the 2026-11-10 record, and its hc-related selection rules (`OPENAB_SHEPHERD_BACKEND=native|hc`, `HC_SOCKET`) no longer apply. Today `OPENAB_SHEPHERD_BACKEND` accepts only unset, empty or `native`, and anything else exits 2.
 - **Date:** 2026-11-10
 - **Author:** chaodu-agent
 - **Based on:** the `TerminalBackend` trait in `src/backend.rs` as first read on branch `feat/backend-trait` at `9022867b70160a9dce89d2a4906a5ceb6fbb4205`. That PR merged as #5; the implementation targets `main` at `091aac3`. The differences between the two are listed in §13, "Reconciliation with the merged trait".

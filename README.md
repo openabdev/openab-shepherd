@@ -34,8 +34,9 @@ which answers a permission dialog may receive.
 - **Native terminal core.** The default backend runs each pane on its own PTY with a
   `vt100` emulator, a cleared child environment and at most 8 live panes. Programs
   report their state (`idle`, `working`, `done`, `blocked`, ...) with OSC 7501
-  escape sequences, which Shepherd parses into a status and a turn counter. An
-  optional backend drives panes through herdr-core instead.
+  escape sequences, which Shepherd parses into a status and a turn counter. It is
+  the only backend. `OPENAB_SHEPHERD_BACKEND` accepts only unset, empty or `native`;
+  any other value exits with status 2.
 - **Process-tree cleanup.** `remove_pane`, a program's own exit and Shepherd's
   shutdown signal the pane's process group and every descendant Shepherd has seen,
   then kill what is left. Descendants are found by looking at the process table
@@ -136,8 +137,8 @@ observations are not yet attached to issue 2.
   `allow_arbitrary_command`.
   This check prevents accidental auto-approve configuration. It matches by name (case-insensitive substring `opencode`) and does not defend against a deliberately renamed binary, a wrapper script, or the `allow_arbitrary_command` path.
 - At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. This report was
-  observed on the laptop. The output filter removes it. Whether herdr-core turns it into a
-  `get_status` result is not yet verified. It is an open point pending a live check.
+  observed on the laptop. The output filter removes it. Whether the native backend turns it
+  into a `get_status` result is not yet verified. It is an open point pending a live check.
 - OpenCode has a dialect slot but no measured permission dialog. `answer_dialog` refuses an
   OpenCode pane before it reads the screen, and sends no keys. A launch profile may name
   `agent: "opencode"`, but only with `permission_mode` `normal`: no OpenCode mode was measured,
@@ -147,7 +148,7 @@ observations are not yet attached to issue 2.
 
 ## Status and known limits
 
-Shepherd is an MVP (version 0.2.0, 264 unit tests: lib 261, bin 3). The native backend was verified against
+Shepherd is an MVP (version 0.2.0). The native backend was verified against
 kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 [MVP-REPORT.md](MVP-REPORT.md) (a dated record, not a current status), and the native core's design is in
 [docs/adr/native-core.md](docs/adr/native-core.md).
@@ -166,7 +167,7 @@ kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 - **Panes do not survive a server restart.** Native panes are children of Shepherd
   and end with it.
 
-The full list, including the hc-only race on Enter and the output filter's limits,
+The full list, including the output filter's limits,
 is in [docs/operations.md](docs/operations.md#known-limits-mvp-scope).
 
 ## License
