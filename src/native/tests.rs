@@ -632,7 +632,9 @@ fn check_non_cloexec_descriptors_do_not_leak() {
         assert!(fd >= 200);
         guard.0.push(fd);
     }
-    let own: Vec<u32> = guard.0.iter().map(|&fd| fd as u32).collect();
+    // The duplicates (numbers >= 200) are the ones that must not leak; the
+    // base descriptor is low and may share a number with the lister's own.
+    let own: Vec<u32> = guard.0[1..].iter().map(|&fd| fd as u32).collect();
     let dir = TempDir::new("native-fds-leak");
     let argv = vec![
         "/bin/sh".to_owned(),
@@ -645,12 +647,12 @@ fn check_non_cloexec_descriptors_do_not_leak() {
         let _lock = pty::SPAWN_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for &fd in &guard.0 {
+        for &fd in &guard.0[1..] {
             // SAFETY: clears FD_CLOEXEC on this test's descriptors.
             assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
         }
         let result = pty::spawn_locked(&argv, dir.path(), &env);
-        for &fd in &guard.0 {
+        for &fd in &guard.0[1..] {
             // SAFETY: restores FD_CLOEXEC before the lock is released.
             assert_eq!(
                 unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
