@@ -83,7 +83,7 @@ Technology stack (locked once this ADR is approved): Rust 2021, std threads and 
    - Any failure returns `Err(io::Error::last_os_error())`, and the spawn then fails.
 5. Spawn, drop the parent's slave copies, release `SPAWN_LOCK`.
 
-Every other descriptor Shepherd opens comes from std, which sets `O_CLOEXEC`, so no descriptor closing loop runs in the child. An integration test checks this (§14).
+Every other descriptor Shepherd opens comes from std, which sets `O_CLOEXEC`. Shepherd can also inherit descriptors from its own parent (a shell started with extra open files, a supervisor) that are not close-on-exec, and those would reach the pane. So, under `SPAWN_LOCK`, the parent lists its open descriptors above 2 (`/proc/self/fd`, or `/dev/fd` on macOS) and the `pre_exec` child marks each of them `FD_CLOEXEC` (`cloexec_above_stdio` in `pty.rs`). It marks instead of closing, because std keeps a close-on-exec pipe open during `pre_exec` to report a failed `exec`. On Linux 5.11 or later `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` is tried first. The child only calls `fcntl` and the syscall, with no allocation, `sysconf` or `getrlimit`. If the listing fails, the parent falls back to a scan up to the hard `RLIMIT_NOFILE`, and fails the spawn when that range cannot be scanned. A failed `F_SETFD` also fails the spawn. Residual: a descriptor opened without close-on-exec by another thread between the listing and the fork is not covered. An integration test checks this (§14).
 
 **Failures.**
 
