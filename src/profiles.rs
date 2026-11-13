@@ -739,6 +739,56 @@ fn watchdog_count(
     }
 }
 
+/// Whether `text` is a bare answer to a prompt rather than an instruction:
+/// a single character (`y`, `n`, `1`, `a`), a word the supported agents'
+/// dialogs and common confirmations take as an answer (`yes`, `ok`, `enter`,
+/// `allow`, `always`, `deny`, `reject`, `bypass`, `trust`, ...), or a short
+/// number. Compared after trimming, lowercasing and dropping trailing
+/// punctuation. The nudge goes through the state/turn guard, so this is a
+/// second line of defence against an operator mistake, not the only one.
+fn is_bare_confirmation(text: &str) -> bool {
+    const ANSWERS: &[&str] = &[
+        "yes",
+        "no",
+        "ok",
+        "okay",
+        "yep",
+        "sure",
+        "enter",
+        "return",
+        "confirm",
+        "accept",
+        "approve",
+        "proceed",
+        "true",
+        "false",
+        "allow",
+        "allow once",
+        "always",
+        "always allow",
+        "deny",
+        "deny once",
+        "reject",
+        "bypass",
+        "bypass mode",
+        "trust",
+        "once",
+        "cancel",
+        "esc",
+        "escape",
+        "tab",
+        "space",
+    ];
+    let word = text
+        .trim()
+        .trim_end_matches(|c: char| c.is_ascii_punctuation())
+        .trim()
+        .to_lowercase();
+    word.chars().count() <= 1
+        || ANSWERS.contains(&word.as_str())
+        || (word.len() <= 2 && word.chars().all(|c| c.is_ascii_digit()))
+}
+
 fn parse_watchdog(
     value: Option<&Value>,
     at: &str,
@@ -788,6 +838,11 @@ fn parse_watchdog(
         }
         Some(_) => return Err(err(format!("{at}: watchdog: nudge_text must be a string"))),
     };
+    if is_bare_confirmation(&nudge_text) {
+        return Err(err(format!(
+            "{at}: watchdog: nudge_text may not be a bare confirmation or menu answer such as y, yes, 1 or ok: a nudge that lands in a dialog Shepherd did not see would answer it. Use a sentence that tells the agent what to do"
+        )));
+    }
     if agent == Agent::Devin && nudge_text.trim().eq_ignore_ascii_case("/yolo") {
         return Err(err(format!(
             "{at}: watchdog: nudge_text may not be /yolo for devin: the Devin mode-switch rule refuses it at runtime, so the watchdog could never send it"
@@ -1570,5 +1625,71 @@ mod tests {
         let message = refused(&text);
         assert!(message.contains("watchdog"), "{message}");
         assert!(message.contains("/yolo"), "{message}");
+    }
+
+    #[test]
+    fn a_watchdog_nudge_text_may_not_be_a_bare_confirmation() {
+        let dir = TempDir::new("profiles-watchdog-bare-confirmation");
+        let with = |nudge: &str| {
+            json!({"profiles": [{"name": "kiro", "argv": ["kiro-cli", "chat"],
+                "cwds": [dir.path()],
+                "watchdog": {"idle_timeout_secs": 120, "nudge_text": nudge}}]})
+            .to_string()
+        };
+        for bad in [
+            "y",
+            "Y",
+            "n",
+            "1",
+            "2",
+            "12",
+            "a",
+            "t",
+            "yes",
+            "YES",
+            " yes ",
+            "Yes.",
+            "ok",
+            "OK!",
+            "okay",
+            "enter",
+            "Return",
+            "allow",
+            "Allow once",
+            "always",
+            "Always allow",
+            "deny",
+            "reject",
+            "Bypass mode",
+            "trust",
+            "confirm",
+            "",
+            "   ",
+            ".",
+            "/",
+        ] {
+            let message = refused(&with(bad));
+            assert!(message.contains("nudge_text"), "{bad:?}: {message}");
+        }
+        // Controls: an instruction, and a word that merely starts like an
+        // answer, still parse.
+        for good in [
+            "continue",
+            "keep going",
+            "yes, please continue with the todo list",
+            "check your todo file and continue",
+            "100",
+        ] {
+            let p = policy(&with(good));
+            assert_eq!(
+                p.profile("kiro")
+                    .unwrap()
+                    .watchdog
+                    .as_ref()
+                    .unwrap()
+                    .nudge_text,
+                good
+            );
+        }
     }
 }
