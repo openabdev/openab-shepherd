@@ -19,7 +19,7 @@ use crate::agent::{unmeasured, Agent, ParsedDialog};
 use crate::ansi::strip_terminal_escapes;
 use crate::backend::{
     dialog_kind, status_json, BackendError, ErrorKind, InputGuard, Key, KeysResult, RunSpec, State,
-    StopHow, TerminalBackend, TerminalInfo, TerminalRef, WaitReason, WaitResult,
+    StopHow, StyledScreen, TerminalBackend, TerminalInfo, TerminalRef, WaitReason, WaitResult,
 };
 use crate::devin_dialog;
 use crate::dialog::Choice;
@@ -308,7 +308,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "answer_dialog",
-            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (tested on kiro-cli 3.1.0 V3 shell permission dialogs) or devin (Devin CLI 3000.12.43 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses); opencode (OpenCode v2.2.7): deny_once sends Esc, which cancels like Reject, after the pane is blocked with kind permission and the screen shows the whole expected dialog; allow_once is refused with no keys sent because the highlighted option is a background colour that the screen text does not carry, and Always allow is never selected. A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
+            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (tested on kiro-cli 3.1.0 V3 shell permission dialogs) or devin (Devin CLI 3000.12.43 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses); opencode (OpenCode v2.2.7): deny_once sends Esc, which cancels like Reject, after the pane is blocked with kind permission and the screen shows the whole expected dialog; allow_once presses Enter only when the styled screen, read in the same step as the key, shows exactly one option drawn with the selected background and that option is Allow once (otherwise it is refused with no keys sent), and Always allow is never selected. A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -955,6 +955,9 @@ fn backend_failure(terminal: Option<&str>, err: BackendError) -> ToolError {
         ErrorKind::StatusMismatch => {
             format!("{pane} is not in the state the request required; nothing was sent")
         }
+        ErrorKind::ScreenRefused => {
+            format!("the screen check on {pane} refused the key; nothing was sent")
+        }
         ErrorKind::Finished => format!("{pane} has finished; its program is no longer running"),
         ErrorKind::Unsupported(op) => format!("the terminal backend does not support {op}"),
         ErrorKind::InvalidInput => "the terminal backend refused the request".to_string(),
@@ -1065,7 +1068,8 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     // Every key goes to this dialog in this turn. A backend with conditional
     // keys enforces it; for one without, the checks below do (non-atomically).
     // OpenCode's dialog has its own path: the highlight is a colour that the
-    // screen text does not carry (see opencode_dialog).
+    // screen text does not carry, so allow_once reads styled cells (see
+    // opencode_dialog).
     if agent == Agent::OpenCode {
         return answer_opencode(sh, &terminal, &pane, choice, turn, caps.conditional_keys);
     }
@@ -1267,10 +1271,10 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
 
 /// OpenCode (v2.2.7). `deny_once` sends Esc, which cancels exactly like Reject
 /// (measured), once the pane is blocked on a permission dialog in this turn and
-/// the screen shows the whole expected dialog. `allow_once` is refused with no key
-/// sent: Enter is safe only on the highlighted `Allow once`, and the highlight is
-/// a background colour that the screen text lacks. Right and Enter are never
-/// sent, so `Always allow` is never reachable.
+/// the screen shows the whole expected dialog. `allow_once` presses Enter only
+/// when the styled cells, read in the same step as the key, show `Allow once`
+/// as the one option drawn with the selected background; otherwise it refuses
+/// with no key sent. Right is never sent, so `Always allow` is never reachable.
 fn answer_opencode(
     sh: &Shepherd,
     terminal: &str,
@@ -1280,15 +1284,6 @@ fn answer_opencode(
     conditional_keys: bool,
 ) -> Result<Value, ToolError> {
     let sent: Vec<Vec<String>> = Vec::new();
-    if choice == Choice::AllowOnce {
-        return Err(refusal(
-            terminal,
-            choice,
-            opencode_dialog::highlight_unverifiable(),
-            json!({"turn": turn}),
-            &sent,
-        ));
-    }
     // Wait for the dialog text to render, checking between reads that the pane
     // is still blocked on a permission dialog in this turn.
     let mut screen = String::new();
@@ -1368,6 +1363,57 @@ fn answer_opencode(
         if_kind: Some("permission".to_string()),
         expect_turn: Some(turn),
     };
+    if choice == Choice::AllowOnce {
+        // The styled cells are read and Enter is pressed in one step inside
+        // the backend, after its status guard: the check and the key see the
+        // same cells. Any failure to verify sends nothing.
+        let check = |styled: &StyledScreen| -> Result<(), String> {
+            let now = opencode_dialog::verify_selected(styled)?;
+            if now != dialog {
+                return Err(format!(
+                    "the dialog changed since it was read: {:?} is now {:?}",
+                    dialog.subject, now.subject
+                ));
+            }
+            Ok(())
+        };
+        let result = match sh
+            .backend
+            .keys_if_screen(pane, &[Key::Enter], &guard, &check)
+        {
+            Ok(result) => result,
+            Err(err) => {
+                let reason = match &err.kind {
+                    ErrorKind::ScreenRefused => format!(
+                        "the highlighted option is not verified as {:?}: {}",
+                        opencode_dialog::OPTION_ALLOW_ONCE,
+                        err.detail
+                    ),
+                    ErrorKind::Unsupported(_) => opencode_dialog::colours_unavailable(),
+                    _ => return Err(backend_failure(Some(terminal), err)),
+                };
+                return Err(refusal(
+                    terminal,
+                    choice,
+                    reason,
+                    json!({"screen": tail(&screen)}),
+                    &sent,
+                ));
+            }
+        };
+        sh.mark_answered(terminal);
+        return Ok(json!({
+            "terminal": terminal,
+            "agent": Agent::OpenCode.as_str(),
+            "choice": choice.as_str(),
+            "selected": opencode_dialog::OPTION_ALLOW_ONCE,
+            "title": opencode_dialog::HEADING,
+            "command": dialog.subject,
+            "options": dialog.options,
+            "keys": [Key::Enter.as_str()],
+            "keys_result": result.to_json(),
+        }));
+    }
     let result = press(sh, pane, terminal, &[Key::Esc], &guard)?;
     sh.mark_answered(terminal);
     Ok(json!({
@@ -2206,13 +2252,130 @@ mod tests {
         }
     }
 
-    #[test]
-    fn opencode_allow_once_is_refused_because_the_highlight_cannot_be_verified() {
+    /// An OpenCode pane whose text screen is the shell dialog and whose
+    /// styled screen is `styled`.
+    fn opencode_styled_pane(styled: Option<StyledScreen>) -> FakeBackend {
         let fake = blocked_devin_pane(vec![opencode_shell()]);
+        fake.state.lock().unwrap().styled = styled;
+        fake
+    }
+
+    fn styled_selected(label: &str) -> StyledScreen {
+        crate::opencode_dialog::fixtures::styled_with_selected(&opencode_shell(), label)
+    }
+
+    #[test]
+    fn opencode_allow_once_presses_enter_when_the_styled_cells_show_allow_once_selected() {
+        for text in [
+            opencode_shell(),
+            crate::opencode_dialog::fixtures::edit_dialog(),
+        ] {
+            let fake = blocked_devin_pane(vec![text.clone()]);
+            fake.state.lock().unwrap().styled = Some(
+                crate::opencode_dialog::fixtures::styled_with_selected(&text, "Allow once"),
+            );
+            let out = opencode_answer(&fake, "allow_once").unwrap();
+            assert_eq!(out["agent"], "opencode");
+            assert_eq!(out["selected"], "Allow once");
+            assert_eq!(out["keys"], json!(["enter"]));
+            assert_eq!(key_names(&fake), [["enter"]]);
+            assert_eq!(
+                fake.calls(),
+                ["get", "get", "read", "get", "keys_if_screen"]
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_allow_once_never_puts_colours_in_the_result() {
+        let fake = opencode_styled_pane(Some(styled_selected("Allow once")));
+        let out = opencode_answer(&fake, "allow_once").unwrap();
+        let text = out.to_string().to_lowercase();
+        assert!(!text.contains("fab283") && !text.contains("rgb"), "{text}");
+    }
+
+    #[test]
+    fn opencode_allow_once_refuses_without_a_key_unless_allow_once_is_the_only_highlight() {
+        use crate::backend::Color;
+        use crate::opencode_dialog::fixtures::{
+            styled, styled_with_selected, SELECTED, UNSELECTED,
+        };
+        let other = Color::Rgb(0xfa, 0xb2, 0x84);
+        let shell = opencode_shell();
+        let cases: Vec<(&str, StyledScreen, &str)> = vec![
+            (
+                "wrong option",
+                styled_selected("Always allow"),
+                "Always allow",
+            ),
+            ("reject", styled_selected("Reject"), "Reject"),
+            (
+                "two",
+                styled(&shell, |l| {
+                    Some((if l == "Reject" { UNSELECTED } else { SELECTED }, false))
+                }),
+                "2 options",
+            ),
+            (
+                "none",
+                styled(&shell, |_| Some((UNSELECTED, false))),
+                "no option",
+            ),
+            (
+                "reverse only",
+                styled(&shell, |l| Some((UNSELECTED, l == "Allow once"))),
+                "no option",
+            ),
+            (
+                "other colour",
+                styled(&shell, |l| {
+                    Some((
+                        if l == "Allow once" {
+                            (SELECTED.0, other)
+                        } else {
+                            UNSELECTED
+                        },
+                        false,
+                    ))
+                }),
+                "no option",
+            ),
+            (
+                "palette index",
+                styled(&shell, |l| {
+                    Some((
+                        if l == "Allow once" {
+                            (SELECTED.0, Color::Idx(0xfa))
+                        } else {
+                            UNSELECTED
+                        },
+                        false,
+                    ))
+                }),
+                "no option",
+            ),
+            (
+                "text changed between the read and the key",
+                styled_with_selected(&shell.replace("marker", "marker2"), "Allow once"),
+                "changed since it was read",
+            ),
+        ];
+        for (name, styled, expect) in cases {
+            let fake = opencode_styled_pane(Some(styled));
+            let err = opencode_answer(&fake, "allow_once").unwrap_err();
+            assert_eq!(err.data["error"], "refused", "{name}");
+            assert!(err.text.contains(expect), "{name}: {}", err.text);
+            assert!(key_names(&fake).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn opencode_allow_once_refuses_when_colours_are_unavailable() {
+        let fake = opencode_styled_pane(None);
         let err = opencode_answer(&fake, "allow_once").unwrap_err();
         assert_eq!(err.data["error"], "refused");
         assert!(
-            err.text.contains("highlighted option cannot be verified"),
+            err.text.contains("cannot read cell colours"),
             "{}",
             err.text
         );
@@ -2254,17 +2417,17 @@ mod tests {
     }
 
     #[test]
-    fn opencode_never_sends_right_or_enter() {
+    fn opencode_sends_enter_only_for_a_verified_allow_once_and_never_right() {
         let fake = blocked_devin_pane(vec![opencode_shell()]);
         opencode_answer(&fake, "deny_once").unwrap();
-        let fake2 = blocked_devin_pane(vec![opencode_shell()]);
-        opencode_answer(&fake2, "allow_once").unwrap_err();
-        for fake in [&fake, &fake2] {
-            assert!(key_names(fake)
-                .iter()
-                .flatten()
-                .all(|key| !matches!(*key, "enter" | "right" | "left" | "tab")));
-        }
+        assert!(key_names(&fake)
+            .iter()
+            .flatten()
+            .all(|key| !matches!(*key, "enter" | "right" | "left" | "tab")));
+        // allow_once sends Enter and nothing else: never Right.
+        let fake2 = opencode_styled_pane(Some(styled_selected("Allow once")));
+        opencode_answer(&fake2, "allow_once").unwrap();
+        assert_eq!(key_names(&fake2), [["enter"]]);
     }
 
     #[test]
@@ -2532,6 +2695,7 @@ mod tests {
             (ErrorKind::NameTaken, "name_taken"),
             (ErrorKind::Blocked { kind: None }, "pane_blocked"),
             (ErrorKind::StatusMismatch, "status_mismatch"),
+            (ErrorKind::ScreenRefused, "screen_refused"),
             (ErrorKind::Finished, "pane_finished"),
             (ErrorKind::Unsupported("x".to_string()), "unsupported"),
             (ErrorKind::InvalidInput, "invalid_input"),

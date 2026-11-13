@@ -441,6 +441,9 @@ pub enum ErrorKind {
     },
     /// An [`InputGuard`] condition did not hold; nothing was sent.
     StatusMismatch,
+    /// The screen check run in the same step as the key refused; nothing was
+    /// sent. `detail` is the check's own reason.
+    ScreenRefused,
     /// The pane's program has ended.
     Finished,
     /// The backend cannot do this.
@@ -477,6 +480,7 @@ impl BackendError {
             ErrorKind::NameTaken => "name_taken",
             ErrorKind::Blocked { .. } => "pane_blocked",
             ErrorKind::StatusMismatch => "status_mismatch",
+            ErrorKind::ScreenRefused => "screen_refused",
             ErrorKind::Finished => "pane_finished",
             ErrorKind::Unsupported(_) => "unsupported",
             ErrorKind::InvalidInput => "invalid_input",
@@ -492,6 +496,66 @@ impl fmt::Display for BackendError {
 }
 
 impl std::error::Error for BackendError {}
+
+/// A cell colour as the screen model holds it. A palette index and a
+/// truecolor value are different things: `Idx(0xfa)` is never `Rgb(0xfa, ..)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Color {
+    Default,
+    Idx(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// One screen cell: its text, colours and the reverse attribute. A wide
+/// character's second column is a cell with empty text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyledCell {
+    pub text: String,
+    pub fg: Color,
+    pub bg: Color,
+    pub reverse: bool,
+}
+
+/// The visible screen with colours, one entry per row, one cell per column.
+/// Used inside Shepherd only: no tool returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyledScreen {
+    pub rows: Vec<Vec<StyledCell>>,
+}
+
+impl StyledScreen {
+    /// The screen text the same way a plain read shapes it: empty cells are
+    /// blanks, rows are trimmed at the end, trailing empty rows are dropped.
+    pub fn text(&self) -> String {
+        let mut rows: Vec<String> = self
+            .rows
+            .iter()
+            .map(|row| row_text(row).trim_end().to_string())
+            .collect();
+        while rows.last().is_some_and(String::is_empty) {
+            rows.pop();
+        }
+        rows.join("\n")
+    }
+}
+
+/// A row's text: a cell with no text of its own is a blank, except the second
+/// column of a wide character, which adds nothing.
+pub fn row_text(row: &[StyledCell]) -> String {
+    row.iter()
+        .map(|cell| {
+            if cell.text.is_empty() {
+                " "
+            } else {
+                cell.text.as_str()
+            }
+        })
+        .collect()
+}
+
+/// A check run on the styled screen in the same step as a key press. `Err`
+/// is the reason to refuse.
+pub type ScreenCheck<'a> = &'a (dyn Fn(&StyledScreen) -> Result<(), String> + Send + Sync);
 
 /// A synchronous terminal backend. Shepherd is blocking (`tiny_http`, Unix
 /// sockets), so adapters wrap their I/O behind plain calls.
@@ -515,6 +579,23 @@ pub trait TerminalBackend: Send + Sync {
         keys: &[Key],
         guard: &InputGuard,
     ) -> Result<KeysResult, BackendError>;
+    /// Press `keys` only if `check` accepts the styled screen as it is at the
+    /// moment of the key, in the same step as the `guard` check and the write.
+    /// A refusal by `check` is [`ErrorKind::ScreenRefused`] and nothing is
+    /// written. A backend that cannot read cell colours keeps this default,
+    /// which writes nothing.
+    fn keys_if_screen(
+        &self,
+        _t: &TerminalRef,
+        _keys: &[Key],
+        _guard: &InputGuard,
+        _check: ScreenCheck<'_>,
+    ) -> Result<KeysResult, BackendError> {
+        Err(BackendError::new(
+            ErrorKind::Unsupported("styled screen".to_string()),
+            "this backend cannot read cell colours",
+        ))
+    }
     /// Block until the program stops working, ends, or `timeout` passes.
     fn wait(&self, t: &TerminalRef, timeout: Duration) -> Result<WaitResult, BackendError>;
     /// Send the stop key and report what happened. Never escalates.

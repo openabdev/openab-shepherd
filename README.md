@@ -163,11 +163,16 @@ checked end to end against OpenCode. Those checks are operator-run.
   `ctrl+f fullscreen` hint. Anything else is refused with no key sent.
   - `deny_once` sends `Esc`, which cancels exactly like `Reject` (measured with marker
     files) and ends the turn (`idle`). It re-checks status and turn just before the key.
-  - `allow_once` is refused with no key sent: `Enter` is safe only when `Allow once` is the
-    highlighted option, OpenCode draws the highlight as a background colour (selected
-    `fab283`, no reverse video, no glyph), and the native screen read returns text without
-    colours. Verifying it needs the native screen model to expose styled cells (the `vt100` cells carry the
-    colour). That would change the backend `read` contract, so it is not part of this change.
+  - `allow_once` presses `Enter` only after it verifies the highlight. OpenCode draws the
+    highlight as a background colour (selected `fab283`, no reverse video, no glyph), so the
+    native backend reads the styled screen cells (colours and the reverse attribute, used
+    internally and never returned by a tool) and presses `Enter` in the same step, under the
+    status, kind and turn guard. It presses only when the dialog text checks pass and exactly
+    one of the three labels is drawn with background `fab283` and that label is `Allow once`.
+    No highlight, two, the highlight on another option, reverse video only, another colour
+    (a palette index is not truecolor), text that changed before the key, or a backend that
+    cannot read colours: refused with no key sent. The colours are as measured on OpenCode
+    v2.2.7 only; the foreground is not checked, and a theme change is unmeasured.
   - `Always allow` is never selected, and `Right` is never sent.
 - Not measured: MCP tools (the configured server was failing), number or letter
   shortcuts and `Tab` in the dialog, the effect of `Always allow`, and a file write without
@@ -186,8 +191,8 @@ kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 - **Text-based dialog parsing.** The dialog is parsed from screen text. Measured
   agents: kiro-cli 3.1.0 (V3 shell permission dialogs), Devin CLI 3000.12.43
   (shell commands) and OpenCode v2.2.7 (shell and edit dialogs, see below). For OpenCode,
-  `deny_once` is answered with Esc; `allow_once` is refused with no key sent, because
-  the highlighted option is a background colour that the screen text does not carry.
+  `deny_once` is answered with Esc; `allow_once` presses Enter only when the styled
+  screen cells show `Allow once` as the one option drawn with the selected background colour.
 - **A fast detached descendant escapes cleanup.** A descendant that is re-parented
   and fully detaches (new session, no terminal, parents gone) within the 250 ms
   between looks at the process table is never seen and survives. macOS has no
