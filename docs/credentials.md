@@ -91,13 +91,14 @@ Verified, env passthrough:
   Stderr output does not print env values.
 - Gap: no test checks stderr for credential values.
 
-Gap, `kind=auth` handling:
-- A pane blocked with `kind=auth` gets the generic "blocked on a auth dialog" message,
-  and `next` points the caller at `answer_dialog` (`src/tools.rs`).
-- `answer_dialog` refuses any non-permission kind with the generic "not blocked on a
-  permission dialog" text.
-- There is no "operator must log in" message today, and no test checks the auth
-  message text. Closing this gap is tracked in #15.
+`kind=auth` handling:
+- A pane blocked with `kind=auth` gets a not-logged-in message from `send_input` and
+  `answer_dialog` (`src/tools.rs`): the CLI is not logged in, the operator must log in
+  or provide its API key and then start a new pane, and Shepherd does not log in or
+  handle credentials. Nothing is typed.
+- `next` is "tell the operator; nothing was typed". It does not point at `answer_dialog`.
+- Permission-kind messages are unchanged. Tests cover the auth and permission texts.
+  This closes the gap tracked in #15.
 
 Not verified:
 - OpenCode provider and credential location.

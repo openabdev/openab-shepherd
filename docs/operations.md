@@ -295,7 +295,7 @@ for debugging; do not parse it.
 | Code | When |
 |------|------|
 | `invalid_input` | An argument failed validation (nothing was sent), or the backend refused the request's parameters |
-| `pane_blocked` | Typing was refused because the program is blocked on a dialog; nothing was typed. `kind` names the dialog (for example `permission`) when known; `next` says to read the screen, then use `answer_dialog` |
+| `pane_blocked` | Typing was refused because the program is blocked on a dialog; nothing was typed. `kind` names the dialog (for example `permission`) when known; `next` says to read the screen, then use `answer_dialog`; for `kind=auth`, `next` says to tell the operator, who must log in |
 | `not_found` | No pane is named `terminal` (a backend address is not a name); for `start_pane`, the program or working directory was not found |
 | `name_taken` | `start_pane` with a name that is already in use (or, rarely, a generated name that collided; retry) |
 | `status_mismatch` | A backend-side input condition did not hold; nothing was sent |
@@ -333,7 +333,8 @@ longer blocked, `kind` is null and `status_now` shows the current status.
 `idle` and `done` are both sendable (kiro-cli stays in `done` after a turn). The tool
 never forces input. While the program is blocked, nothing is typed and the tool
 returns error `pane_blocked` with `kind` (the dialog, for example `permission`) and
-`next`, which says to read the screen and use `answer_dialog`.
+`next`, which says to read the screen and use `answer_dialog`. For `kind=auth` the
+CLI is not logged in: `next` says to tell the operator, and `answer_dialog` is not the way.
 
 Who refuses depends on the backend's `conditional_input` capability. herdr-core has
 it: its send refuses a blocked program in the same step as the write. If herdr-core's
