@@ -189,7 +189,7 @@ kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 - **Two dialog choices only.** `answer_dialog` answers `allow_once` or `deny_once`
   and nothing else. Other dialog kinds (`question`, `auth`) are not answered.
 - **Text-based dialog parsing.** The dialog is parsed from screen text. Measured
-  agents: kiro-cli 3.1.0 (V3 shell permission dialogs), Devin CLI 3000.12.43
+  agents: kiro-cli 3.1.0 (V3 shell permission dialogs), Devin CLI 3000.12.43 and 3000.12.57
   (shell commands) and OpenCode v2.2.7 (shell and edit dialogs, see below). For OpenCode,
   `deny_once` is answered with Esc; `allow_once` presses Enter only when the styled
   screen cells show `Allow once` as the one option drawn with the selected background colour.

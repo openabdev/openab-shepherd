@@ -308,7 +308,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "answer_dialog",
-            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (tested on kiro-cli 3.1.0 V3 shell permission dialogs) or devin (Devin CLI 3000.12.43 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses); opencode (OpenCode v2.2.7): deny_once sends Esc, which cancels like Reject, after the pane is blocked with kind permission and the screen shows the whole expected dialog; allow_once presses Enter only when the styled screen, read in the same step as the key, shows exactly one option drawn with the selected background and that option is Allow once (otherwise it is refused with no keys sent), and Always allow is never selected. A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
+            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (tested on kiro-cli 3.1.0 V3 shell permission dialogs) or devin (Devin CLI 3000.12.43 and 3000.12.57 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses); opencode (OpenCode v2.2.7): deny_once sends Esc, which cancels like Reject, after the pane is blocked with kind permission and the screen shows the whole expected dialog; allow_once presses Enter only when the styled screen, read in the same step as the key, shows exactly one option drawn with the selected background and that option is Allow once (otherwise it is refused with no keys sent), and Always allow is never selected. A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2540,6 +2540,46 @@ mod tests {
         let out = devin_answer(&fake, "deny_once").unwrap();
         assert_eq!(out["selected"], "Deny");
         assert_eq!(key_names(&fake), [["down"], ["down"], ["enter"]]);
+    }
+
+    fn devin_screen_12_57(cursor: usize) -> String {
+        crate::devin_dialog::fixtures_12_57::dialog_with_cursor_on(cursor)
+    }
+
+    #[test]
+    fn devin_3000_12_57_allow_once_presses_enter_on_allow_with_scope_once() {
+        let fake = blocked_devin_pane(vec![devin_screen_12_57(0)]);
+        let out = devin_answer(&fake, "allow_once").unwrap();
+        assert_eq!(out["selected"], "Allow");
+        assert_eq!(out["moves"], 0);
+        assert_eq!(key_names(&fake), [["enter"]]);
+    }
+
+    #[test]
+    fn devin_3000_12_57_deny_once_moves_to_deny_then_enter() {
+        let fake = blocked_devin_pane(vec![
+            devin_screen_12_57(0),
+            devin_screen_12_57(1),
+            devin_screen_12_57(2),
+        ]);
+        let out = devin_answer(&fake, "deny_once").unwrap();
+        assert_eq!(out["selected"], "Deny");
+        assert_eq!(out["moves"], 2);
+        assert_eq!(key_names(&fake), [["down"], ["down"], ["enter"]]);
+    }
+
+    #[test]
+    fn devin_3000_12_57_refuses_a_wrong_scope_and_a_bypass_highlight() {
+        let screen = devin_screen_12_57(0).replace("→ Once", "→ Session");
+        let fake = blocked_devin_pane(vec![screen]);
+        let err = devin_answer(&fake, "allow_once").unwrap_err();
+        assert!(err.text.contains("Once scope"), "{}", err.text);
+        assert_eq!(key_names(&fake), [["esc"]]);
+
+        let fake = blocked_devin_pane(vec![devin_screen_12_57(1)]);
+        let err = devin_answer(&fake, "allow_once").unwrap_err();
+        assert!(err.text.contains("not on Allow"), "{}", err.text);
+        assert_eq!(key_names(&fake), [["esc"]]);
     }
 
     #[test]
