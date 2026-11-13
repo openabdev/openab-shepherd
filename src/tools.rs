@@ -642,12 +642,18 @@ fn send_input(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         }
     }
     match sh.backend.send(&pane, &text, &guard) {
-        Ok(sent) => Ok(json!({
-            "terminal": terminal,
-            "turn": sent.turn,
-            "started": sent.started,
-            "status": sent.status.as_ref().map(State::as_str),
-        })),
+        Ok(sent) => {
+            // A new OpenCode turn must not inherit a deny from an earlier one.
+            if sent.started != Some(false) && sh.agent_of(&terminal) == Some(Agent::OpenCode) {
+                sh.clear_answer(&terminal);
+            }
+            Ok(json!({
+                "terminal": terminal,
+                "turn": sent.turn,
+                "started": sent.started,
+                "status": sent.status.as_ref().map(State::as_str),
+            }))
+        }
         Err(BackendError {
             kind: ErrorKind::Blocked { kind: None },
             detail,
@@ -1402,7 +1408,10 @@ fn answer_opencode(
                 ));
             }
         };
-        sh.mark_answered(terminal);
+        // An allowed command runs, so the idle that follows is the turn's
+        // done, not a cancel. Drop a marker left by an earlier denied dialog
+        // in the same turn.
+        sh.clear_answer(terminal);
         return Ok(json!({
             "terminal": terminal,
             "agent": Agent::OpenCode.as_str(),
@@ -2551,6 +2560,94 @@ mod tests {
 
     fn wait_idle(turn: Option<u64>) -> crate::backend::WaitResult {
         wait_result(State::Idle, turn)
+    }
+
+    fn push_wait(fake: &FakeBackend, wait: crate::backend::WaitResult) {
+        fake.state.lock().unwrap().waits.push_back(wait);
+    }
+
+    fn wait_work(sh: &Shepherd) -> Value {
+        call(sh, "wait_status", &args(json!({"terminal": "work"}))).unwrap()
+    }
+
+    fn opencode_pane_with_allowable_dialog() -> (FakeBackend, Shepherd) {
+        let fake = blocked_devin_pane(vec![opencode_shell()]);
+        fake.state.lock().unwrap().styled = Some(styled_selected("Allow once"));
+        let sh = shepherd(&fake);
+        sh.assume_agent("work", Agent::OpenCode);
+        (fake, sh)
+    }
+
+    fn answer_work(sh: &Shepherd, choice: &str) {
+        call(
+            sh,
+            "answer_dialog",
+            &args(json!({"terminal": "work", "choice": choice})),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn opencode_idle_after_allow_once_is_done() {
+        let (fake, sh) = opencode_pane_with_allowable_dialog();
+        answer_work(&sh, "allow_once");
+        push_wait(&fake, wait_result(State::Other, Some(1)));
+        push_wait(&fake, wait_idle(Some(1)));
+        let out = wait_work(&sh);
+        assert_eq!(out["outcome"], "done");
+        assert_eq!(out["turn_complete"], true);
+    }
+
+    #[test]
+    fn opencode_allow_then_a_second_dialog_then_deny_is_cancelled() {
+        let (fake, sh) = opencode_pane_with_allowable_dialog();
+        answer_work(&sh, "allow_once");
+        answer_work(&sh, "deny_once");
+        push_wait(&fake, wait_idle(Some(1)));
+        let out = wait_work(&sh);
+        assert_eq!(out["outcome"], "cancelled");
+        assert_eq!(out["turn_complete"], false);
+    }
+
+    #[test]
+    fn opencode_allow_then_a_second_dialog_then_allow_is_done() {
+        let (fake, sh) = opencode_pane_with_allowable_dialog();
+        answer_work(&sh, "allow_once");
+        answer_work(&sh, "allow_once");
+        push_wait(&fake, wait_idle(Some(1)));
+        let out = wait_work(&sh);
+        assert_eq!(out["outcome"], "done");
+        assert_eq!(out["turn_complete"], true);
+    }
+
+    #[test]
+    fn opencode_deny_then_a_second_dialog_then_allow_is_done() {
+        let (fake, sh) = opencode_pane_with_allowable_dialog();
+        answer_work(&sh, "deny_once");
+        answer_work(&sh, "allow_once");
+        push_wait(&fake, wait_idle(Some(1)));
+        assert_eq!(wait_work(&sh)["outcome"], "done");
+    }
+
+    #[test]
+    fn an_opencode_deny_does_not_leak_into_the_next_turn() {
+        let (fake, sh) = opencode_pane_with_allowable_dialog();
+        answer_work(&sh, "deny_once");
+        // The deny's wait never ran. The pane goes idle; a new turn starts.
+        fake.state.lock().unwrap().panes[0].status = Some(crate::backend::ProgramStatus {
+            state: State::Idle,
+            kind: None,
+        });
+        let sent = call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "work", "text": "next"})),
+        )
+        .unwrap();
+        assert_eq!(sent["started"], true);
+        push_wait(&fake, wait_result(State::Other, Some(2)));
+        push_wait(&fake, wait_idle(Some(2)));
+        assert_eq!(wait_work(&sh)["outcome"], "done");
     }
 
     fn wait_outcome_of(agent: Agent, waits: Vec<crate::backend::WaitResult>) -> Value {
