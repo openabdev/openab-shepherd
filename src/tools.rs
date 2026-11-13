@@ -19,18 +19,19 @@ use crate::agent::{unmeasured, Agent, ParsedDialog};
 use crate::ansi::strip_terminal_escapes;
 use crate::backend::{
     dialog_kind, status_json, BackendError, ErrorKind, InputGuard, Key, KeysResult, RunSpec, State,
-    StopHow, TerminalBackend, TerminalInfo, TerminalRef, WaitReason,
+    StopHow, TerminalBackend, TerminalInfo, TerminalRef, WaitReason, WaitResult,
 };
 use crate::devin_dialog;
 use crate::dialog::Choice;
 use crate::input::{validate_input, validate_name};
+use crate::opencode_dialog;
 use crate::panelock::{PaneGuard, PaneLocks};
 use crate::profiles::{CwdError, LaunchPolicy};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const TOOL_NAMES: [&str; 9] = [
     "start_pane",
@@ -63,6 +64,9 @@ pub const CONFIRM_INTERVAL: Duration = Duration::from_millis(200);
 /// re-reading the screen every [`RENDER_POLL_INTERVAL`].
 pub const RENDER_WAIT: Duration = Duration::from_secs(3);
 pub const RENDER_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// How long wait_status pauses before it waits again on an OpenCode pane that
+/// reported `clear`.
+const SETTLE_INTERVAL: Duration = Duration::from_millis(100);
 /// Screen reads in the render wait: one at once, then one per interval.
 pub const RENDER_READS: usize =
     (RENDER_WAIT.as_millis() / RENDER_POLL_INTERVAL.as_millis()) as usize + 1;
@@ -272,7 +276,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "wait_status",
-            "description": "Wait until a pane stops working, or check in after timeout seconds. Branch on outcome: done (the turn finished), blocked (waiting on a dialog; kind says which, for example permission), timeout (a check-in: still running), exited (the program ended), cancelled (the pane went idle after answer_dialog denied or cancelled its dialog; a Devin cancel returns to idle, not done), or other (any other status or reason; read status). turn_complete is true only for done and exited; a blocked pane has not completed its turn even though its turn number advanced. A program that never reports status counts as working until it exits.",
+            "description": "Wait until a pane stops working, or check in after timeout seconds. Branch on outcome: done (the turn finished; for an opencode pane, idle after a turn, since OpenCode reports no done), blocked (waiting on a dialog; kind says which, for example permission), timeout (a check-in: still running), exited (the program ended), cancelled (the pane went idle after answer_dialog denied or cancelled its dialog; a Devin cancel returns to idle, not done), or other (any other status or reason; read status). turn_complete is true only for done and exited; a blocked pane has not completed its turn even though its turn number advanced. A program that never reports status counts as working until it exits.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -304,7 +308,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "answer_dialog",
-            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (tested on kiro-cli 3.1.0 V3 shell permission dialogs) or devin (Devin CLI 3000.12.43 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses); opencode has no measured dialog, so it is always refused with no keys sent. A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
+            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (tested on kiro-cli 3.1.0 V3 shell permission dialogs) or devin (Devin CLI 3000.12.43 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses); opencode (OpenCode v2.2.7): deny_once sends Esc, which cancels like Reject, after the pane is blocked with kind permission and the screen shows the whole expected dialog; allow_once is refused with no keys sent because the highlighted option is a background colour that the screen text does not carry, and Always allow is never selected. A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -769,10 +773,9 @@ fn wait_status(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     let timeout = optional_number(args, "timeout", WAIT_MIN_SECONDS, WAIT_MAX_SECONDS)?
         .unwrap_or(WAIT_DEFAULT_SECONDS);
     let pane = resolve(sh, &terminal)?.reference();
-    let result = sh
-        .backend
-        .wait(&pane, Duration::from_secs_f64(timeout))
-        .map_err(|err| {
+    let agent = sh.agent_of(&terminal);
+    let result =
+        wait_settled(sh, &pane, agent, Duration::from_secs_f64(timeout)).map_err(|err| {
             let protocol = err.kind == ErrorKind::Protocol;
             let failure = backend_failure(Some(&terminal), err);
             if protocol {
@@ -783,7 +786,19 @@ fn wait_status(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         })?;
     let state = result.status.as_ref().map(|status| &status.state);
     let answered = sh.answer_pending(&terminal);
-    let outcome = wait_outcome(result.ended, result.reason.as_ref(), state, answered);
+    let mut outcome = wait_outcome(result.ended, result.reason.as_ref(), state, answered);
+    // OpenCode reports no done state: a turn ends clear, then idle. An idle
+    // after at least one turn (the turn number is 0 until the first leaves
+    // working) is its done.
+    if outcome == "other"
+        && agent == Some(Agent::OpenCode)
+        && result.ended
+        && result.reason == Some(WaitReason::Status)
+        && state == Some(&State::Idle)
+        && result.turn.is_some_and(|turn| turn > 0)
+    {
+        outcome = "done";
+    }
     if matches!(outcome, "done" | "cancelled" | "blocked" | "exited") {
         sh.clear_answer(&terminal);
     }
@@ -816,6 +831,33 @@ fn wait_status(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         }
     }
     Ok(out)
+}
+
+/// The backend's wait. OpenCode reports `clear` between `working` and `idle`
+/// at the end of a turn; it maps to the unknown state, which would end the wait
+/// for a moment before the idle that closes the turn. For an OpenCode pane such
+/// a result is waited out again, within the caller's timeout.
+fn wait_settled(
+    sh: &Shepherd,
+    pane: &TerminalRef,
+    agent: Option<Agent>,
+    timeout: Duration,
+) -> Result<WaitResult, BackendError> {
+    let end = Instant::now() + timeout;
+    let mut remaining = timeout;
+    loop {
+        let result = sh.backend.wait(pane, remaining)?;
+        let settling = agent == Some(Agent::OpenCode)
+            && result.ended
+            && result.reason == Some(WaitReason::Status)
+            && result.status.as_ref().map(|status| &status.state) == Some(&State::Other);
+        let left = end.saturating_duration_since(Instant::now());
+        if !settling || left <= SETTLE_INTERVAL {
+            return Ok(result);
+        }
+        thread::sleep(SETTLE_INTERVAL);
+        remaining = end.saturating_duration_since(Instant::now());
+    }
 }
 
 /// What a wait result means. Only `done` and `exited` complete a turn. `idle`
@@ -1022,7 +1064,12 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     };
     // Every key goes to this dialog in this turn. A backend with conditional
     // keys enforces it; for one without, the checks below do (non-atomically).
-    // An agent whose dialog was not measured has no option to press: refuse
+    // OpenCode's dialog has its own path: the highlight is a colour that the
+    // screen text does not carry (see opencode_dialog).
+    if agent == Agent::OpenCode {
+        return answer_opencode(sh, &terminal, &pane, choice, turn, caps.conditional_keys);
+    }
+    // An agent the generic path does not serve has no option to press: refuse
     // before reading the screen, and send nothing.
     let Some((target, label)) = agent.option(choice) else {
         return Err(refusal(
@@ -1214,6 +1261,124 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         "command": first.command,
         "options": first.options,
         "moves": moves,
+        "keys_result": result.to_json(),
+    }))
+}
+
+/// OpenCode (v2.2.7). `deny_once` sends Esc, which cancels exactly like Reject
+/// (measured), once the pane is blocked on a permission dialog in this turn and
+/// the screen shows the whole expected dialog. `allow_once` is refused with no key
+/// sent: Enter is safe only on the highlighted `Allow once`, and the highlight is
+/// a background colour that the screen text lacks. Right and Enter are never
+/// sent, so `Always allow` is never reachable.
+fn answer_opencode(
+    sh: &Shepherd,
+    terminal: &str,
+    pane: &TerminalRef,
+    choice: Choice,
+    turn: u64,
+    conditional_keys: bool,
+) -> Result<Value, ToolError> {
+    let sent: Vec<Vec<String>> = Vec::new();
+    if choice == Choice::AllowOnce {
+        return Err(refusal(
+            terminal,
+            choice,
+            opencode_dialog::highlight_unverifiable(),
+            json!({"turn": turn}),
+            &sent,
+        ));
+    }
+    // Wait for the dialog text to render, checking between reads that the pane
+    // is still blocked on a permission dialog in this turn.
+    let mut screen = String::new();
+    let mut parse_error = String::new();
+    let mut parsed = None;
+    for attempt in 0..RENDER_READS {
+        if attempt > 0 {
+            thread::sleep(RENDER_POLL_INTERVAL);
+            let now = get_pane(sh, pane, terminal)?;
+            let changes = pane_changes(&now, turn);
+            if !changes.is_empty() {
+                return Err(refusal(
+                    terminal,
+                    choice,
+                    format!(
+                        "the pane changed while waiting for the dialog to render: {}",
+                        changes.join("; ")
+                    ),
+                    json!({
+                        "status": status_json(now.status.as_ref()),
+                        "turn_before": turn,
+                        "turn_now": now.turn,
+                        "screen": tail(&screen),
+                    }),
+                    &sent,
+                ));
+            }
+        }
+        screen = read_screen(sh, pane, terminal)?;
+        match opencode_dialog::parse(&screen) {
+            Ok(found) => {
+                parsed = Some(found);
+                break;
+            }
+            Err(err) => parse_error = err,
+        }
+    }
+    let Some(dialog) = parsed else {
+        return Err(refusal(
+            terminal,
+            choice,
+            format!(
+                "cannot parse the permission dialog: timed out waiting for the dialog to render ({RENDER_READS} reads over {} ms): {parse_error}",
+                RENDER_WAIT.as_millis()
+            ),
+            json!({"screen": tail(&screen)}),
+            &sent,
+        ));
+    };
+    // Re-check, immediately before Esc, that the pane is still blocked on a
+    // permission dialog in this turn. A backend with conditional keys also
+    // enforces it with the key itself.
+    if !conditional_keys {
+        let again = get_pane(sh, pane, terminal)?;
+        let changes = pane_changes(&again, turn);
+        if !changes.is_empty() {
+            return Err(refusal(
+                terminal,
+                choice,
+                format!(
+                    "the pane changed after the dialog was read: {}",
+                    changes.join("; ")
+                ),
+                json!({
+                    "status": status_json(again.status.as_ref()),
+                    "turn_before": turn,
+                    "turn_now": again.turn,
+                    "screen": tail(&screen),
+                }),
+                &sent,
+            ));
+        }
+    }
+    let guard = InputGuard {
+        refuse_when_blocked: false,
+        if_state: Some(State::Blocked),
+        if_kind: Some("permission".to_string()),
+        expect_turn: Some(turn),
+    };
+    let result = press(sh, pane, terminal, &[Key::Esc], &guard)?;
+    sh.mark_answered(terminal);
+    Ok(json!({
+        "terminal": terminal,
+        "agent": Agent::OpenCode.as_str(),
+        "choice": choice.as_str(),
+        "selected": opencode_dialog::OPTION_REJECT,
+        "title": opencode_dialog::HEADING,
+        "command": dialog.subject,
+        "options": dialog.options,
+        "keys": [Key::Esc.as_str()],
         "keys_result": result.to_json(),
     }))
 }
@@ -2010,27 +2175,175 @@ mod tests {
         assert!(key_names(&fake).is_empty());
     }
 
+    /// answer_dialog on pane `work`, which is an OpenCode pane.
+    fn opencode_answer(fake: &FakeBackend, choice: &str) -> Result<Value, ToolError> {
+        let sh = shepherd(fake);
+        sh.assume_agent("work", Agent::OpenCode);
+        call(
+            &sh,
+            "answer_dialog",
+            &args(json!({"terminal": "work", "choice": choice})),
+        )
+    }
+
+    fn opencode_shell() -> String {
+        crate::opencode_dialog::fixtures::shell_dialog()
+    }
+
     #[test]
-    fn opencode_is_refused_without_keys_because_its_dialog_is_unmeasured() {
-        let fake = blocked_devin_pane(vec![devin_screen(0), devin_screen(1)]);
+    fn opencode_deny_once_sends_only_esc_after_the_dialog_checks() {
+        for screen in [
+            opencode_shell(),
+            crate::opencode_dialog::fixtures::edit_dialog(),
+        ] {
+            let fake = blocked_devin_pane(vec![screen]);
+            let out = opencode_answer(&fake, "deny_once").unwrap();
+            assert_eq!(out["agent"], "opencode");
+            assert_eq!(out["selected"], "Reject");
+            assert_eq!(out["keys"], json!(["esc"]));
+            assert_eq!(key_names(&fake), [["esc"]]);
+            assert_eq!(fake.calls(), ["get", "get", "read", "get", "keys"]);
+        }
+    }
+
+    #[test]
+    fn opencode_allow_once_is_refused_because_the_highlight_cannot_be_verified() {
+        let fake = blocked_devin_pane(vec![opencode_shell()]);
+        let err = opencode_answer(&fake, "allow_once").unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        assert!(
+            err.text.contains("highlighted option cannot be verified"),
+            "{}",
+            err.text
+        );
+        assert!(key_names(&fake).is_empty());
+    }
+
+    #[test]
+    fn opencode_sends_nothing_unless_the_pane_is_blocked_on_a_permission_dialog() {
+        let cases = [
+            (State::Working, None),
+            (State::Idle, None),
+            (State::Blocked, Some("auth")),
+            (State::Blocked, Some("question")),
+        ];
+        for (state, kind) in cases {
+            for choice in ["allow_once", "deny_once"] {
+                let fake = FakeBackend::new(false);
+                fake.add_pane("work", state.clone(), kind);
+                fake.state.lock().unwrap().screen = Some(opencode_shell());
+                let err = opencode_answer(&fake, choice).unwrap_err();
+                assert_eq!(err.data["error"], "refused", "{state:?} {kind:?}");
+                assert!(key_names(&fake).is_empty(), "{state:?} {kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn opencode_deny_once_sends_nothing_when_the_dialog_is_not_the_expected_one() {
+        // The options are in the wrong order, so the dialog never parses.
+        let wrong = opencode_shell().replace(
+            "Allow once   Always allow   Reject",
+            "Allow once   Reject   Always allow",
+        );
+        let fake = blocked_devin_pane(vec![wrong]);
+        let err = opencode_answer(&fake, "deny_once").unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        assert!(err.text.contains("in that order"), "{}", err.text);
+        assert!(key_names(&fake).is_empty());
+    }
+
+    #[test]
+    fn opencode_never_sends_right_or_enter() {
+        let fake = blocked_devin_pane(vec![opencode_shell()]);
+        opencode_answer(&fake, "deny_once").unwrap();
+        let fake2 = blocked_devin_pane(vec![opencode_shell()]);
+        opencode_answer(&fake2, "allow_once").unwrap_err();
+        for fake in [&fake, &fake2] {
+            assert!(key_names(fake)
+                .iter()
+                .flatten()
+                .all(|key| !matches!(*key, "enter" | "right" | "left" | "tab")));
+        }
+    }
+
+    #[test]
+    fn opencode_idle_after_a_denied_dialog_is_cancelled() {
+        let fake = blocked_devin_pane(vec![opencode_shell()]);
         let sh = shepherd(&fake);
         sh.assume_agent("work", Agent::OpenCode);
-        for choice in ["allow_once", "deny_once"] {
-            let err = call(
-                &sh,
-                "answer_dialog",
-                &args(json!({"terminal": "work", "choice": choice})),
-            )
-            .unwrap_err();
-            assert_eq!(err.data["error"], "refused");
-            assert!(
-                err.text
-                    .contains("opencode permission dialog has not been measured"),
-                "{}",
-                err.text
-            );
+        call(
+            &sh,
+            "answer_dialog",
+            &args(json!({"terminal": "work", "choice": "deny_once"})),
+        )
+        .unwrap();
+        fake.state
+            .lock()
+            .unwrap()
+            .waits
+            .push_back(wait_idle(Some(3)));
+        let out = call(&sh, "wait_status", &args(json!({"terminal": "work"}))).unwrap();
+        assert_eq!(out["outcome"], "cancelled");
+    }
+
+    fn wait_result(state: State, turn: Option<u64>) -> crate::backend::WaitResult {
+        crate::backend::WaitResult {
+            ended: true,
+            reason: Some(crate::backend::WaitReason::Status),
+            status: Some(crate::backend::ProgramStatus { state, kind: None }),
+            exit_code: None,
+            turn,
         }
-        assert!(key_names(&fake).is_empty());
+    }
+
+    fn wait_idle(turn: Option<u64>) -> crate::backend::WaitResult {
+        wait_result(State::Idle, turn)
+    }
+
+    fn wait_outcome_of(agent: Agent, waits: Vec<crate::backend::WaitResult>) -> Value {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", State::Working, None);
+        fake.state.lock().unwrap().waits = waits.into();
+        let sh = shepherd(&fake);
+        sh.assume_agent("work", agent);
+        call(
+            &sh,
+            "wait_status",
+            &args(json!({"terminal": "work", "timeout": 5})),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_opencode_turn_with_no_dialog_ends_done_at_idle_after_clear() {
+        // working, then clear (the unknown state), then idle: no blocked at all.
+        let out = wait_outcome_of(
+            Agent::OpenCode,
+            vec![wait_result(State::Other, Some(1)), wait_idle(Some(1))],
+        );
+        assert_eq!(out["outcome"], "done");
+        assert_eq!(out["turn_complete"], true);
+        assert_eq!(out["status"], "idle");
+    }
+
+    #[test]
+    fn an_opencode_idle_before_any_turn_is_not_done() {
+        let out = wait_outcome_of(Agent::OpenCode, vec![wait_idle(Some(0))]);
+        assert_eq!(out["outcome"], "other");
+        assert_eq!(out["turn_complete"], false);
+    }
+
+    #[test]
+    fn idle_is_not_done_for_kiro_or_devin() {
+        for agent in [Agent::Kiro, Agent::Devin] {
+            let out = wait_outcome_of(agent, vec![wait_idle(Some(3))]);
+            assert_eq!(out["outcome"], "other");
+            // Only OpenCode waits out the unknown state.
+            let out = wait_outcome_of(agent, vec![wait_result(State::Other, Some(3))]);
+            assert_eq!(out["outcome"], "other");
+            assert_eq!(out["status"], "other");
+        }
     }
 
     #[test]
