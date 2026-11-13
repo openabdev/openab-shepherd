@@ -3716,6 +3716,92 @@ mod tests {
         }
     }
 
+    /// Tick once to start the idle clock, then arrange for the pane to
+    /// change at the read the nudge's send makes inside the pane lock (the
+    /// third get of the next tick: the check's resolve, then the send's two),
+    /// and tick again past the idle timeout. The backend is conditional, so
+    /// only the guard the watchdog built can refuse the send.
+    fn tick_with_pane_flipping_before_the_send(
+        sh: &Shepherd,
+        fake: &FakeBackend,
+        state: State,
+        turn: Option<u64>,
+    ) {
+        let t0 = Instant::now();
+        sh.watchdog_tick_at(t0);
+        {
+            let mut fake_state = fake.state.lock().unwrap();
+            let gets = fake_state.calls.iter().filter(|c| **c == "get").count();
+            fake_state.flip_on_get = Some((gets + 3, state, turn));
+        }
+        sh.watchdog_tick_at(t0 + Duration::from_secs(11));
+    }
+
+    #[test]
+    fn the_watchdog_does_not_nudge_a_pane_that_went_blocked_before_the_send() {
+        let (sh, fake, _dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
+            "tools-watchdog-tick-blocked",
+        );
+        tick_with_pane_flipping_before_the_send(&sh, &fake, State::Blocked, None);
+        assert!(fake.calls().contains(&"send"), "the send was never tried");
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn the_watchdog_does_not_nudge_a_pane_that_went_back_to_working_before_the_send() {
+        let (sh, fake, _dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
+            "tools-watchdog-tick-working",
+        );
+        tick_with_pane_flipping_before_the_send(&sh, &fake, State::Working, None);
+        assert!(fake.calls().contains(&"send"), "the send was never tried");
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn the_watchdog_does_not_nudge_a_pane_whose_turn_advanced_before_the_send() {
+        let (sh, fake, _dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
+            "tools-watchdog-tick-turn",
+        );
+        tick_with_pane_flipping_before_the_send(&sh, &fake, State::Done, Some(4));
+        assert!(fake.calls().contains(&"send"), "the send was never tried");
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn the_watchdog_does_not_nudge_a_working_pane() {
+        let (sh, fake, _dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
+            "tools-watchdog-tick-idle-working",
+        );
+        fake.state.lock().unwrap().panes[0].status = Some(ProgramStatus {
+            state: State::Working,
+            kind: None,
+        });
+        let t0 = Instant::now();
+        sh.watchdog_tick_at(t0);
+        sh.watchdog_tick_at(t0 + Duration::from_secs(3600));
+        assert!(!fake.calls().contains(&"send"));
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn the_watchdog_nudges_when_the_pane_is_unchanged_at_the_send() {
+        // Positive control for the flip tests: the same conditional backend
+        // lets the send through when nothing changed.
+        let (sh, fake, _dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
+            "tools-watchdog-tick-control",
+        );
+        tick_with_pane_flipping_before_the_send(&sh, &fake, State::Done, Some(3));
+        assert_eq!(
+            fake.state.lock().unwrap().sent,
+            [("continue".to_string(), true)]
+        );
+    }
+
     #[test]
     fn removing_a_watched_pane_unregisters_it() {
         let (sh, fake, _dir) = watched_pane(
