@@ -2217,15 +2217,48 @@ mod tests {
         assert_eq!(key_names(&fake), [["down"], ["esc"]]);
     }
 
+    fn read_count(fake: &FakeBackend) -> usize {
+        fake.calls().iter().filter(|call| **call == "read").count()
+    }
+
+    /// Deny-once on a Devin pane whose every Down is first read `stale` times
+    /// on the old row. Returns the answer and the number of screen reads.
+    fn devin_deny_with_stale(stale: usize) -> (Result<Value, ToolError>, usize, FakeBackend) {
+        let fake = blocked_devin_pane(vec![devin_screen(0), devin_screen(1), devin_screen(2)]);
+        fake.state.lock().unwrap().stale_reads = stale;
+        let out = devin_answer(&fake, "deny_once");
+        let reads = read_count(&fake);
+        (out, reads, fake)
+    }
+
     #[test]
     fn devin_deny_once_waits_for_a_highlight_that_updates_on_the_second_read() {
         // Each Down is first read on the old row (Devin redraws ~60 ms later).
-        let fake = blocked_devin_pane(vec![devin_screen(0), devin_screen(1), devin_screen(2)]);
-        fake.state.lock().unwrap().stale_reads = 1;
-        let out = devin_answer(&fake, "deny_once").unwrap();
+        let (_, base_reads, _) = devin_deny_with_stale(0);
+        let (out, reads, fake) = devin_deny_with_stale(1);
+        let out = out.unwrap();
         assert_eq!(out["selected"], "Deny");
         assert_eq!(out["moves"], 2);
         assert_eq!(key_names(&fake), [["down"], ["down"], ["enter"]]);
+        // One extra read per Down proves the stale screen was really served.
+        assert_eq!(reads, base_reads + 2);
+    }
+
+    #[test]
+    fn devin_deny_once_accepts_a_highlight_that_lands_on_the_fifth_read() {
+        let (out, _, fake) = devin_deny_with_stale(CONFIRM_READS - 1);
+        let out = out.unwrap();
+        assert_eq!(out["selected"], "Deny");
+        assert_eq!(key_names(&fake), [["down"], ["down"], ["enter"]]);
+    }
+
+    #[test]
+    fn devin_deny_once_refuses_when_the_highlight_lands_on_the_sixth_read() {
+        let (out, _, fake) = devin_deny_with_stale(CONFIRM_READS);
+        let err = out.unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        assert!(err.text.contains("after 5 reads"), "{}", err.text);
+        assert_eq!(key_names(&fake), [["down"], ["esc"]]);
     }
 
     #[test]

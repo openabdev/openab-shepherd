@@ -397,7 +397,7 @@ cannot be chosen. A Devin dialog never selects `Bypass mode`: the target is `All
 
 Devin answers: `allow_once` presses `enter` on `Allow` (the scope defaults to `Once`).
 It refuses, sending `esc`, when the Allow row shows another scope than `Once`.
-`deny_once` moves to `Deny` and presses `enter`. The command does not run, and the
+`deny_once` moves to `Deny` with one `down` at a time and presses `enter`. After each `down` it re-reads the screen, up to 5 reads 200 ms apart, until the highlight is on the next row (Devin redraws it a moment late); if it is not there after 5 reads, or lands on another row, it sends `esc` and refuses. The command does not run, and the
 pane goes to `idle`, not `done`; `wait_status` reports that as `cancelled`. Esc has
 the same end state.
 

@@ -323,7 +323,7 @@ impl TerminalBackend for FakeBackend {
         if let Some(next) = state.next_screens.pop_front() {
             if state.stale_reads > 0 {
                 let stale = state.stale_reads;
-                state.late = Some((next, stale - 1));
+                state.late = Some((next, stale));
             } else {
                 state.screen = Some(next);
             }
