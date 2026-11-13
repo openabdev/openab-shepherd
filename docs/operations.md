@@ -220,6 +220,9 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
 - Programs a profile's pane runs (Kiro's tools, for example) inherit its
   environment. A profile's credential is as exposed as anything that program does.
 
+For how the operator signs in to the coding CLI or supplies its key, see
+[credentials.md](credentials.md).
+
 ### herdr-core socket (hc backend only)
 
 - `HC_SOCKET` is the override. The herdr-core binary names it in its own error text.
