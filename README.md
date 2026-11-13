@@ -113,6 +113,9 @@ put it behind `tailscale serve` and allow that name, for example
 Every variable, profile field, tool argument, error code and bound is described in
 [docs/operations.md](docs/operations.md).
 
+How the operator signs in to the coding CLI or supplies its key is described in
+[docs/credentials.md](docs/credentials.md).
+
 ## OpenCode CLI
 
 Observed on a laptop with OpenCode 2.2.7 (`opencode --version`), installed locally with bun.
