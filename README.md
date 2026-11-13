@@ -36,9 +36,10 @@ which answers a permission dialog may receive.
   through the same path and refusal rules as `send_input` — when a pane's
   finished turn sits untouched for `idle_timeout_secs` and, when the profile
   sets `todo_file`, that file still has an unchecked item. At most
-  `max_consecutive_nudges` nudges go in without the turn advancing, and a
-  blocked pane is never nudged. Every nudge and every give-up is logged. Off
-  unless a profile sets it.
+  `max_consecutive_nudges` nudges go in without progress the watchdog did
+  not itself cause (the turn a nudge produces does not reset the count),
+  and a blocked pane is never nudged. Every nudge and every give-up is
+  logged to stderr. Off unless a profile sets it.
 - **Native terminal core.** The default backend runs each pane on its own PTY with a
   `vt100` emulator, a cleared child environment and at most 8 live panes. Programs
   report their state (`idle`, `working`, `done`, `blocked`, ...) with OSC 7501
