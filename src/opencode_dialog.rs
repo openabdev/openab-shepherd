@@ -13,11 +13,17 @@
 //!   ┃   Allow once   Always allow   Reject  ctrl+f fullscreen  ⇆ select  enter confirm
 //! ```
 //!
-//! The highlighted option is drawn with a background colour (selected `fab283`),
-//! not with reverse video or a glyph, so it is not in the screen text. The
-//! styled screen carries it: [`verify_selected`] parses the text and then
-//! requires exactly one of the three labels to be drawn with that background,
-//! and that label to be `Allow once`. Anything that does not match is refused.
+//! The highlighted option is drawn with a background colour (not reverse video
+//! or a glyph), so it is not in the screen text. The colour depends on the
+//! colour depth OpenCode picks (256-colour palette index without `COLORTERM`,
+//! RGB with it), so [`verify_selected`] does not know it. It parses the text
+//! and then compares the `vt100` colours of the three labels as they are
+//! (no palette/RGB conversion): `Allow once` passes only when its background
+//! differs from the other two and those two are equal, and it is not the
+//! default. Only the label characters are compared, not the padding around
+//! them. Residual: a plain `Allow once` with an identical highlight on both
+//! other options also passes; OpenCode draws one highlight, so it does not
+//! occur. Everything else is refused.
 
 use crate::backend::{row_text, Color, StyledCell, StyledScreen};
 
@@ -113,9 +119,7 @@ pub fn verify_selected(screen: &StyledScreen) -> Result<OpenCodeDialog, String> 
             return Err(format!("{label:?} has no visible character"));
         };
         if bgs.iter().any(|bg| *bg != first) {
-            return Err(format!(
-                "{label:?} is only partly drawn with one background"
-            ));
+            return Err(format!("{label:?} is only partly drawn with one background"));
         }
         drawn.push(first);
         at += label.chars().count();
@@ -125,7 +129,9 @@ pub fn verify_selected(screen: &StyledScreen) -> Result<OpenCodeDialog, String> 
     }
     let (once, always, reject) = (drawn[0], drawn[1], drawn[2]);
     if once == always && once == reject {
-        return Err("no option is highlighted: all three labels have the same background".to_string());
+        return Err(
+            "no option is highlighted: all three labels have the same background".to_string(),
+        );
     }
     if always != reject {
         let who = if once == always {

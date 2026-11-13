@@ -2292,7 +2292,10 @@ mod tests {
         let fake = opencode_styled_pane(Some(styled_selected("Allow once")));
         let out = opencode_answer(&fake, "allow_once").unwrap();
         let text = out.to_string().to_lowercase();
-        assert!(!text.contains("fab283") && !text.contains("rgb") && !text.contains("idx"), "{text}");
+        assert!(
+            !text.contains("fab283") && !text.contains("rgb") && !text.contains("idx"),
+            "{text}"
+        );
     }
 
     #[test]
