@@ -148,7 +148,10 @@ fn main() -> ExitCode {
                 }
             }));
             let handle = Some(native.clone());
-            (tools::Shepherd::with_policy(native, policy), handle)
+            let shepherd = tools::Shepherd::with_policy(native, policy);
+            // No thread, and nothing to watch, when no profile sets a watchdog.
+            shepherd.spawn_watchdog();
+            (shepherd, handle)
         }
     };
     let state = Arc::new(AppState {
