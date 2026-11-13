@@ -188,7 +188,7 @@ checked end to end against OpenCode. Those checks are operator-run.
 
 ## Status and known limits
 
-Shepherd is an MVP (version 0.2.0). The native backend was verified against
+Shepherd is an MVP (version 0.3.0). The native backend was verified against
 kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 [MVP-REPORT.md](MVP-REPORT.md) (a dated record, not a current status), and the native core's design is in
 [docs/adr/native-core.md](docs/adr/native-core.md).
