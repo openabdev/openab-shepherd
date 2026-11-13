@@ -117,6 +117,10 @@ Every variable, profile field, tool argument, error code and bound is described 
 How the operator signs in to the coding CLI or supplies its key is described in
 [docs/credentials.md](docs/credentials.md).
 
+Running Shepherd beside a human terminal (openab-pty) so a terminal client can
+supervise panes is described in
+[docs/terminal-clients.md](docs/terminal-clients.md).
+
 ## OpenCode CLI
 
 Observed on a laptop with OpenCode 2.2.7 (`opencode --version`), installed locally with bun.
