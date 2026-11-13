@@ -125,8 +125,10 @@ observations are not yet attached to issue 2.
   (observed on the laptop).
 - Never pass `--auto`, and never set `session.permissions` to `autoaccept`. Both
   approve permission prompts without a dialog. A profile whose `argv` or `extra_args`
-  contains `--auto`, a `--auto-…` flag, or an `autoaccept` spelling is refused when the
-  config loads. The check does not cover `env` or OpenCode's own config file.
+  contains `--auto`, a `--auto-…` flag, or an `autoaccept` or `auto-accept` spelling is
+  refused when the config loads. The check does not cover `env` or OpenCode's own config
+  file, and it does not cover a command given to `start_pane` through
+  `allow_arbitrary_command`.
 - At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. This report was
   observed on the laptop. The output filter removes it. Whether herdr-core turns it into a
   `get_status` result is not yet verified. It is an open point pending a live check.

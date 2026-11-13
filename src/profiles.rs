@@ -672,16 +672,14 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
     })
 }
 
-/// True for an argument that approves OpenCode permission prompts without a
-/// dialog: `--auto` (with or without `=value`), any `--auto-…` flag, and any
-/// `autoaccept` or `auto-accept` spelling, such as `session.permissions=autoaccept`.
+/// True for an argument that contains an OpenCode auto-approve spelling. The
+/// match is a substring match on the whole argument, so `--auto`, `--auto=true`,
+/// `--auto-…`, `--config=--auto`, and a shell string such as `sh -c "opencode --auto"`
+/// are all refused. It also matches `autoaccept` or `auto-accept` anywhere, such as
+/// `session.permissions=autoaccept`. Over-refusal is the safe direction here.
 fn is_opencode_auto_flag(arg: &str) -> bool {
     let lower = arg.to_ascii_lowercase();
-    let flag = lower.split('=').next().unwrap_or_default();
-    flag == "--auto"
-        || flag.starts_with("--auto-")
-        || lower.contains("autoaccept")
-        || lower.contains("auto-accept")
+    lower.contains("--auto") || lower.contains("autoaccept") || lower.contains("auto-accept")
 }
 
 fn parse_source(
@@ -958,6 +956,7 @@ mod tests {
             "--auto-approve",
             "session.permissions=autoaccept",
             "--config=session.permissions=AutoAccept",
+            "--config=--auto",
         ] {
             let message = refused(&with_argv(json!(["opencode", "--standalone", flag])));
             assert!(
@@ -965,6 +964,13 @@ mod tests {
                 "{flag}: {message}"
             );
         }
+        // A shell string that starts OpenCode with the flag is still an argv containing it.
+        let shell = with_argv(json!(["sh", "-c", "opencode --auto"]));
+        let message = refused(&shell);
+        assert!(
+            message.contains("--auto") && message.contains("opencode"),
+            "{message}"
+        );
         let in_extra = json!({"profiles": [{"name": "oc", "agent": "opencode",
             "argv": ["opencode"], "extra_args": ["--auto"], "cwds": [d]}]})
         .to_string();
