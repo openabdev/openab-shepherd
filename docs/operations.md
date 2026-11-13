@@ -673,6 +673,28 @@ build host needs `sh`, `cat`, `printf`, `env` and `ls`.
 
 The operator end-to-end runbook, which drives real Devin and OpenCode panes through the MCP tools, is in [`docs/operator-e2e/`](operator-e2e/README.md).
 
+## CI
+
+`.github/workflows/ci.yml` runs on every pull request and on pushes to `main`. It uses no
+secrets and only read access to the repository.
+
+- `test` runs on `ubuntu-latest` and `macos-latest`: `cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo test --no-fail-fast`.
+- `docker-build` builds the `Dockerfile` with its default build arguments (no Devin CLI),
+  pushes nothing, and runs `openab-shepherd --help` in the image.
+
+To reproduce the `test` job locally, run these three commands in the crate directory:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --no-fail-fast
+```
+
+CI installs the stable Rust toolchain on the runner. The project itself is built on a
+separate build host (see "Build offload"), so a newer stable release can add clippy
+warnings that the build host does not show yet.
+
 ## Build offload
 
 The laptop never runs `cargo` or `rustc`. Sync the crate to the build host with
