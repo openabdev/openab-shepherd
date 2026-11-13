@@ -3,7 +3,7 @@ name = "openab-shepherd"
 version = "0.2.0"
 edition = "2021"
 publish = false
-description = "MCP server that exposes terminal panes as tools, over herdr-core or its own native PTY core (loopback only, bearer token)"
+description = "MCP server that exposes terminal panes as tools, over its own native PTY core (loopback only, bearer token)"
 
 [dependencies]
 libc = "0.2"

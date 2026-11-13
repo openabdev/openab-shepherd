@@ -7,9 +7,8 @@ the overview, see the [README](../README.md).
 Shepherd is an MCP server that exposes terminal panes as MCP tools. It listens on
 loopback only and requires a bearer token. The panes are run by a terminal backend
 behind a trait (see [Terminal backend](#terminal-backend)): the native core is the
-default, and herdr-core (hc) is optional. Status: MVP. The latest recorded run on the
-build host passed 264 unit tests (lib 261, bin 3), counted with `cargo test` on the build host. Test and probe results are in
-[`MVP-REPORT.md`](../MVP-REPORT.md).
+only backend. Status: MVP. Test and probe results are in
+[`MVP-REPORT.md`](../MVP-REPORT.md), a dated record rather than a current status.
 
 ## Language: Rust
 
@@ -46,10 +45,6 @@ later is a contained change.
 | `src/native/tests.rs` | Test-only: native tests with real programs |
 | `examples/native_probe.rs` | The real-Kiro probe for the native backend |
 | `examples/native_leak_check.rs` | Real-Kiro leak check: removes a pane and verifies no descendant process survives (issue #10) |
-| `src/hc/mod.rs` | `HcBackend`: the herdr-core adapter. The only code that knows hc method names, JSON fields, and error kinds |
-| `src/hc/rpc.rs` | JSON-RPC 2.0 client over the herdr-core Unix socket |
-| `src/hc/error_kinds.json` | The herdr-core error kinds the adapter maps (extracted from its schema) |
-| `src/hc/fake.rs`, `src/hc/tests.rs` | Test-only: a fake hc socket, and tool tests over the hc wire |
 | `src/tools.rs` | The nine tools, their schemas, the safety rules, and the backend calls each one makes |
 | `src/dialog.rs` | Text parser for the kiro-cli permission dialog |
 | `src/devin_dialog.rs` | Text parser for the Devin CLI permission dialog |
@@ -71,10 +66,9 @@ openssl rand -hex 32 > <token-file>
 chmod 600 <token-file>
 ```
 
-Start the server. By default it runs panes on its own native terminal core
-(`OPENAB_SHEPHERD_BACKEND=native`, see [Native backend](#native-backend)) and needs
-no herdr-core. To use herdr-core instead, set `OPENAB_SHEPHERD_BACKEND=hc` and
-`HC_SOCKET` to the herdr-core socket path; the server has no default for it.
+Start the server. It runs panes on its own native terminal core, the only backend
+(see [Native backend](#native-backend)). `OPENAB_SHEPHERD_BACKEND` may be unset,
+empty or `native`; it needs nothing else.
 
 The command below is documentation for the operator. The operator runs it by hand,
 outside the agent's command guard. No script in this crate runs it.
@@ -96,15 +90,16 @@ arbitrary commands, so `start_pane` starts nothing (see
   IPv6 loopback address. Any other value, including the all-interfaces wildcard
   address and the name `localhost`, exits with status 2 before anything listens.
 - No token, both token variables set, a token shorter than 16 characters, an
-  `OPENAB_SHEPHERD_BACKEND` other than `native` or `hc`, or `hc` without
-  `HC_SOCKET` also exit with status 2. The reason goes to stderr.
+  `OPENAB_SHEPHERD_BACKEND` that is set to anything other than empty or `native`
+  (including `hc`, which was removed) also exit with status 2. The reason goes to
+  stderr.
 - Token variables: `OPENAB_SHEPHERD_TOKEN_FILE` (preferred) or `OPENAB_SHEPHERD_TOKEN`.
   Use one of them, not both.
 - A launch profiles file that is unreadable, inside a git repository, or invalid
   also exits with status 2.
 - An invalid `OPENAB_SHEPHERD_ALLOWED_HOSTS` entry also exits with status 2 (see
   [Behind tailscale serve](#behind-tailscale-serve)).
-- The startup line names the backend: `(backend: native)` or `(backend: hc)`.
+- The startup line names the backend: `(backend: native)`.
 
 ### Token file rules
 
@@ -125,7 +120,7 @@ also be a regular file owned by the user Shepherd runs as and writable by no one
 Shepherd refuses to start.
 
 Upgrading: `start_pane` without a profiles file now refuses every start with
-`profile_required`, on the hc backend too. Create a profiles file with the programs
+`profile_required`. Create a profiles file with the programs
 you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
 `argv`/`line` (without credentials).
 
@@ -216,39 +211,28 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
 - Unknown fields are refused, so a typo cannot silently drop a restriction.
 - `list_panes` returns `profiles` (each profile's `name` and `cwds`, never its argv or
   env) and `allow_arbitrary_command`, so a caller can see what it may start.
-- The hc backend runs profiles without `env`; a profile with `env` returns
-  `unsupported` there before any source is read.
 - Programs a profile's pane runs (Kiro's tools, for example) inherit its
   environment. A profile's credential is as exposed as anything that program does.
 
 For how the operator signs in to the coding CLI or supplies its key, see
 [credentials.md](credentials.md).
 
-### herdr-core socket (hc backend only)
-
-- `HC_SOCKET` is the override. The herdr-core binary names it in its own error text.
-- `hc --help` names `~/.config/herdr-core/config.toml` as the settings file. It does
-  not show `HC_SESSION` or a `socket` key. This server reads neither, and whether
-  either one sets the socket is unverified. The operator sets `HC_SOCKET` explicitly.
-- The default socket path is unknown. The server never guesses one.
-
 ## Tools
 
 Panes are identified by **name**: pass the name `start_pane` returned as `terminal`
 to every other tool. Every pane Shepherd starts has one: give `start_pane` a `name`,
 or Shepherd picks `pane-` plus 12 hex digits and returns it. The backend's own
-reference (herdr-core: its address) stays inside Shepherd, where the pane lock keys
+reference (an internal id) stays inside Shepherd, where the pane lock keys
 on it; pane objects do not carry it. A pane started outside Shepherd without a name
 is listed by `list_panes` with `name: null` and cannot be addressed through Shepherd.
 
 Every tool that takes `terminal` first resolves it with a `get`, and goes on only if
-the pane found carries exactly that name. herdr-core's `get` also accepts an address
-(`t9`), so this check is what keeps addresses out: a call naming an address, whether
-of an unnamed pane or of a named one, fails with `not_found` and nothing else reaches
-the backend. Calls after the lookup use the pane's internal id. `send_input`,
+the pane found carries exactly that name. A call naming an internal id, whether of an
+unnamed pane or of a named one, fails with `not_found` and nothing else reaches the
+backend. Calls after the lookup use the pane's internal id. `send_input`,
 `interrupt_pane`, `answer_dialog`, and `remove_pane` resolve the pane twice (see
 [Pane lock](#pane-lock)). The implementing function is in
-`src/tools.rs`; the herdr-core method behind each backend call is listed in
+`src/tools.rs`; the backend calls are the `TerminalBackend` trait methods listed in
 [Terminal backend](#terminal-backend).
 
 | MCP tool | Backend calls | Parameters | Result |
@@ -258,7 +242,7 @@ the backend. Calls after the lookup use the pane's internal id. `send_input`,
 | `read_output` | `get`, `read` | `terminal`, `lines` (0 to 10000) | `text` (escapes stripped), `complete`, `source` (`screen`, `history`, `stitched`, or `other`), `reason` (why only the screen was read: `blocked`, `other`, or null) |
 | `get_status` | `get` | `terminal` | a [pane object](#pane-object) plus `terminal` |
 | `wait_status` | `get`, `wait`, then `get` if it ended blocked without a kind | `terminal`, `timeout` (1 to 1800 s, default 30) | `terminal`, `outcome`, `turn_complete`, `ended`, `reason`, `status` (a state word), `kind`, `exit_code`, `turn`, and `status_now` when the extra `get` ran |
-| `list_panes` | `list` | `all` | `panes` (pane objects), `hidden_finished` (finished panes left out; null if the backend does not say), `live_panes` (running panes now), `live_pane_limit` (how many may run at once: 8 on the native backend, null on hc), `profiles` (`name` and `cwds` of each launch profile), `allow_arbitrary_command` |
+| `list_panes` | `list` | `all` | `panes` (pane objects), `hidden_finished` (finished panes left out; null if the backend does not say), `live_panes` (running panes now), `live_pane_limit` (how many may run at once: 8 on the native backend; null for a backend with no limit), `profiles` (`name` and `cwds` of each launch profile), `allow_arbitrary_command` |
 | `interrupt_pane` | `get` (twice), `interrupt` | `terminal`, `timeout` (1 to 60 s, optional) | `terminal`, `key` (the stop key the backend chose: `esc`, `ctrl+c`, or `other`), `outcome` (`stopped`, `exited`, `still_working`, `unknown`, or `other`) |
 | `answer_dialog` | `get`, `read`, `keys` | `terminal`, `choice` (`allow_once` or `deny_once`) | `terminal`, `choice`, `selected`, `title`, `command`, `options`, `moves`, `keys_result` (`status`, `turn`) |
 | `remove_pane` | `get` (twice), `remove` | `terminal`, `timeout` (0 to 60 s, default 2: the grace before the kill) | `name`, `was_live` (the program was running), `stopped` (`exited`, `killed`, `other`, or null when it had already finished), `exit_code` (128 + the signal number when a signal ended it; null when unknown). See [remove_pane](#remove_pane) |
@@ -322,13 +306,13 @@ Branch on `outcome`:
 |-----------|------|-----------------|
 | `done` | `ended`, `reason: "status"`, `status: "done"` | true |
 | `exited` | `ended`, `reason: "exit"` | true |
-| `blocked` | `ended`, `reason: "status"`, `status: "blocked"`. `kind` comes from a follow-up `get` when the wait did not report it (herdr-core's wait never does) | false |
+| `blocked` | `ended`, `reason: "status"`, `status: "blocked"`. `kind` comes from a follow-up `get` when the wait did not report it (a backend's wait may not report it) | false |
 | `cancelled` | `ended`, `reason: "status"`, `status: "idle"`, after `answer_dialog` on this process answered this pane's dialog (a Devin `deny_once` or Esc returns to idle, not done) | false |
 | `timeout` | `ended: false`, `reason: "timeout"`: a check-in, the pane is still running | false |
 | `other` | anything else (`idle`, `error`, a message to the caller, `not_started`). Read `status` and `reason` | false |
 
 `turn` advances on blocked too, so a changed `turn` is not a completion signal. A
-wait reply the backend cannot read (herdr-core: no boolean `ended`) is reported as
+wait reply the backend cannot read (for example, no boolean `ended`) is reported as
 error `backend_error`, never as idle. If the follow-up `get` shows the pane is no
 longer blocked, `kind` is null and `status_now` shows the current status.
 
@@ -340,11 +324,11 @@ returns error `pane_blocked` with `kind` (the dialog, for example `permission`) 
 `next`, which says to read the screen and use `answer_dialog`. For `kind=auth` the
 CLI is not logged in: `next` says to tell the operator, and `answer_dialog` is not the way.
 
-Who refuses depends on the backend's `conditional_input` capability. herdr-core has
-it: its send refuses a blocked program in the same step as the write. If herdr-core's
-refusal does not name the dialog, Shepherd reads the pane once more for `kind` (and
+Who refuses depends on the backend's `conditional_input` capability. The native
+backend has it: its send refuses a blocked program in the same step as the write. If
+the refusal does not name the dialog, Shepherd reads the pane once more for `kind` (and
 uses the status read before the send only if that read fails). A
-backend without it gets the check from Shepherd: the status read inside the pane lock
+backend without it would get the check from Shepherd: the status read inside the pane lock
 must not be `blocked`, then the text is sent, still inside the lock.
 
 ### answer_dialog
@@ -390,8 +374,8 @@ must not be `blocked`, then the text is sent, still inside the lock.
 
 Every key is sent with an `InputGuard` (state `blocked`, kind `permission`, the
 recorded turn). A backend with the `conditional_keys` capability enforces it in the
-same step as the key press, and Shepherd then skips step 5. herdr-core lacks it, so
-for herdr-core step 5 runs as described.
+same step as the key press, and Shepherd then skips step 5. The native backend has
+it. A backend without it would run step 5 as described.
 
 If a check fails, the tool never sends `enter`, and returns error `refused` with
 `structuredContent` holding `reason`, `seen` (the status or the last 40 screen lines),
@@ -420,12 +404,9 @@ What this guarantees, and what it does not:
   longer blocked and is refused.
 - **Re-checked just before Enter.** Status, kind, and turn are read again after the
   cursor is confirmed.
-- **No herdr-core guard on the key.** herdr-core 0.1.19's key press has no status
-  or turn condition, so `conditional_keys` is false for it. The re-check and the
-  `enter` are therefore two calls. A person at the terminal or another herdr-core
-  client on the same host can still change the dialog between them, and `enter`
-  would then select whatever is under the cursor. The design accepts this because
-  Shepherd is meant to be the only client of the socket.
+- **Guarded key.** The native backend has `conditional_keys`: `enter` carries the
+  status, kind and turn guard and is checked in the same step as the key press, and no
+  other client can attach to a native pane.
 
 ### remove_pane
 
@@ -454,12 +435,7 @@ runs at most 8 panes, and finished panes keep their screen memory until removed)
 
 A `send_input`, `interrupt_pane` or `answer_dialog` that was waiting for the lock
 gets `not_found` once the removal is done, and nothing is typed. A `wait_status` in
-flight on the pane (it takes no lock) returns `outcome: "exited"`. With hc, the
-removal is herdr-core's own `kill` (hangup, terminate, kill, on its own timing, so
-`timeout` is not used) followed by `rm`; `stopped` is `killed` when herdr-core
-reports SIGKILL, `exited` for another signal or a plain exit, else `other`.
-With hc, processes that left the pane's process group (`setsid`, daemonizing) are
-not reached.
+flight on the pane (it takes no lock) returns `outcome: "exited"`.
 
 ### Pane lock
 
@@ -488,32 +464,34 @@ pane lock, refusing to type into a blocked pane, and `answer_dialog`'s checks.
 `Capabilities` says what a backend can also do itself, so Shepherd can choose a
 native call or its own fallback:
 
-| Flag | When true | When false | hc | native |
-|------|-----------|------------|----|--------|
-| `conditional_input` | `send` enforces its `InputGuard` (refuse while blocked) in the same step as the write | Shepherd checks the status under the pane lock, then sends | true | true |
-| `conditional_keys` | `keys` enforces its `InputGuard` (state, kind, turn) with the key press | Shepherd re-checks status, kind, and turn before `enter` | false | true |
-| `client_command` | `run` takes a caller-chosen `argv` or `line` | `start_pane` returns `unsupported` | true | true |
-| `client_cwd` | `run` takes a caller-chosen `cwd` | `start_pane` with `cwd` returns `unsupported` | true | true |
-| `client_env` | `run` takes extra environment variables for that run | `start_pane` with `env` returns `unsupported` | false | true |
-| `screen_text` | `read` returns rendered screen text | `read_output` and `answer_dialog` return `unsupported` | true | true |
-| `program_status` | the backend reports the program's OSC 7501 status and turns | informational | true | true |
-| `history` | `read` with history lines returns scrollback | `read_output` with `lines > 0` returns `unsupported` | true | true |
-| `native_wait` | `wait` blocks inside the backend | informational (Shepherd would poll) | true | true |
-| `survives_restart` | panes outlive a Shepherd restart | informational | true | false |
+| Flag | When true | When false | native |
+|------|-----------|------------|--------|
+| `conditional_input` | `send` enforces its `InputGuard` (refuse while blocked) in the same step as the write | Shepherd checks the status under the pane lock, then sends | true |
+| `conditional_keys` | `keys` enforces its `InputGuard` (state, kind, turn) with the key press | Shepherd re-checks status, kind, and turn before `enter` | true |
+| `client_command` | `run` takes a caller-chosen `argv` or `line` | `start_pane` returns `unsupported` | true |
+| `client_cwd` | `run` takes a caller-chosen `cwd` | `start_pane` with `cwd` returns `unsupported` | true |
+| `client_env` | `run` takes extra environment variables for that run | `start_pane` with `env` returns `unsupported` | true |
+| `screen_text` | `read` returns rendered screen text | `read_output` and `answer_dialog` return `unsupported` | true |
+| `program_status` | the backend reports the program's OSC 7501 status and turns | informational | true |
+| `history` | `read` with history lines returns scrollback | `read_output` with `lines > 0` returns `unsupported` | true |
+| `native_wait` | `wait` blocks inside the backend | informational (Shepherd would poll) | true |
+| `survives_restart` | panes outlive a Shepherd restart | informational | false |
 
 `RunSpec.profile` names the launch profile Shepherd resolved `argv` and `cwd` from,
 and `RunSpec.profile_env` carries that profile's environment, already read from its
 sources (a `Secret`, whose `Debug` is redacted). Only Shepherd sets them, only from a
-profile. hc refuses a non-empty `profile_env`.
+profile.
 
-Two backends exist, chosen at startup with `OPENAB_SHEPHERD_BACKEND`:
-`NativeBackend` (`src/native/`, the default) and `HcBackend` (`src/hc/`, optional).
+`NativeBackend` (`src/native/`) is the only backend and is what Shepherd starts;
+`OPENAB_SHEPHERD_BACKEND` accepts only unset, empty or `native`, and any other value
+exits with status 2. The trait stays so that another backend can be added later
+without touching the tools; none is planned. The herdr-core (hc) backend was removed.
 
 ### Native backend
 
-`OPENAB_SHEPHERD_BACKEND=native` (or unset) runs each pane as a child of Shepherd on
-its own PTY, with a `vt100` emulator for the screen. No herdr-core and no
-`HC_SOCKET` are needed; `HC_SOCKET` is ignored if set. Pane ids are `n:<k>`
+The native backend runs each pane as a child of Shepherd on
+its own PTY, with a `vt100` emulator for the screen. Nothing external is needed.
+Pane ids are `n:<k>`
 (internal; callers still use names).
 
 - **Child environment.** `env_clear()`, then only `HOME`, `PATH` (default
@@ -527,7 +505,7 @@ its own PTY, with a `vt100` emulator for the screen. No herdr-core and no
   under the input rules (empty allowed), for that pane only. It may not set `HOME`,
   `PATH`, `USER`, `LANG`, `TERM` or any `DYLD_*`/`LD_*` name (refused with
   `invalid_input`). Shepherd's token, token file path, profiles path,
-  `OPENAB_SHEPHERD_BACKEND`, `HC_*` and everything else never reach a child. Descriptors are close-on-exec and native spawns are serialized.
+  `OPENAB_SHEPHERD_BACKEND` and everything else never reach a child. Descriptors are close-on-exec and native spawns are serialized.
 - **Process groups and descendants.** Each child is a session and group leader with
   the PTY as its controlling terminal. Shepherd also tracks every descendant of the
   child, by pid and start time: by parent pid every 250 ms while the child runs and
@@ -553,8 +531,8 @@ its own PTY, with a `vt100` emulator for the screen. No herdr-core and no
 - **Conditional input and keys are atomic.** The status check and the write happen
   under the same pane-state lock, so a status change cannot slip in between.
   `answer_dialog`'s Enter carries the turn and kind guard, and no other client can
-  attach to a native pane. The [residual race on Enter](#known-limits-mvp-scope)
-  applies to hc only.
+  attach to a native pane. The Enter has no
+  residual race.
 - **Keys** follow DECCKM and the kitty flags the program pushed (kiro-cli 3.1.0
   pushes flag 1, disambiguate).
 
@@ -586,36 +564,6 @@ Verified against kiro-cli 3.1.0 by `examples/native_probe.rs` (see
 [`MVP-REPORT.md`](../MVP-REPORT.md)). The design is recorded in
 [`docs/adr/native-core.md`](adr/native-core.md).
 
-### hc backend
-
-`OPENAB_SHEPHERD_BACKEND=hc` uses herdr-core over its socket (`HC_SOCKET`, required).
-herdr-core is optional: only this backend needs it. Trait call to herdr-core method:
-
-| Trait call | herdr-core method | Notes |
-|------------|-------------------|-------|
-| `run` | `terminal.run` | `argv` or `line`, `cwd`, `name` |
-| `get` | `terminal.get` | |
-| `list` | `terminal.list` | `all` |
-| `read` | `terminal.read` | `lines` |
-| `send` | `terminal.send` | never `force`; refuses while blocked |
-| `keys` | `terminal.keys` | no condition |
-| `wait` | `terminal.wait` | socket timeout is the wait plus 15 s |
-| `interrupt` | `terminal.interrupt` | |
-| `remove` | `terminal.get`, then `terminal.kill` if live, then `terminal.rm` | herdr-core times its own stop; the grace is not sent |
-
-hc error kinds map to Shepherd codes: `not_found` and `machine_unknown` to
-`not_found`, `name_taken` to `name_taken`, `blocked` to `pane_blocked`,
-`status_mismatch` to `status_mismatch`, `finished` to `pane_finished`,
-`invalid_params` to `invalid_input`, `unavailable`, `unreachable` (or a socket that
-cannot be reached) to `unavailable`, a reply timeout to `timeout`, and everything else
-(`spawn_failed`, `config`, transport or protocol failures, ...) to `backend_error`.
-`src/hc/error_kinds.json` lists every error kind in the herdr-core 0.1.19 schema and
-the kinds each adapter method can return; the tests check that each one has an
-expected Shepherd code and reaches MCP as that code. Dialog kinds in hc statuses
-are normalized the same way: `permission`, `question` and `auth` pass through, and
-any other word reaches callers as `other`. Regenerate it when the
-supported herdr-core version changes.
-
 ## Input rules
 
 Applied to every string field that reaches the backend (`line`, each `argv` element,
@@ -629,7 +577,7 @@ Applied to every string field that reaches the backend (`line`, each `argv` elem
 3. Reject an empty result.
 4. Reject a result over **4096 bytes** of UTF-8.
 
-`name` must also match herdr-core's naming rule: 1 to 32 characters of `a-z`, `0-9`,
+`name` must also match Shepherd's naming rule: 1 to 32 characters of `a-z`, `0-9`,
 `-`, `_`, `.`.
 
 The cleaned value is what gets sent. For `argv`, that means each element is trimmed,
@@ -653,8 +601,7 @@ text removes the rest of the text. Newlines and tabs are kept.
 - Bearer token: compared in constant time. A missing or wrong token gets HTTP 401.
 - Only `POST /mcp` is served. `GET` gets 405. Notifications get 202.
 - The listener binds the validated loopback address only. The server does not run
-  `tailscale serve`, Funnel, or any other public listener. The herdr-core socket is
-  never exposed.
+  `tailscale serve`, Funnel, or any other public listener.
 - Request bodies are capped at 1 MiB, read before the token check. Request bodies
   are not logged.
 
@@ -703,9 +650,8 @@ cargo test
 cargo build --release
 ```
 
-The unit tests need no herdr-core daemon. The tool tests over the hc wire use a fake
-Unix socket in `/tmp`, the backend-neutral tests use an in-memory `FakeBackend`, and
-the config tests run `git init` in a scratch directory, so `git` must be installed.
+The unit tests need no external daemon. The backend-neutral tool tests use an in-memory
+`FakeBackend`, and the config tests run `git init` in a scratch directory, so `git` must be installed.
 The native integration tests (`native::tests`) run real programs on a PTY, so the
 build host needs `sh`, `cat`, `printf`, `env` and `ls`.
 
@@ -787,12 +733,6 @@ try to update itself at run time).
   is tested against the layout measured on Devin CLI 3000.12.43 for shell commands.
   Other tools (fs_write, MCP), other programs, other versions, and `kind` values
   `question` or `auth` are untested or refused. `force` is never sent.
-- **Residual race on Enter (hc only).** With hc, `answer_dialog` is serialized
-  against other Shepherd calls and re-checks status and turn just before `enter`, but
-  herdr-core has no conditional key press (`conditional_keys` is false). A person at
-  the terminal or another herdr-core client can still move or replace the dialog
-  between that re-check and `enter`. The native backend guards the Enter atomically
-  and has no other clients.
 - **Native: no restart survival.** Native panes are Shepherd's children; they end
   when Shepherd exits.
 - **Native: no viewer or attach.** Nobody can watch or type into a native pane
@@ -834,20 +774,13 @@ try to update itself at run time).
   trailing spaces inside an `argv` element are lost.
 - **Grok Bot tested by hand only.** Grok Bot has connected to a deployed endpoint and
   called these tools in manual sessions. No automated test covers that client.
-- **Plain-mode framing.** The client sends no `hello`. The schema describes plain
-  mode as one message per line. The 2026-11-10 operator run
-  (see [`MVP-REPORT.md`](../MVP-REPORT.md)) made hc calls without `hello` and they
-  succeeded; whether herdr-core ever requires `hello` is otherwise unverified.
 - **Stateless HTTP.** No SSE stream and no session ids. Clients that expect server
   push or sessions will not get them.
-- **Socket path (hc).** The default is unknown. `HC_SOCKET` is required for hc.
 - **Token file check-then-read.** The mode and location are checked, then the file
   is read. Someone who can replace files in the token's folder could swap the file
   between the two steps. The 0600 mode and a folder outside the repository are the
   defense.
-- **Two backends.** The native core is the default and was verified against
-  kiro-cli 3.1.0; hc is optional. openab-pty is not a backend yet.
+- **One backend.** The native core is the only backend and was verified against
+  kiro-cli 3.1.0. openab-pty is not a backend.
 - **Integration.** The native backend's real-program tests run in `cargo test` and
-  the real-Kiro probe ran on the laptop ([`MVP-REPORT.md`](../MVP-REPORT.md)). The operator ran the
-  live herdr-core checks on the MVP build; they have not been re-run since the
-  result shapes changed.
+  the real-Kiro probe ran on the laptop ([`MVP-REPORT.md`](../MVP-REPORT.md), a dated record).

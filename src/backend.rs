@@ -1,9 +1,9 @@
 //! The terminal backend: what Shepherd needs from the program that runs panes.
 //!
 //! The MCP tools in `tools.rs` talk only to [`TerminalBackend`]. Every type here
-//! is Shepherd's own vocabulary; an adapter (`hc::HcBackend`, and the native
-//! core in `native/`) maps its backend's wire format onto it. Safety rules (input validation, the pane
-//! lock, refusing to type into a blocked pane, the answer_dialog checks) live in
+//! is Shepherd's own vocabulary; an adapter (the native
+//! core in `native/`) maps its backend's wire format onto it. Safety rules
+//! (input validation, the pane lock, refusing to type into a blocked pane, the answer_dialog checks) live in
 //! Shepherd, not in a backend. [`Capabilities`] tells Shepherd which of them a
 //! backend can also enforce atomically.
 
@@ -533,4 +533,18 @@ pub trait TerminalBackend: Send + Sync {
         t: &TerminalRef,
         grace: Option<Duration>,
     ) -> Result<RemoveResult, BackendError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dialog_kind;
+
+    #[test]
+    fn known_dialog_kinds_pass_through() {
+        for kind in ["permission", "question", "auth"] {
+            assert_eq!(dialog_kind(kind), kind);
+        }
+        assert_eq!(dialog_kind(""), "other");
+        assert_eq!(dialog_kind("Permission"), "other");
+    }
 }

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- The herdr-core (hc) backend is removed. Native is the only backend.
+  `OPENAB_SHEPHERD_BACKEND` accepts only unset, empty or `native`; any other value,
+  including `hc`, exits with status 2. `HC_SOCKET` is no longer read.
+
 ## 0.2.0
 
 ### Changes
