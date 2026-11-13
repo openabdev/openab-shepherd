@@ -126,7 +126,9 @@ observations are not yet attached to issue 2.
 - Never pass `--auto`, and never set `session.permissions` to `autoaccept`. Both
   approve permission prompts without a dialog. A profile whose `argv` or `extra_args`
   contains `--auto`, a `--auto-…` flag, or an `autoaccept` or `auto-accept` spelling is
-  refused when the config loads. The check does not cover `env` or OpenCode's own config
+  refused when the config loads. This applies when the profile sets `agent: "opencode"`,
+  or when any argv element names `opencode` (for example `npx opencode`, `sh -c "opencode …"`,
+  or `/usr/local/bin/opencode`), even with no `agent` field. The check does not cover `env` or OpenCode's own config
   file, and it does not cover a command given to `start_pane` through
   `allow_arbitrary_command`.
 - At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. This report was

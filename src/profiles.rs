@@ -558,12 +558,10 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         Some(Value::Bool(allow)) => *allow,
         Some(_) => return Err(err(format!("{at}: allow_bypass must be true or false"))),
     };
-    // The program decides whether this is OpenCode, not only the declared agent:
-    // a profile with no `agent` field still defaults to Kiro.
-    let runs_opencode = Path::new(&argv[0])
-        .file_name()
-        .and_then(|name| name.to_str())
-        == Some("opencode");
+    // The argv decides whether this is OpenCode, not only the declared agent: a profile
+    // with no `agent` field still defaults to Kiro, and a wrapper such as `sh -c` or `npx`
+    // runs OpenCode from a later element.
+    let runs_opencode = argv.iter().any(|a| names_opencode(a));
     if agent == Agent::OpenCode || runs_opencode {
         if let Some(arg) = argv.iter().find(|a| is_opencode_auto_flag(a)) {
             return Err(err(format!(
@@ -680,6 +678,13 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
 fn is_opencode_auto_flag(arg: &str) -> bool {
     let lower = arg.to_ascii_lowercase();
     lower.contains("--auto") || lower.contains("autoaccept") || lower.contains("auto-accept")
+}
+
+/// True when an argument names the `opencode` program as a whole word: the argument is
+/// `opencode`, a path ending in `/opencode`, or a shell string with an `opencode` word.
+fn names_opencode(arg: &str) -> bool {
+    arg.split(|c: char| c.is_whitespace() || c == '/')
+        .any(|word| word == "opencode")
 }
 
 fn parse_source(
@@ -999,6 +1004,16 @@ mod tests {
         let absolute = json!({"profiles": [{"name": "oc", "argv": ["/usr/local/bin/opencode", "--auto"], "cwds": [d]}]})
             .to_string();
         assert!(refused(&absolute).contains("--auto"));
+        // Wrappers that start OpenCode are refused even with no `agent` field.
+        for argv in [
+            json!(["sh", "-c", "opencode --auto"]),
+            json!(["npx", "opencode", "--auto"]),
+            json!(["env", "FOO=1", "/usr/local/bin/opencode", "--auto-accept"]),
+        ] {
+            let text = json!({"profiles": [{"name": "oc", "argv": argv, "cwds": [d]}]}).to_string();
+            let message = refused(&text);
+            assert!(message.contains("opencode"), "{message}");
+        }
         // The same flag on a program that is not OpenCode is the operator's own choice.
         let kiro =
             json!({"profiles": [{"name": "k", "argv": ["kiro-cli", "--auto"], "cwds": [d]}]})
