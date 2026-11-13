@@ -255,6 +255,7 @@ fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
             &mut slave,
             ptr::null_mut(),
             ptr::null_mut::<libc::termios>(),
+            // openpty takes *const winsize on Linux and *mut on macOS; it never writes through it.
             ptr::from_ref(&size).cast_mut(),
         )
     };
