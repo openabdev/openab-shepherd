@@ -1541,25 +1541,55 @@ fn step_devin(
             let reason = format!("after a move the status is {after:?}, not blocked");
             return Err(ask.mismatch(sent, reason, json!({"keys_result": result.to_json()}))?);
         }
-        let screen = read_screen(ask.sh, ask.pane, ask.terminal)?;
-        let now = match ask.agent.parse_dialog(&screen) {
-            Ok(now) if now.title == first.title && now.command == first.command => now,
-            Ok(_) => {
-                let reason = "a different dialog is on the screen after a move".to_string();
-                return Err(ask.mismatch(sent, reason, json!({"screen": tail(&screen)}))?);
+        // Devin redraws the highlight about 60 ms after the key, so the first
+        // read can still show the old row. Re-read a bounded number of times;
+        // only the old row (or an unparseable screen) is waited out. Any other
+        // row, or a different dialog, is a mismatch at once.
+        let mut landed = None;
+        let mut last_screen = String::new();
+        let mut last_problem = String::new();
+        for attempt in 0..CONFIRM_READS {
+            if attempt > 0 {
+                thread::sleep(CONFIRM_INTERVAL);
             }
-            Err(err) => {
-                let reason = format!("cannot parse the dialog after a move: {err}");
-                return Err(ask.mismatch(sent, reason, json!({"screen": tail(&screen)}))?);
+            last_screen = read_screen(ask.sh, ask.pane, ask.terminal)?;
+            match ask.agent.parse_dialog(&last_screen) {
+                Ok(now) if now.title != first.title || now.command != first.command => {
+                    let reason = "a different dialog is on the screen after a move".to_string();
+                    return Err(ask.mismatch(
+                        sent,
+                        reason,
+                        json!({"screen": tail(&last_screen)}),
+                    )?);
+                }
+                Ok(now) if now.cursor == next => {
+                    landed = Some(now);
+                    break;
+                }
+                Ok(now) if now.cursor == cursor => {
+                    last_problem = format!(
+                        "after a move the highlight is on {:?}, not on {:?}",
+                        now.options[now.cursor], first.options[next]
+                    );
+                }
+                Ok(now) => {
+                    let reason = format!(
+                        "after a move the highlight is on {:?}, not on {:?}",
+                        now.options[now.cursor], first.options[next]
+                    );
+                    return Err(ask.mismatch(
+                        sent,
+                        reason,
+                        json!({"screen": tail(&last_screen)}),
+                    )?);
+                }
+                Err(err) => last_problem = format!("cannot parse the dialog after a move: {err}"),
             }
-        };
-        if now.cursor != next {
-            let reason = format!(
-                "after a move the highlight is on {:?}, not on {:?}",
-                now.options[now.cursor], first.options[next]
-            );
-            return Err(ask.mismatch(sent, reason, json!({"screen": tail(&screen)}))?);
         }
+        let Some(now) = landed else {
+            let reason = format!("{last_problem} (after {CONFIRM_READS} reads)");
+            return Err(ask.mismatch(sent, reason, json!({"screen": tail(&last_screen)}))?);
+        };
         cursor = now.cursor;
     }
     Ok(moves)
@@ -2185,6 +2215,43 @@ mod tests {
         let err = devin_answer(&fake, "deny_once").unwrap_err();
         assert_eq!(err.data["error"], "refused");
         assert_eq!(key_names(&fake), [["down"], ["esc"]]);
+    }
+
+    #[test]
+    fn devin_deny_once_waits_for_a_highlight_that_updates_on_the_second_read() {
+        // Each Down is first read on the old row (Devin redraws ~60 ms later).
+        let fake = blocked_devin_pane(vec![devin_screen(0), devin_screen(1), devin_screen(2)]);
+        fake.state.lock().unwrap().stale_reads = 1;
+        let out = devin_answer(&fake, "deny_once").unwrap();
+        assert_eq!(out["selected"], "Deny");
+        assert_eq!(out["moves"], 2);
+        assert_eq!(key_names(&fake), [["down"], ["down"], ["enter"]]);
+    }
+
+    #[test]
+    fn devin_refuses_after_bounded_rereads_when_the_highlight_never_moves() {
+        let fake = blocked_devin_pane(vec![devin_screen(0)]);
+        let err = devin_answer(&fake, "deny_once").unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        assert!(err.text.contains("after 5 reads"), "{}", err.text);
+        assert_eq!(key_names(&fake), [["down"], ["esc"]]);
+    }
+
+    #[test]
+    fn devin_refuses_at_once_when_the_highlight_lands_on_the_wrong_row() {
+        // Allow to Deny in one Down skips the verified Bypass row.
+        let fake = blocked_devin_pane(vec![devin_screen(0), devin_screen(2)]);
+        let err = devin_answer(&fake, "deny_once").unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        assert_eq!(key_names(&fake), [["down"], ["esc"]]);
+    }
+
+    #[test]
+    fn devin_refuses_when_bypass_is_still_highlighted_at_the_end() {
+        let fake = blocked_devin_pane(vec![devin_screen(0), devin_screen(1), devin_screen(1)]);
+        let err = devin_answer(&fake, "deny_once").unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        assert_eq!(key_names(&fake), [["down"], ["down"], ["esc"]]);
     }
 
     #[test]
