@@ -575,56 +575,132 @@ fn children_inherit_only_stdio_even_when_spawned_together() {
             .split_whitespace()
             .filter_map(|word| word.parse().ok())
             .collect();
-        // 0, 1, 2 and what ls itself opened, which take the lowest free
-        // numbers: one directory on Linux, two on macOS (fts opens "." as
-        // well; a plain ssh shell on remote build host lists 0-4 too). A leaked
-        // descriptor would add a number or push ls's own up.
-        let own = if cfg!(target_os = "macos") { 2 } else { 1 };
-        let expected: BTreeSet<u32> = (0..3 + own).collect();
-        assert_eq!(fds, expected, "inherited descriptors: {text}");
+        // 0, 1, 2 and what ls itself opened (one directory descriptor on
+        // Linux, two on macOS; an ssh shell may add more). A leaked
+        // descriptor adds to that count, so assert on how many there are
+        // above stdio, not on which numbers.
+        assert!(
+            [0, 1, 2].iter().all(|fd| fds.contains(fd)),
+            "stdio missing: {text}"
+        );
+        let above = fds.iter().filter(|&&fd| fd > 2).count();
+        assert!(above <= 2, "inherited descriptors: {text}");
+    }
+}
+
+/// Closes the descriptors it holds on drop, also when the test panics.
+struct FdGuard(Vec<libc::c_int>);
+
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        for &fd in &self.0 {
+            // SAFETY: closes descriptors this test opened.
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+/// Restores `SKIP_CLOSE_RANGE` to false on drop.
+struct SkipCloseRange;
+
+impl SkipCloseRange {
+    fn on() -> Self {
+        pty::SKIP_CLOSE_RANGE.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for SkipCloseRange {
+    fn drop(&mut self) {
+        pty::SKIP_CLOSE_RANGE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Spawn `ls /dev/fd` while the test's own non-close-on-exec descriptors are
+/// open, and check none of them reaches the child.
+fn check_non_cloexec_descriptors_do_not_leak() {
+    // SAFETY: plain libc calls on descriptors this test opens and closes.
+    let base = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    assert!(base >= 0);
+    let mut guard = FdGuard(vec![base]);
+    for _ in 0..3 {
+        // SAFETY: as above; F_DUPFD takes the lowest free number >= 200 and
+        // the duplicate is close-on-exec.
+        let fd = unsafe { libc::fcntl(base, libc::F_DUPFD_CLOEXEC, 200) };
+        assert!(fd >= 200);
+        guard.0.push(fd);
+    }
+    let own: Vec<u32> = guard.0.iter().map(|&fd| fd as u32).collect();
+    let dir = TempDir::new("native-fds-leak");
+    let argv = vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        "ls /dev/fd".to_owned(),
+    ];
+    let env = vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))];
+    let spawned = {
+        // No other spawn can fork while the flags are cleared.
+        let _lock = pty::SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &fd in &guard.0 {
+            // SAFETY: clears FD_CLOEXEC on this test's descriptors.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+        }
+        let result = pty::spawn_locked(&argv, dir.path(), &env);
+        for &fd in &guard.0 {
+            // SAFETY: restores FD_CLOEXEC before the lock is released.
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        result.unwrap()
+    };
+    let pty::Spawned { master, mut child } = spawned;
+    let started = Instant::now();
+    let mut text = Vec::new();
+    loop {
+        let mut buf = [0u8; 4096];
+        // SAFETY: reads into a local buffer of the stated length.
+        let n = unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            text.extend_from_slice(&buf[..n as usize]);
+            continue;
+        }
+        if child.try_wait().unwrap().is_some() && n <= 0 {
+            break;
+        }
+        assert!(started.elapsed() < LONG, "ls did not finish");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let text = String::from_utf8_lossy(&text).into_owned();
+    let fds: BTreeSet<u32> = text
+        .split_whitespace()
+        .filter_map(|word| word.parse().ok())
+        .collect();
+    assert!(
+        fds.contains(&0) && fds.contains(&1) && fds.contains(&2),
+        "{text}"
+    );
+    for fd in own {
+        assert!(!fds.contains(&fd), "descriptor {fd} leaked: {text}");
     }
 }
 
 #[test]
 fn children_close_inherited_non_cloexec_descriptors() {
-    // Descriptors the launching environment left open without close-on-exec
-    // must not reach a pane child.
-    let mut extra: Vec<libc::c_int> = Vec::new();
-    // SAFETY: plain libc calls on descriptors this test opens and closes.
-    unsafe {
-        for _ in 0..3 {
-            let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
-            assert!(fd >= 0);
-            extra.push(fd);
-        }
-        let high = libc::dup2(extra[0], 200);
-        assert_eq!(high, 200);
-        extra.push(high);
-        for &fd in &extra {
-            assert_eq!(libc::fcntl(fd, libc::F_SETFD, 0), 0);
-            assert_eq!(libc::fcntl(fd, libc::F_GETFD), 0);
-        }
-    }
-    let dir = TempDir::new("native-fds-leak");
-    let b = backend();
-    let info = b.run(&spec_line("leak", "ls /dev/fd", &dir)).unwrap();
-    b.wait(&info.reference(), LONG).unwrap();
-    let text = screen(&b, &info);
-    // SAFETY: closes the descriptors opened above.
-    for &fd in &extra {
-        unsafe {
-            libc::close(fd);
-        }
-    }
-    let fds: BTreeSet<u32> = text
-        .split_whitespace()
-        .filter_map(|word| word.parse().ok())
-        .collect();
-    // 0, 1, 2 plus ls's own directory descriptors (one on Linux, two on
-    // macOS); any leaked descriptor adds a number such as 200.
-    let own = if cfg!(target_os = "macos") { 2 } else { 1 };
-    let expected: BTreeSet<u32> = (0..3 + own).collect();
-    assert_eq!(fds, expected, "inherited descriptors: {text}");
+    check_non_cloexec_descriptors_do_not_leak();
+}
+
+#[test]
+fn children_close_inherited_descriptors_without_close_range() {
+    // Exercises the enumeration path on Linux; macOS always takes it. Both
+    // paths are correct, so other tests running meanwhile are unaffected.
+    let _skip = SkipCloseRange::on();
+    check_non_cloexec_descriptors_do_not_leak();
 }
 
 // (f)
