@@ -1,7 +1,8 @@
-//! Text parser for the Cognition Devin CLI permission dialog (Devin CLI 3000.12.43).
+//! Text parser for the Cognition Devin CLI permission dialog (Devin CLI 3000.12.43
+//! and 3000.12.57).
 //!
 //! The layout was measured for a shell command. The three options are one per
-//! row, in this order, and the highlighted row starts with `❭`:
+//! row, in this order, and the highlighted row starts with `❭`. 3000.12.43:
 //!
 //! ```text
 //!  Running command
@@ -13,6 +14,18 @@
 //!  ↑↓ select · ←→ 1-4 scope · e edit · ↵ confirm · esc cancel
 //! ```
 //!
+//! 3000.12.57 draws a `⏺` bullet before the heading and `└ ` before the command,
+//! and a wider scope selector:
+//!
+//! ```text
+//!  ⏺ Running command
+//!  └ $ touch /tmp/x
+//!
+//! ❭ Allow       ← ◼◼◼◼ → Once     Exec(touch)
+//!   Bypass mode
+//!   Deny
+//! ```
+//!
 //! The Allow row may carry the scope selector after its label. Anything else is
 //! refused rather than guessed.
 
@@ -20,6 +33,10 @@ use crate::agent::ParsedDialog;
 
 pub const TITLE: &str = "Running command";
 pub const COMMAND_PREFIX: &str = "$ ";
+/// The one glyph that may precede the heading (3000.12.57), and the one that may
+/// precede the command line.
+const HEADING_BULLET: char = '⏺';
+const COMMAND_BRANCH: char = '└';
 pub const CURSOR: char = '❭';
 pub const OPTION_ALLOW: &str = "Allow";
 pub const OPTION_BYPASS: &str = "Bypass mode";
@@ -38,7 +55,7 @@ pub fn parse(screen: &str) -> Result<ParsedDialog, String> {
     let titles: Vec<usize> = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.trim() == TITLE)
+        .filter(|(_, line)| is_heading(line))
         .map(|(index, _)| index)
         .collect();
     match titles.as_slice() {
@@ -54,6 +71,9 @@ pub fn parse(screen: &str) -> Result<ParsedDialog, String> {
 fn parse_block(lines: &[&str], title_index: usize) -> Result<ParsedDialog, String> {
     let next = skip_blank(lines, title_index + 1);
     let command_line = lines.get(next).map_or("", |line| line.trim());
+    let command_line = command_line
+        .strip_prefix(COMMAND_BRANCH)
+        .map_or(command_line, str::trim_start);
     let Some(command) = command_line.strip_prefix(COMMAND_PREFIX) else {
         return Err(format!(
             "the line after {TITLE:?} is not \"$ <command>\": {command_line:?}"
@@ -107,6 +127,15 @@ fn parse_block(lines: &[&str], title_index: usize) -> Result<ParsedDialog, Strin
     })
 }
 
+/// The heading is `Running command`, optionally preceded by one `⏺` and spaces.
+fn is_heading(line: &str) -> bool {
+    let line = line.trim();
+    let line = line
+        .strip_prefix(HEADING_BULLET)
+        .map_or(line, str::trim_start);
+    line == TITLE
+}
+
 fn is_allow_row(text: &str) -> bool {
     text == OPTION_ALLOW || text.starts_with("Allow ")
 }
@@ -145,6 +174,26 @@ pub mod fixtures {
             out.push_str(&format!(" {mark} {row}\n"));
         }
         out.push_str(" ↑↓ select · ←→ 1-4 scope · e edit · ↵ confirm · esc cancel\n");
+        out
+    }
+}
+
+/// Screen measured on Devin CLI 3000.12.57 (account line and logo removed).
+#[cfg(test)]
+pub mod fixtures_12_57 {
+    pub const ALLOW_ROW: &str = "Allow       ← ◼◼◼◼ → Once     Exec(touch)";
+
+    /// The dialog with the highlight on `cursor` (0 Allow, 1 Bypass mode, 2 Deny).
+    pub fn dialog_with_cursor_on(cursor: usize) -> String {
+        let rows = [ALLOW_ROW, "Bypass mode", "Deny"];
+        let mut out = String::from(
+            "\n❭ Use the shell tool to run exactly: touch /tmp/shepherd-e2e/devin/marker-allow . Do nothing else.\n\n ⏺ Running command\n └ $ touch /tmp/shepherd-e2e/devin/marker-allow\n\n",
+        );
+        for (index, row) in rows.iter().enumerate() {
+            let mark = if index == cursor { super::CURSOR } else { ' ' };
+            out.push_str(&format!("{mark} {row}\n"));
+        }
+        out.push_str("\n↑↓ select · ←→ 1-4 scope · e edit · ↵ confirm · esc cancel\n");
         out
     }
 }
@@ -247,5 +296,73 @@ mod tests {
             .collect();
         let err = parse(&screen).unwrap_err();
         assert!(err.contains("three option rows"), "{err}");
+    }
+
+    #[test]
+    fn parses_the_3000_12_57_layout() {
+        use super::fixtures_12_57 as f;
+        for (cursor, want) in [(0, INDEX_ALLOW), (1, INDEX_BYPASS), (2, INDEX_DENY)] {
+            let dialog = parse(&f::dialog_with_cursor_on(cursor)).unwrap();
+            assert_eq!(dialog.title, TITLE);
+            assert_eq!(dialog.command, "touch /tmp/shepherd-e2e/devin/marker-allow");
+            assert_eq!(dialog.cursor, want);
+            assert_eq!(dialog.options[0], f::ALLOW_ROW);
+            assert_eq!(dialog.options[1], OPTION_BYPASS);
+            assert_eq!(dialog.options[2], OPTION_DENY);
+        }
+        assert!(allow_scope_is_once(f::ALLOW_ROW));
+    }
+
+    #[test]
+    fn scope_comes_after_the_arrow_not_from_the_exec_label() {
+        assert!(!allow_scope_is_once("Allow ← ◼◼◼◼ → Session Exec(Once)"));
+        assert!(!allow_scope_is_once("Allow ← ◼◼◼◼ Once Exec(Once)"));
+        assert!(!allow_scope_is_once(
+            "Allow       ← ◼◼◼◼ → Always   Exec(touch)"
+        ));
+    }
+
+    #[test]
+    fn heading_accepts_only_an_optional_bullet() {
+        use super::fixtures_12_57 as f;
+        let base = f::dialog_with_cursor_on(0);
+        // Another glyph, a substring match, extra text, and a doubled bullet refuse.
+        for bad in [
+            " ✱ Running command",
+            " ⏺ ⏺ Running command",
+            " ⏺ Running command now",
+            " ⏺ Not Running command",
+            " x Running command",
+            " Running commands",
+        ] {
+            let screen = base.replace(" ⏺ Running command", bad);
+            let err = parse(&screen).unwrap_err();
+            assert!(err.contains("no line reading"), "{bad}: {err}");
+        }
+        // The 3000.12.43 heading without a bullet still parses in the new layout.
+        let plain = base.replace(" ⏺ Running command", " Running command");
+        assert!(parse(&plain).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_command_line_with_another_glyph_in_3000_12_57() {
+        use super::fixtures_12_57 as f;
+        let screen = f::dialog_with_cursor_on(0).replace(" └ $ ", " ├ $ ");
+        let err = parse(&screen).unwrap_err();
+        assert!(err.contains("$ <command>"), "{err}");
+    }
+
+    #[test]
+    fn refuses_3000_12_57_option_problems() {
+        use super::fixtures_12_57 as f;
+        let swapped = f::dialog_with_cursor_on(0)
+            .replace("  Bypass mode\n  Deny\n", "  Deny\n  Bypass mode\n");
+        assert!(parse(&swapped).unwrap_err().contains("in that order"));
+        let extra = f::dialog_with_cursor_on(0)
+            .replace("  Deny\n", "  Deny\n  Other\n")
+            .replace("Bypass mode", "Bypass mode now");
+        assert!(parse(&extra).is_err());
+        let two = f::dialog_with_cursor_on(0).replace("  Bypass mode", "❭ Bypass mode");
+        assert!(parse(&two).unwrap_err().contains("found 2"));
     }
 }

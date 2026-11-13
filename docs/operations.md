@@ -346,7 +346,8 @@ must not be `blocked`, then the text is sent, still inside the lock.
    - `kiro`: the dialog needs a line ending in `requires approval`, the next line as
      `<tool> → <command>`, then exactly four options in this order: `Allow once`,
      `Deny once`, `Create allow rule...`, `Create deny rule...`, with one `❯` cursor.
-   - `devin`: the dialog needs a line reading `Running command`, then `$ <command>`,
+   - `devin`: the dialog needs a line reading `Running command` (optionally preceded by
+     one `⏺` and spaces), then `$ <command>` (optionally preceded by `└ `),
      then three option rows in this order: `Allow` (its scope selector may follow on
      the same row), `Bypass mode`, `Deny`, with one `❭` on the highlighted row.
    - `opencode` (OpenCode v2.2.7): the dialog needs a line starting `△ Permission required`,
@@ -397,9 +398,10 @@ It refuses, sending `esc`, when the Allow row shows another scope than `Once`.
 pane goes to `idle`, not `done`; `wait_status` reports that as `cancelled`. Esc has
 the same end state.
 
-The Devin dialog layout was measured in a plain PTY on Devin CLI 3000.12.43. The
-parser is tested on fixtures built from that layout, not on captures from other
-versions.
+Supported Devin layouts: Devin CLI 3000.12.43 (measured in a plain PTY) and
+3000.12.57 (measured in an operator end-to-end run; it draws `⏺ Running command`,
+`└ $ <command>` and a wider scope selector). Other versions refuse until they are
+measured. The parser is tested on fixtures built from those two layouts.
 
 
 What this guarantees, and what it does not:
@@ -736,7 +738,7 @@ try to update itself at run time).
 - **Permission dialogs: text parsing, two layouts.** `answer_dialog` parses the dialog
   from screen text, for the pane's agent. Kiro is tested only against kiro-cli 3.1.0
   (V3 engine) shell permission dialogs, using the screen captured by the probe. Devin
-  is tested against the layout measured on Devin CLI 3000.12.43 for shell commands.
+  is tested against the layouts measured on Devin CLI 3000.12.43 and 3000.12.57 for shell commands.
   Other tools (fs_write, MCP), other programs, other versions, and `kind` values
   `question` or `auth` are untested or refused. `force` is never sent.
 - **Native: no restart survival.** Native panes are Shepherd's children; they end
