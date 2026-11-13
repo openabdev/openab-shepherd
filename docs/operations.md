@@ -671,6 +671,8 @@ The unit tests need no external daemon. The backend-neutral tool tests use an in
 The native integration tests (`native::tests`) run real programs on a PTY, so the
 build host needs `sh`, `cat`, `printf`, `env` and `ls`.
 
+The operator end-to-end runbook, which drives real Devin and OpenCode panes through the MCP tools, is in [`docs/operator-e2e/`](operator-e2e/README.md).
+
 ## Build offload
 
 The laptop never runs `cargo` or `rustc`. Sync the crate to the build host with
