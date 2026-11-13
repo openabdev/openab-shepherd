@@ -1076,6 +1076,8 @@ mod tests {
         let outside = TempDir::new("profiles-outside");
         let file = outside.path().join("profiles.json");
         fs::write(&file, r#"{"allow_arbitrary_command": true}"#).unwrap();
+        // The process umask decides a new file's mode; the rule needs 0600.
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
         let file_text = file.to_string_lossy().into_owned();
         let lookup = |key: &str| (key == PROFILES_ENV).then(|| file_text.clone());
         assert!(
