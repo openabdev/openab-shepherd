@@ -76,6 +76,11 @@ pub struct FakeState {
     /// Each `keys` call replaces `screen` with the next of these, when any
     /// are left: the screen the program draws after the key.
     pub next_screens: std::collections::VecDeque<String>,
+    /// After a `keys` call, this many reads still show the old screen before
+    /// the next screen appears: a program that redraws a moment late.
+    pub stale_reads: usize,
+    /// The screen waiting to appear, and the stale reads left before it does.
+    pub late: Option<(String, usize)>,
     /// Specs passed to `run`. Refused unless `runnable` is set.
     pub runs: Vec<RunSpec>,
     /// When set, `run` starts a live pane named after the spec and returns it.
@@ -223,8 +228,23 @@ impl TerminalBackend for FakeBackend {
     }
 
     fn read(&self, t: &TerminalRef, _lines: u32) -> Result<ScreenText, BackendError> {
-        let Some(text) = self.state.lock().unwrap().screen.clone() else {
-            return self.unsupported("read");
+        let text = {
+            let mut state = self.state.lock().unwrap();
+            let Some(old) = state.screen.clone() else {
+                drop(state);
+                return self.unsupported("read");
+            };
+            match state.late.take() {
+                Some((next, 0)) => {
+                    state.screen = Some(next.clone());
+                    next
+                }
+                Some((next, left)) => {
+                    state.late = Some((next, left - 1));
+                    old
+                }
+                None => old,
+            }
         };
         self.record("read");
         self.find(t)?;
@@ -301,7 +321,12 @@ impl TerminalBackend for FakeBackend {
         let mut state = self.state.lock().unwrap();
         state.keys.push(keys.to_vec());
         if let Some(next) = state.next_screens.pop_front() {
-            state.screen = Some(next);
+            if state.stale_reads > 0 {
+                let stale = state.stale_reads;
+                state.late = Some((next, stale));
+            } else {
+                state.screen = Some(next);
+            }
         }
         Ok(KeysResult {
             status: pane.status.map(|s| s.state),
