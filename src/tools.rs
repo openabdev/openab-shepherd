@@ -308,7 +308,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "answer_dialog",
-            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (tested on kiro-cli 3.1.0 V3 shell permission dialogs) or devin (Devin CLI 3000.12.43 and 3000.12.57 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses); opencode (OpenCode v2.2.7): deny_once sends Esc, which cancels like Reject, after the pane is blocked with kind permission and the screen shows the whole expected dialog; allow_once presses Enter only when the styled screen, read in the same step as the key, shows exactly one option drawn with the selected background and that option is Allow once (otherwise it is refused with no keys sent), and Always allow is never selected. A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
+            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (tested on kiro-cli 3.1.0 V3 shell permission dialogs) or devin (Devin CLI 3000.12.43 and 3000.12.57 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses); opencode (OpenCode v2.2.7): deny_once sends Esc, which cancels like Reject, after the pane is blocked with kind permission and the screen shows the whole expected dialog; allow_once presses Enter only when the styled screen, read in the same step as the key, shows Allow once with a background that differs from both other options while those two share one background, compared as palette-or-truecolor values so it works with either (otherwise it is refused with no keys sent), and Always allow is never selected. A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1273,7 +1273,8 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
 /// (measured), once the pane is blocked on a permission dialog in this turn and
 /// the screen shows the whole expected dialog. `allow_once` presses Enter only
 /// when the styled cells, read in the same step as the key, show `Allow once`
-/// as the one option drawn with the selected background; otherwise it refuses
+/// as the one option whose background differs from the other two, which
+/// match each other; otherwise it refuses
 /// with no key sent. Right is never sent, so `Always allow` is never reachable.
 fn answer_opencode(
     sh: &Shepherd,
@@ -2291,7 +2292,7 @@ mod tests {
         let fake = opencode_styled_pane(Some(styled_selected("Allow once")));
         let out = opencode_answer(&fake, "allow_once").unwrap();
         let text = out.to_string().to_lowercase();
-        assert!(!text.contains("fab283") && !text.contains("rgb"), "{text}");
+        assert!(!text.contains("fab283") && !text.contains("rgb") && !text.contains("idx"), "{text}");
     }
 
     #[test]
@@ -2300,59 +2301,44 @@ mod tests {
         use crate::opencode_dialog::fixtures::{
             styled, styled_with_selected, SELECTED, UNSELECTED,
         };
-        let other = Color::Rgb(0xfa, 0xb2, 0x84);
         let shell = opencode_shell();
         let cases: Vec<(&str, StyledScreen, &str)> = vec![
             (
                 "wrong option",
                 styled_selected("Always allow"),
-                "Always allow",
+                "highlighted option",
             ),
-            ("reject", styled_selected("Reject"), "Reject"),
+            ("reject", styled_selected("Reject"), "highlighted option"),
             (
                 "two",
                 styled(&shell, |l| {
                     Some((if l == "Reject" { UNSELECTED } else { SELECTED }, false))
                 }),
-                "2 options",
+                "highlighted option",
             ),
             (
-                "none",
+                "all the same",
                 styled(&shell, |_| Some((UNSELECTED, false))),
-                "no option",
+                "same background",
             ),
             (
                 "reverse only",
                 styled(&shell, |l| Some((UNSELECTED, l == "Allow once"))),
-                "no option",
+                "reverse",
             ),
             (
-                "other colour",
+                "default background",
                 styled(&shell, |l| {
                     Some((
                         if l == "Allow once" {
-                            (SELECTED.0, other)
+                            (SELECTED.0, Color::Default)
                         } else {
                             UNSELECTED
                         },
                         false,
                     ))
                 }),
-                "no option",
-            ),
-            (
-                "palette index",
-                styled(&shell, |l| {
-                    Some((
-                        if l == "Allow once" {
-                            (SELECTED.0, Color::Idx(0xfa))
-                        } else {
-                            UNSELECTED
-                        },
-                        false,
-                    ))
-                }),
-                "no option",
+                "default background",
             ),
             (
                 "text changed between the read and the key",

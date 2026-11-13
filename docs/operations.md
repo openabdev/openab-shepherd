@@ -358,11 +358,14 @@ must not be `blocked`, then the text is sent, still inside the lock.
      `allow_once` skips steps 3 and 4 too, and replaces step 6: the backend reads the styled
      cells (foreground, background, reverse; internal only) and presses `enter` in one step,
      under the status, kind and turn guard (`TerminalBackend::keys_if_screen`). It presses only
-     when the same text checks pass and exactly one of the three labels is drawn with
-     background `fab283` and is `Allow once`; no highlight, two, another option, reverse video
-     only, another colour, text changed since the first read, a screen mid synchronized
-     update, or a backend without styled cells all refuse with no key sent. Not measured: other
-     themes, and the foreground colour is not checked.
+     when the same text checks pass and `Allow once` has a background that differs from both
+     other labels while those two share one background (a relative rule, compared as colour
+     values without converting between palette and RGB, so it works with palette or
+     truecolor); all three equal, the highlight on another option, any other pattern, a label
+     with mixed backgrounds, a default background on `Allow once`, reverse video on any label,
+     text changed since the first read, a screen mid synchronized update, or a backend without
+     styled cells all refuse with no key sent. Not measured: other themes, and the foreground
+     colour is not checked.
 
    Anything else is refused.
 3. Move the cursor. For `kiro`, `up` or `down` keys (`keys`) go out in one batch:

@@ -164,15 +164,19 @@ checked end to end against OpenCode. Those checks are operator-run.
   - `deny_once` sends `Esc`, which cancels exactly like `Reject` (measured with marker
     files) and ends the turn (`idle`). It re-checks status and turn just before the key.
   - `allow_once` presses `Enter` only after it verifies the highlight. OpenCode draws the
-    highlight as a background colour (selected `fab283`, no reverse video, no glyph), so the
-    native backend reads the styled screen cells (colours and the reverse attribute, used
-    internally and never returned by a tool) and presses `Enter` in the same step, under the
-    status, kind and turn guard. It presses only when the dialog text checks pass and exactly
-    one of the three labels is drawn with background `fab283` and that label is `Allow once`.
-    No highlight, two, the highlight on another option, reverse video only, another colour
-    (a palette index is not truecolor), text that changed before the key, or a backend that
-    cannot read colours: refused with no key sent. The colours are as measured on OpenCode
-    v2.2.7 only; the foreground is not checked, and a theme change is unmeasured.
+    highlight as a background colour (no reverse video, no glyph), and the colour depends on
+    the terminal: a 256-colour palette index without `COLORTERM`, truecolor with it. The
+    native backend therefore applies a relative rule to the styled screen cells (colours and
+    the reverse attribute, used internally and never returned by a tool) and presses `Enter`
+    in the same step, under the status, kind and turn guard. It presses only when the dialog
+    text checks pass and `Allow once` has a background that differs from both other options,
+    while those two have the same background as each other. Colours are compared as values
+    (default, palette index or RGB) without converting between palette and RGB, so the rule
+    works with palette or truecolor. All three equal, the highlight on another option, any
+    other pattern, a label with mixed backgrounds, a default background on `Allow once`,
+    reverse video on any label, text that changed before the key, or a backend that cannot
+    read colours: refused with no key sent. Measured on OpenCode v2.2.7 only; the foreground
+    is not checked, and a theme that highlights differently is unmeasured.
   - `Always allow` is never selected, and `Right` is never sent.
 - Not measured: MCP tools (the configured server was failing), number or letter
   shortcuts and `Tab` in the dialog, the effect of `Always allow`, and a file write without
@@ -192,7 +196,7 @@ kiro-cli 3.1.0 with a real-Kiro probe; the results are in
   agents: kiro-cli 3.1.0 (V3 shell permission dialogs), Devin CLI 3000.12.43 and 3000.12.57
   (shell commands) and OpenCode v2.2.7 (shell and edit dialogs, see below). For OpenCode,
   `deny_once` is answered with Esc; `allow_once` presses Enter only when the styled
-  screen cells show `Allow once` as the one option drawn with the selected background colour.
+  screen cells show `Allow once` with a background that differs from the other two options, which match each other.
 - **A fast detached descendant escapes cleanup.** A descendant that is re-parented
   and fully detaches (new session, no terminal, parents gone) within the 250 ms
   between looks at the process table is never seen and survives. macOS has no
