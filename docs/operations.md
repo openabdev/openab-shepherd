@@ -8,7 +8,7 @@ Shepherd is an MCP server that exposes terminal panes as MCP tools. It listens o
 loopback only and requires a bearer token. The panes are run by a terminal backend
 behind a trait (see [Terminal backend](#terminal-backend)): the native core is the
 default, and herdr-core (hc) is optional. Status: MVP. The latest recorded run on the
-build host passed 173 unit tests (lib 170, bin 3). Test and probe results are in
+build host passed 264 unit tests (lib 261, bin 3), counted with `cargo test` on the build host. Test and probe results are in
 [`MVP-REPORT.md`](../MVP-REPORT.md).
 
 ## Language: Rust
@@ -42,16 +42,19 @@ later is a contained change.
 | `src/ansi.rs` | Escape-sequence filter for pane output |
 | `src/backend.rs` | The `TerminalBackend` trait and Shepherd's own types: `TerminalInfo`, `ProgramStatus`, `Capabilities`, `InputGuard`, `BackendError`, ... |
 | `src/native/mod.rs` | `NativeBackend`: pane table, reader and reaper threads, guarded writes, the trait impl |
-| `src/native/pty.rs`, `term.rs`, `status.rs`, `keys.rs` | PTY spawn and child env; the `vt100` emulator and query replies; OSC 7501 parsing and turns; key encoding |
+| `src/native/pty.rs`, `term.rs`, `status.rs`, `keys.rs`, `procs.rs` | PTY spawn and child env; the `vt100` emulator and query replies; OSC 7501 parsing and turns; key encoding; the process table and descendant tree used by cleanup |
 | `src/native/tests.rs` | Test-only: native tests with real programs |
 | `examples/native_probe.rs` | The real-Kiro probe for the native backend |
+| `examples/native_leak_check.rs` | Real-Kiro leak check: removes a pane and verifies no descendant process survives (issue #10) |
 | `src/hc/mod.rs` | `HcBackend`: the herdr-core adapter. The only code that knows hc method names, JSON fields, and error kinds |
 | `src/hc/rpc.rs` | JSON-RPC 2.0 client over the herdr-core Unix socket |
+| `src/hc/error_kinds.json` | The herdr-core error kinds the adapter maps (extracted from its schema) |
 | `src/hc/fake.rs`, `src/hc/tests.rs` | Test-only: a fake hc socket, and tool tests over the hc wire |
 | `src/tools.rs` | The nine tools, their schemas, the safety rules, and the backend calls each one makes |
 | `src/dialog.rs` | Text parser for the kiro-cli permission dialog |
 | `src/devin_dialog.rs` | Text parser for the Devin CLI permission dialog |
 | `src/agent.rs` | The agents a profile can name (`kiro`, `devin`, `opencode`), their dialects, and `permission_mode` |
+| `src/panelock.rs` | The per-pane lock that serializes calls typing into one pane |
 | `src/mcp.rs` | MCP message handling |
 | `src/http.rs` | Loopback Host check, bearer auth, POST handling |
 | `src/testutil.rs` | Test-only helpers: scratch dirs, git init, an in-memory `FakeBackend` |
@@ -183,6 +186,7 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
   refuses it with no keys sent. Panes started before this Shepherd process have no
   record of their agent, so they are refused too.
   A profile whose `argv` or `extra_args` names `opencode` (case-insensitive substring) and contains an auto-approve spelling (`--auto`, `autoaccept`, `auto-accept`) is refused at load. This prevents accidental configuration; it does not defend against a renamed binary, a wrapper script, or `allow_arbitrary_command`.
+  `send_input` refuses `/yolo` (trimmed, case-insensitive) on a Devin pane, because it may switch to Bypass mode. This is a name-based check against accidental use, not a defense against a different spelling or a wrapper.
 - `permission_mode` (optional, default `normal`): what the agent may do without
   asking.
   - `normal`: a `devin` pane runs `devin --permission-mode auto`. Shell commands and
@@ -793,8 +797,9 @@ To print the usage text without starting a server, run the binary by name:
 - **Grok Bot tested by hand only.** Grok Bot has connected to a deployed endpoint and
   called these tools in manual sessions. No automated test covers that client.
 - **Plain-mode framing.** The client sends no `hello`. The schema describes plain
-  mode as one message per line. Whether herdr-core requires `hello` first is
-  unverified until the integration checks run.
+  mode as one message per line. The 2026-11-10 operator run
+  (see [`MVP-REPORT.md`](../MVP-REPORT.md)) made hc calls without `hello` and they
+  succeeded; whether herdr-core ever requires `hello` is otherwise unverified.
 - **Stateless HTTP.** No SSE stream and no session ids. Clients that expect server
   push or sessions will not get them.
 - **Socket path (hc).** The default is unknown. `HC_SOCKET` is required for hc.
