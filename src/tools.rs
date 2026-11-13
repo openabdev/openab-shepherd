@@ -70,6 +70,9 @@ pub const RENDER_READS: usize =
 const SEEN_TAIL_LINES: usize = 40;
 /// What a caller does after typing was refused because the pane is blocked.
 const BLOCKED_NEXT: &str = "read_output, then answer_dialog; nothing was typed";
+/// The coding CLI is not logged in. answer_dialog cannot fix that.
+const AUTH_NEXT: &str = "tell the operator; nothing was typed";
+const AUTH_BLOCKED: &str = "the CLI is not logged in; the operator must log in to it or provide its API key, then start a new pane. Shepherd does not log in or handle credentials";
 
 pub type Args = Map<String, Value>;
 
@@ -918,14 +921,23 @@ fn pane_blocked(terminal: &str, kind: Option<String>, detail: impl Into<String>)
         Some(kind) => format!("a {kind} dialog"),
         None => "a dialog".to_string(),
     };
-    ToolError::new(
-        "pane_blocked",
-        format!("{terminal} is blocked on {dialog}; nothing was typed. Read the screen with read_output, then answer with answer_dialog"),
-    )
-    .with("terminal", terminal)
-    .with("kind", kind)
-    .with("next", BLOCKED_NEXT)
-    .with("backend_detail", detail.into())
+    let auth = kind.as_deref() == Some("auth");
+    let (message, next) = if auth {
+        (
+            format!("{terminal} is blocked on an auth prompt: {AUTH_BLOCKED}. Nothing was typed"),
+            AUTH_NEXT,
+        )
+    } else {
+        (
+            format!("{terminal} is blocked on {dialog}; nothing was typed. Read the screen with read_output, then answer with answer_dialog"),
+            BLOCKED_NEXT,
+        )
+    };
+    ToolError::new("pane_blocked", message)
+        .with("terminal", terminal)
+        .with("kind", kind)
+        .with("next", next)
+        .with("backend_detail", detail.into())
 }
 
 fn unsupported(op: &str) -> ToolError {
@@ -956,10 +968,19 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         .as_ref()
         .is_some_and(|s| s.is_blocked_with("permission"))
     {
+        let reason = if got
+            .status
+            .as_ref()
+            .is_some_and(|s| s.is_blocked_with("auth"))
+        {
+            format!("this is an auth prompt, not a permission dialog, and answer_dialog cannot answer it: {AUTH_BLOCKED}; status is {status}")
+        } else {
+            format!("the pane is not blocked on a permission dialog: status is {status}")
+        };
         return Err(refusal(
             &terminal,
             choice,
-            format!("the pane is not blocked on a permission dialog: status is {status}"),
+            reason,
             json!({"status": status}),
             &sent,
         ));
@@ -1483,6 +1504,59 @@ mod tests {
             [("next".to_string(), true)]
         );
         assert!(!sh.pane_locks().is_held("id-ready"));
+    }
+
+    #[test]
+    fn auth_blocked_pane_says_not_logged_in_and_does_not_point_at_answer_dialog() {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("stuck", State::Blocked, Some("auth"));
+        let sh = shepherd(&fake);
+        let err = call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "stuck", "text": "yes"})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "pane_blocked");
+        assert_eq!(err.data["kind"], "auth");
+        let message = err.text.clone();
+        assert!(message.contains("not logged in"), "{message}");
+        assert!(message.contains("operator"), "{message}");
+        assert!(!message.contains("answer_dialog"), "{message}");
+        let next = err.data["next"].as_str().unwrap();
+        assert!(!next.contains("answer_dialog"), "{next}");
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+
+        let err = call(
+            &sh,
+            "answer_dialog",
+            &args(json!({"terminal": "stuck", "choice": "allow_once"})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        let reason = err.data["reason"].as_str().unwrap();
+        assert!(reason.contains("not logged in"), "{reason}");
+        assert!(reason.contains("operator"), "{reason}");
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn permission_blocked_message_and_next_are_unchanged() {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("stuck", State::Blocked, Some("permission"));
+        let sh = shepherd(&fake);
+        let err = call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "stuck", "text": "yes"})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["next"], BLOCKED_NEXT);
+        let text = err.text.clone();
+        assert!(
+            text.contains("stuck is blocked on a permission dialog; nothing was typed. Read the screen with read_output, then answer with answer_dialog"),
+            "{text}"
+        );
     }
 
     #[test]
