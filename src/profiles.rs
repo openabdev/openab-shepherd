@@ -558,7 +558,13 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         Some(Value::Bool(allow)) => *allow,
         Some(_) => return Err(err(format!("{at}: allow_bypass must be true or false"))),
     };
-    if agent == Agent::OpenCode {
+    // The program decides whether this is OpenCode, not only the declared agent:
+    // a profile with no `agent` field still defaults to Kiro.
+    let runs_opencode = Path::new(&argv[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("opencode");
+    if agent == Agent::OpenCode || runs_opencode {
         if let Some(arg) = argv.iter().find(|a| is_opencode_auto_flag(a)) {
             return Err(err(format!(
                 "{at}: argv and extra_args may not pass {arg} for opencode: OpenCode auto-approve flags are refused"
@@ -970,6 +976,28 @@ mod tests {
             policy.profile("oc").unwrap().argv,
             ["opencode", "--standalone", "--model", "auto"]
         );
+    }
+
+    #[test]
+    fn an_opencode_program_is_refused_auto_flags_even_without_an_agent_field() {
+        let dir = TempDir::new("profiles-opencode-program");
+        let d = dir.path().to_string_lossy().into_owned();
+        let no_agent =
+            json!({"profiles": [{"name": "oc", "argv": ["opencode", "--auto"], "cwds": [d]}]})
+                .to_string();
+        let message = refused(&no_agent);
+        assert!(
+            message.contains("--auto") && message.contains("opencode"),
+            "{message}"
+        );
+        let absolute = json!({"profiles": [{"name": "oc", "argv": ["/usr/local/bin/opencode", "--auto"], "cwds": [d]}]})
+            .to_string();
+        assert!(refused(&absolute).contains("--auto"));
+        // The same flag on a program that is not OpenCode is the operator's own choice.
+        let kiro =
+            json!({"profiles": [{"name": "k", "argv": ["kiro-cli", "--auto"], "cwds": [d]}]})
+                .to_string();
+        assert!(parse(&kiro, true).is_ok());
     }
 
     #[test]
