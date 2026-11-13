@@ -232,8 +232,20 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
     pane is never nudged; a file that cannot be read is never nudged either.
     The match is a plain line scan, so `- [ ]` inside a fenced code block
     counts too. The file is read defensively: it must be a regular file, a
-    symlink in any component of its path or a file over 256 KiB counts as
-    unreadable, and the transition to unreadable is logged once.
+    file over 256 KiB counts as unreadable, and the transition to
+    unreadable is logged once. On Unix the working directory is the
+    boundary: it is opened as a directory handle (so a working directory
+    reached through a symlinked ancestor still reads), and a symlink in
+    any component of the `todo_file` path below it counts as unreadable.
+    On non-Unix the read is a plain open and follows symlinks.
+  Watchdog profiles are meant for unattended panes. The watchdog types
+  into a pane on its own: if a nudge's text is pasted but Enter is then
+  refused (the native backend's second guarded step), the text is left
+  on the pane's input line, the watchdog does not retry it — a retry
+  would paste a second copy — and it stops for that pane until a turn
+  advance it did not cause. A person at the pane in the meantime could
+  submit that pasted text by pressing Enter themselves. A watched pane
+  whose program has ended is forgotten, not re-checked on every pass.
   The watchdog's audit trail is Shepherd's stderr log: every nudge (with
   the pane's idle seconds), every give-up and every failed attempt is a
   line there, and nowhere else — a client cannot tell a watchdog nudge
