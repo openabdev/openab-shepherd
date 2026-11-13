@@ -611,6 +611,13 @@ fn send_input(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     let terminal = terminal_arg(args)?;
     let text = validate_input(required_str(args, "text")?).map_err(|err| format!("text: {err}"))?;
     let (_guard, pane, now) = lock_pane(sh, &terminal)?;
+    if sh.agent_of(&terminal) == Some(Agent::Devin) && is_devin_mode_switch(&text) {
+        return Err(ToolError::new(
+            "refused",
+            "refused by the Devin mode-switch rule: /yolo can switch Devin into Bypass mode, which Shepherd never allows; nothing was sent",
+        )
+        .with("terminal", terminal.as_str()));
+    }
     // Idle and done are both sendable; a blocked program is never typed into.
     let guard = InputGuard {
         refuse_when_blocked: true,
@@ -650,6 +657,12 @@ fn send_input(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         }
         Err(err) => Err(backend_failure(Some(&terminal), err)),
     }
+}
+
+/// Devin slash commands that may change the permission mode. A name-based check
+/// against accidental use, not a defense against a different spelling or a wrapper.
+fn is_devin_mode_switch(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case("/yolo")
 }
 
 fn blocked_kind_of(info: &TerminalInfo) -> Option<String> {
@@ -1483,6 +1496,50 @@ mod tests {
             [("next".to_string(), true)]
         );
         assert!(!sh.pane_locks().is_held("id-ready"));
+    }
+
+    #[test]
+    fn send_input_refuses_yolo_on_a_devin_pane_and_sends_nothing() {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", State::Done, None);
+        let sh = shepherd(&fake);
+        sh.assume_agent("work", Agent::Devin);
+        for text in ["/yolo", "  /YOLO "] {
+            let err = call(
+                &sh,
+                "send_input",
+                &args(json!({"terminal": "work", "text": text})),
+            )
+            .unwrap_err();
+            assert_eq!(err.data["error"], "refused");
+            assert!(err.data["message"]
+                .as_str()
+                .unwrap()
+                .contains("mode-switch"));
+        }
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+        call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "work", "text": "fix the tests"})),
+        )
+        .unwrap();
+        assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
+    }
+
+    #[test]
+    fn send_input_yolo_on_a_non_devin_pane_is_unaffected() {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", State::Done, None);
+        let sh = shepherd(&fake);
+        sh.assume_agent("work", Agent::Kiro);
+        call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "work", "text": "/yolo"})),
+        )
+        .unwrap();
+        assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
     }
 
     #[test]
