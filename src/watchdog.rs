@@ -48,20 +48,20 @@ pub const MAX_TODO_BYTES: u64 = 256 * 1024;
 /// The file is read defensively: the supervised agent writes in the same
 /// directory, so the path could be a FIFO (which would block a plain read
 /// forever and stall the single watchdog thread), a symlink out of the
-/// directory, or an unbounded file. The open is non-blocking and refuses
-/// symlinks (on Unix), the handle must be a regular file, and at most
+/// directory, or an unbounded file. On Unix the path is walked one
+/// component at a time with `openat` and `O_NOFOLLOW`, so a symlink in
+/// any component — an intermediate directory, not just the file itself —
+/// is refused, and no component can be swapped for a symlink between a
+/// check and the open. The handle must be a regular file, and at most
 /// [`MAX_TODO_BYTES`] are read. Any failure, or a file over the limit,
 /// maps to [`Todo::Unreadable`]: fail closed, no nudge.
 pub fn read_todo(path: &Path) -> Todo {
     use std::io::Read as _;
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    let Ok(mut file) = options.open(path) else {
+    let opened = open_todo_refusing_symlinks(path);
+    #[cfg(not(unix))]
+    let opened = fs::File::open(path).ok();
+    let Some(mut file) = opened else {
         return Todo::Unreadable;
     };
     match file.metadata() {
@@ -82,6 +82,69 @@ pub fn read_todo(path: &Path) -> Todo {
     } else {
         Todo::Finished
     }
+}
+
+/// Open `path` for reading, refusing a symlink in every component. Each
+/// directory component is opened relative to the previous one with
+/// `O_NOFOLLOW`, so the walk never follows a link and never resolves the
+/// whole path at once (which would let a swapped intermediate directory
+/// escape the pane's working directory). `..` components are refused
+/// outright; profiles already reject them, and a reader that resolves
+/// them component by component has no safe meaning for them here.
+#[cfg(unix)]
+fn open_todo_refusing_symlinks(path: &Path) -> Option<fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::io::FromRawFd as _;
+    use std::path::Component;
+
+    let mut parts: Vec<CString> = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::Normal(name) => parts.push(CString::new(name.as_bytes()).ok()?),
+            Component::CurDir | Component::RootDir => {}
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    let (last, dirs) = parts.split_last()?;
+    let start = CString::new(if path.is_absolute() { "/" } else { "." }).ok()?;
+    // SAFETY: every fd returned below is checked before use and closed
+    // exactly once; the final fd's ownership passes to the returned File.
+    let mut fd = unsafe {
+        libc::open(
+            start.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    for dir in dirs {
+        let next = unsafe {
+            libc::openat(
+                fd,
+                dir.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        unsafe { libc::close(fd) };
+        if next < 0 {
+            return None;
+        }
+        fd = next;
+    }
+    let file_fd = unsafe {
+        libc::openat(
+            fd,
+            last.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    unsafe { libc::close(fd) };
+    if file_fd < 0 {
+        return None;
+    }
+    Some(unsafe { fs::File::from_raw_fd(file_fd) })
 }
 
 /// Why a nudge is due; the watchdog's log line names it.
@@ -627,6 +690,26 @@ mod tests {
         text.push_str(&"x".repeat(MAX_TODO_BYTES as usize));
         std::fs::write(&big, text).unwrap();
         assert_eq!(read_todo(&big), Todo::Unreadable);
+    }
+
+    #[test]
+    fn read_todo_refuses_a_symlinked_intermediate_directory() {
+        // `O_NOFOLLOW` on the final component alone is not enough: with
+        // `sub/TODO.md`, a `sub` that is a symlink would carry the read
+        // outside the working directory. Every component is refused.
+        #[cfg(unix)]
+        {
+            let dir = TempDir::new("watchdog-todo-symlink-dir");
+            let outside = TempDir::new("watchdog-todo-outside");
+            std::fs::write(outside.path().join("TODO.md"), "- [ ] left\n").unwrap();
+            std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
+            assert_eq!(read_todo(&dir.path().join("sub/TODO.md")), Todo::Unreadable);
+            // A real subdirectory in between reads normally.
+            let real = dir.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            std::fs::write(real.join("TODO.md"), "- [ ] left\n").unwrap();
+            assert_eq!(read_todo(&real.join("TODO.md")), Todo::Unchecked);
+        }
     }
 
     #[test]
