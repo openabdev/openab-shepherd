@@ -91,6 +91,9 @@ pub struct Shepherd {
     policy: Arc<LaunchPolicy>,
     panes: Arc<Mutex<HashMap<String, PaneAgent>>>,
     watchdog: Arc<Mutex<HashMap<String, PaneWatch>>>,
+    /// How long the watchdog waits for a pane's lock before it skips the
+    /// pane for this tick (see [`watchdog::LOCK_WAIT`]); tests shorten it.
+    watchdog_lock_wait: Duration,
 }
 
 /// What this process knows about a pane a profile started, keyed by pane name.
@@ -125,6 +128,7 @@ impl Shepherd {
             policy: Arc::new(policy),
             panes: Arc::new(Mutex::new(HashMap::new())),
             watchdog: Arc::new(Mutex::new(HashMap::new())),
+            watchdog_lock_wait: watchdog::LOCK_WAIT,
         }
     }
 
@@ -288,7 +292,7 @@ impl Shepherd {
 
     fn watchdog_check(&self, name: &str, clock: &dyn Fn() -> Instant) {
         let now = clock();
-        let (config, cwd, todo_rel, pane_id, finished_state) = {
+        let (config, work_dir, todo_rel, pane_id, finished_state) = {
             let map = self.watchdog_map();
             let Some(watch) = map.get(name) else {
                 return;
@@ -296,7 +300,7 @@ impl Shepherd {
             let config = watch.config().clone();
             (
                 config.clone(),
-                watch.cwd().to_path_buf(),
+                watch.work_dir(),
                 config.todo_file.clone(),
                 watch.pane_id().to_string(),
                 watch.finished_state(),
@@ -324,7 +328,7 @@ impl Shepherd {
             return;
         }
         let todo = match &todo_rel {
-            Some(rel) => watchdog::read_todo(&cwd, rel),
+            Some(rel) => watchdog::read_todo_in(&work_dir, rel),
             None => Todo::NotConfigured,
         };
         let (event, idle_secs) = {
@@ -370,8 +374,17 @@ impl Shepherd {
                     expect_turn: info.turn,
                     ..InputGuard::default()
                 };
-                match send_text_guarded(self, name, &config.nudge_text, Some(guard), Some(&pane_id))
-                {
+                // The pane lock is waited for only briefly: a pane whose lock
+                // is held for long (a slow send or wait) is skipped for this
+                // tick instead of stalling every other watched pane.
+                match send_text_within(
+                    self,
+                    name,
+                    &config.nudge_text,
+                    Some(guard),
+                    Some(&pane_id),
+                    Some(self.watchdog_lock_wait),
+                ) {
                     Ok(_) => {
                         // The send just returned: stamp it with a fresh
                         // time, not the observation time, or a slow send
@@ -379,7 +392,7 @@ impl Shepherd {
                         let sent_at = clock();
                         if let Some(watch) = self.watchdog_map().get_mut(name) {
                             if watch.pane_id() == pane_id {
-                                watch.note_nudged(sent_at, info.turn);
+                                watch.note_nudged(sent_at);
                             }
                         }
                         eprintln!(
@@ -389,21 +402,23 @@ impl Shepherd {
                             reason.as_str()
                         );
                     }
+                    Err(err) if err.data["error"] == "pane_busy" => {
+                        // Nothing was sent and nothing is counted: the next
+                        // tick looks again.
+                    }
                     Err(err) => {
-                        // A `terminal_changed` refusal is dropped, not
-                        // retried: the pane this check observed is gone
-                        // or replaced, and the next tick re-reads whatever
-                        // the name now resolves to.
+                        // Any other refusal or failure (a `terminal_changed`
+                        // or `status_mismatch` among them) counts toward the
+                        // cooldown and the cap through `note_failed`.
                         let failed_at = clock();
                         // The native backend pastes, then presses Enter
                         // under a second guard; when that guard refuses,
                         // the nudge text is left sitting on the input
                         // line. That failure must not be retried — a
                         // retry would paste a second copy.
-                        let pasted_unsubmitted =
-                            err.data["backend_detail"].as_str().is_some_and(|detail| {
-                                detail.contains("the text was pasted but Enter was not pressed")
-                            });
+                        let pasted_unsubmitted = err.data["backend_detail"]
+                            .as_str()
+                            .is_some_and(crate::backend::is_pasted_unsubmitted);
                         if let Some(watch) = self.watchdog_map().get_mut(name) {
                             if watch.pane_id() == pane_id {
                                 if pasted_unsubmitted {
@@ -923,7 +938,21 @@ fn send_text_guarded(
     extra_guard: Option<InputGuard>,
     expected_pane_id: Option<&str>,
 ) -> Result<Value, ToolError> {
-    let (_guard, pane, now) = lock_pane(sh, terminal)?;
+    send_text_within(sh, terminal, text, extra_guard, expected_pane_id, None)
+}
+
+/// `send_text_guarded` with an optional bound on the wait for the pane lock:
+/// a lock still held when `lock_wait` runs out is a `pane_busy` refusal and
+/// nothing is sent. `None` waits as every other tool does.
+fn send_text_within(
+    sh: &Shepherd,
+    terminal: &str,
+    text: &str,
+    extra_guard: Option<InputGuard>,
+    expected_pane_id: Option<&str>,
+    lock_wait: Option<Duration>,
+) -> Result<Value, ToolError> {
+    let (_guard, pane, now) = lock_pane_within(sh, terminal, lock_wait)?;
     // A caller that observed a specific pane (the watchdog) can pin the
     // send to that pane's id: if the name was reused while waiting for
     // the pane lock, `lock_pane`'s own check sees two reads of the NEW
@@ -1064,8 +1093,27 @@ fn lock_pane(
     sh: &Shepherd,
     terminal: &str,
 ) -> Result<(PaneGuard, TerminalRef, TerminalInfo), ToolError> {
+    lock_pane_within(sh, terminal, None)
+}
+
+/// [`lock_pane`] with an optional bound on the wait for the lock: `None`
+/// waits as long as it takes, `Some(wait)` gives up with `pane_busy`.
+fn lock_pane_within(
+    sh: &Shepherd,
+    terminal: &str,
+    lock_wait: Option<Duration>,
+) -> Result<(PaneGuard, TerminalRef, TerminalInfo), ToolError> {
     let before = resolve(sh, terminal)?;
-    let guard = sh.locks.lock(&before.id);
+    let guard = match lock_wait {
+        None => sh.locks.lock(&before.id),
+        Some(wait) => sh.locks.lock_within(&before.id, wait).ok_or_else(|| {
+            ToolError::new(
+                "pane_busy",
+                format!("{terminal} stayed locked by another call; nothing was sent"),
+            )
+            .with("terminal", terminal)
+        })?,
+    };
     let now = resolve(sh, terminal)?;
     if now.id != before.id {
         return Err(ToolError::new(
@@ -4016,5 +4064,99 @@ mod tests {
             sh.watchdog_map().is_empty(),
             "the restart kept the old pane's watch"
         );
+    }
+
+    #[test]
+    fn the_watchdog_skips_a_pane_whose_lock_stays_held_and_nudges_it_later() {
+        // Another call holds the pane's lock (a long send or wait). The
+        // watchdog thread must not block on it: that would stall every
+        // other watched pane. It skips the pane for the tick, counts
+        // nothing, and nudges once the lock is free.
+        let (mut sh, fake, _dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "cooldown_secs": 10,
+                   "nudge_text": "continue"}),
+            "tools-watchdog-lock-held",
+        );
+        sh.watchdog_lock_wait = Duration::from_millis(50);
+        let t0 = Instant::now();
+        sh.watchdog_tick_at(t0);
+        let held = sh.pane_locks().lock("id-work");
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let ticker = {
+            let sh = sh.clone();
+            thread::spawn(move || {
+                sh.watchdog_tick_at(t0 + Duration::from_secs(11));
+                done_tx.send(()).unwrap();
+            })
+        };
+        let finished = done.recv_timeout(Duration::from_secs(10)).is_ok();
+        // Release the lock first, so a blocked tick (a failing run) ends too.
+        drop(held);
+        ticker.join().unwrap();
+        assert!(finished, "the watchdog tick blocked on the held pane lock");
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+        // Nothing was counted against the pane: the next tick, 1 s later and
+        // well inside what a counted attempt's cooldown would be, nudges.
+        sh.watchdog_tick_at(t0 + Duration::from_secs(12));
+        assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
+    }
+
+    fn sends_tried(fake: &FakeBackend) -> usize {
+        fake.calls().iter().filter(|call| **call == "send").count()
+    }
+
+    #[test]
+    fn a_pasted_but_unsubmitted_nudge_stops_the_watch_and_a_plain_failure_only_cools_down() {
+        let json_config = json!({"idle_timeout_secs": 10, "cooldown_secs": 10,
+                                 "nudge_text": "continue"});
+        // The backend's own paste-without-Enter failure: no second paste.
+        let (sh, fake, _dir) = watched_pane(json_config.clone(), "tools-watchdog-pasted");
+        fake.state.lock().unwrap().send_error = Some(crate::backend::pasted_unsubmitted(
+            "id-work",
+            "the program became blocked",
+        ));
+        let t0 = Instant::now();
+        sh.watchdog_tick_at(t0);
+        sh.watchdog_tick_at(t0 + Duration::from_secs(11));
+        assert_eq!(sends_tried(&fake), 1);
+        sh.watchdog_tick_at(t0 + Duration::from_secs(3600));
+        assert_eq!(sends_tried(&fake), 1, "the watchdog pasted a second copy");
+        // Control: any other failure is counted (cooldown) and retried after.
+        let (sh, fake, _dir) = watched_pane(json_config, "tools-watchdog-failed");
+        fake.state.lock().unwrap().send_error = Some(BackendError::new(ErrorKind::Other, "boom"));
+        sh.watchdog_tick_at(t0);
+        sh.watchdog_tick_at(t0 + Duration::from_secs(11));
+        assert_eq!(sends_tried(&fake), 1);
+        sh.watchdog_tick_at(t0 + Duration::from_secs(12));
+        assert_eq!(sends_tried(&fake), 1, "a failed nudge skipped the cooldown");
+        sh.watchdog_tick_at(t0 + Duration::from_secs(22));
+        assert_eq!(sends_tried(&fake), 2);
+    }
+
+    #[test]
+    fn a_working_directory_swapped_for_a_symlink_after_the_start_is_not_followed() {
+        // The watch resolved the pane's directory when it started. Swapping
+        // that path for a symlink afterwards (the real directory moved
+        // aside) must not carry the todo read into the symlink's target.
+        let (sh, fake, dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "nudge_text": "continue",
+                   "todo_file": "TODO.md"}),
+            "tools-watchdog-cwd-swap",
+        );
+        let cwd = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(cwd.join("TODO.md"), "- [x] everything is done\n").unwrap();
+        let outside = crate::testutil::TempDir::new("tools-watchdog-cwd-swap-outside");
+        std::fs::write(outside.path().join("TODO.md"), "- [ ] planted\n").unwrap();
+        let moved = cwd.with_extension("moved");
+        std::fs::rename(&cwd, &moved).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &cwd).unwrap();
+        let t0 = Instant::now();
+        sh.watchdog_tick_at(t0);
+        sh.watchdog_tick_at(t0 + Duration::from_secs(60));
+        let sent = fake.state.lock().unwrap().sent.len();
+        // Put the directory back so the temp dir cleans up.
+        std::fs::remove_file(&cwd).unwrap();
+        std::fs::rename(&moved, &cwd).unwrap();
+        assert_eq!(sent, 0, "the watchdog followed the swapped symlink");
     }
 }

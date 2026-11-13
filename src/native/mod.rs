@@ -1282,16 +1282,7 @@ impl TerminalBackend for NativeBackend {
         pane.write_guarded(Some(&enter_guard), |st| {
             encode_key(&Key::Enter, st.emu.mode()).map(<[u8]>::to_vec)
         })
-        .map_err(|err| {
-            BackendError::new(
-                ErrorKind::Other,
-                format!(
-                    "native: {}: the text was pasted but Enter was not pressed: {}",
-                    pane.id,
-                    enter_refusal(&err)
-                ),
-            )
-        })?;
+        .map_err(|err| crate::backend::pasted_unsubmitted(&pane.id, enter_refusal(&err)))?;
         drop(input);
         let started = pane.await_start(turn_at_send)?;
         Ok(SendResult {

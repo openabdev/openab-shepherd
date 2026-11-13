@@ -23,6 +23,17 @@ use std::time::{Duration, Instant};
 /// How often the watchdog thread looks at the panes it watches.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The turn advances one nudge may explain. A nudge usually makes the agent
+/// run one turn, sometimes a follow-up as well; an advance larger than this
+/// (or one with no nudge outstanding) is the agent making progress on its
+/// own and clears the consecutive count.
+pub const NUDGE_TURN_ALLOWANCE: u64 = 3;
+
+/// How long the watchdog waits for a pane's lock before it skips that pane
+/// for the tick. The lock is held for the whole of another call's send or
+/// wait, and the one watchdog thread serves every watched pane.
+pub const LOCK_WAIT: Duration = Duration::from_secs(2);
+
 /// What a profile's todo file says about the work, when one is configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Todo {
@@ -40,34 +51,110 @@ pub enum Todo {
 /// anything larger is treated as unreadable rather than read into memory.
 pub const MAX_TODO_BYTES: u64 = 256 * 1024;
 
-/// Read the todo file named by the relative path `rel` inside the pane's
-/// working directory `cwd`. An unchecked item is a line whose first
-/// non-blank characters are `- [ ]`; `- [x]`, other bullets and prose do
-/// not count. (`- [ ]` inside a fenced code block counts too; the check is
-/// a plain line scan, not a Markdown parse.)
+/// A pane's working directory, resolved once when its watch is registered.
+/// On Unix the resolved directory is held open as a directory fd, so every
+/// later todo read starts from the directory the watch began with, not from
+/// whatever the path names at that moment: an ancestor (or the directory
+/// itself) swapped for a symlink after the watch started is never followed.
+/// The path is canonicalized once, at open time, and kept for non-Unix
+/// reads and messages.
+#[derive(Debug)]
+pub struct WorkDir {
+    path: PathBuf,
+    #[cfg(unix)]
+    handle: Option<fs::File>,
+}
+
+impl WorkDir {
+    /// Resolve `cwd` now. A directory that cannot be opened leaves a handle
+    /// that reads every todo file as [`Todo::Unreadable`] (fail closed).
+    pub fn open(cwd: &Path) -> Self {
+        let path = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        #[cfg(unix)]
+        let handle = open_dir_fd(&path);
+        Self {
+            path,
+            #[cfg(unix)]
+            handle,
+        }
+    }
+
+    /// The canonical path the directory had when it was opened.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A second handle on the same directory, for a read made outside the
+    /// watch map's lock.
+    pub fn try_clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            #[cfg(unix)]
+            handle: self.handle.as_ref().and_then(|file| file.try_clone().ok()),
+        }
+    }
+}
+
+/// Open directory `path` for use as the base of `openat` walks.
+#[cfg(unix)]
+fn open_dir_fd(path: &Path) -> Option<fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::io::FromRawFd as _;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: the fd is checked before use and its ownership passes to the
+    // returned File.
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOCTTY,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    Some(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+/// Read the todo file named by the relative path `rel` inside the working
+/// directory `cwd`, resolving `cwd` now. The watchdog itself reads through
+/// the [`WorkDir`] its watch opened once ([`read_todo_in`]); this form is
+/// for a caller with only a path.
+pub fn read_todo(cwd: &Path, rel: &Path) -> Todo {
+    read_todo_in(&WorkDir::open(cwd), rel)
+}
+
+/// Read the todo file named by the relative path `rel` inside `work`. An
+/// unchecked item is a line whose first non-blank characters are `- [ ]`;
+/// `- [x]`, other bullets, prose and anything inside a fenced code block
+/// (a line starting with three backticks or tildes opens and closes one)
+/// do not count. The check is a plain line scan, not a Markdown parse.
 ///
 /// The file is read defensively: the supervised agent writes in the same
 /// directory, so the path could be a FIFO (which would block a plain read
 /// forever and stall the single watchdog thread), a symlink out of the
 /// directory, or an unbounded file. The working directory is the boundary
-/// the read enforces: on Unix, `cwd` itself is opened as a directory fd
-/// (its ancestors are resolved by that open, so a working directory
+/// the read enforces: on Unix it is the directory fd `work` holds, opened
+/// once (its ancestors were resolved by that open, so a working directory
 /// reached through a symlinked ancestor — `/tmp` on macOS, say — reads
-/// normally), and only the components of `rel` are then walked with
-/// `openat` and `O_NOFOLLOW`, so a symlink in any component of `rel` —
-/// an intermediate directory, not just the file itself — is refused, and
-/// no component can be swapped for a symlink between a check and the
-/// open. The handle must be a regular file, and at most
-/// [`MAX_TODO_BYTES`] are read. Any failure, or a file over the limit,
-/// maps to [`Todo::Unreadable`]: fail closed, no nudge. (On non-Unix the
-/// read is a plain open of `cwd.join(rel)` and follows symlinks; the
-/// symlink refusal above is Unix-only.)
-pub fn read_todo(cwd: &Path, rel: &Path) -> Todo {
+/// normally, and a later swap of any ancestor is not followed), and only
+/// the components of `rel` are walked with `openat` and `O_NOFOLLOW`, so a
+/// symlink in any component of `rel` — an intermediate directory, not just
+/// the file itself — is refused, and no component can be swapped for a
+/// symlink between a check and the open. The handle must be a regular
+/// file, and at most [`MAX_TODO_BYTES`] are read. Any failure, or a file
+/// over the limit, maps to [`Todo::Unreadable`]: fail closed, no nudge.
+/// (On non-Unix the read is a plain open of the canonical path joined with
+/// `rel` and follows symlinks; the symlink refusal above is Unix-only.)
+pub fn read_todo_in(work: &WorkDir, rel: &Path) -> Todo {
     use std::io::Read as _;
     #[cfg(unix)]
-    let opened = open_todo_refusing_symlinks(cwd, rel);
+    let opened = work
+        .handle
+        .as_ref()
+        .and_then(|dir| open_todo_refusing_symlinks(dir, rel));
     #[cfg(not(unix))]
-    let opened = fs::File::open(cwd.join(rel)).ok();
+    let opened = fs::File::open(work.path.join(rel)).ok();
     let Some(mut file) = opened else {
         return Todo::Unreadable;
     };
@@ -81,32 +168,37 @@ pub fn read_todo(cwd: &Path, rel: &Path) -> Todo {
         return Todo::Unreadable;
     }
     let text = String::from_utf8_lossy(&buf);
-    if text
-        .lines()
-        .any(|line| line.trim_start().starts_with("- [ ]"))
-    {
+    let mut fence: Option<&str> = None;
+    let mut unchecked = false;
+    for line in text.lines() {
+        let line = line.trim_start();
+        let marker = ["```", "~~~"].into_iter().find(|m| line.starts_with(m));
+        match (fence, marker) {
+            (None, Some(open)) => fence = Some(open),
+            (Some(open), Some(close)) if open == close => fence = None,
+            (None, None) if line.starts_with("- [ ]") => unchecked = true,
+            _ => {}
+        }
+    }
+    if unchecked {
         Todo::Unchecked
     } else {
         Todo::Finished
     }
 }
 
-/// Open the todo file `rel` inside `cwd` for reading, refusing a symlink
-/// in every component of `rel`. The working directory is the boundary:
-/// `cwd` is opened as a directory fd with a plain open (which resolves
-/// any symlinked ancestors of the working directory itself — the walk
-/// does not police directories outside the boundary it enforces), and
-/// each component of `rel` is then opened relative to the previous one
-/// with `O_NOFOLLOW`, so the walk never follows a link inside the
-/// boundary and no component can be swapped for a symlink between a
-/// check and the open. `..` and absolute components are refused
-/// outright; profiles already reject them, and a reader that resolves
-/// them component by component has no safe meaning for them here.
+/// Open the todo file `rel` inside the directory fd `dir` for reading,
+/// refusing a symlink in every component of `rel`. Each component is
+/// opened relative to the previous one with `O_NOFOLLOW`, so the walk never
+/// follows a link inside the boundary and no component can be swapped for
+/// a symlink between a check and the open. `..` and absolute components
+/// are refused outright; profiles already reject them, and a reader that
+/// resolves them component by component has no safe meaning for them here.
 #[cfg(unix)]
-fn open_todo_refusing_symlinks(cwd: &Path, rel: &Path) -> Option<fs::File> {
+fn open_todo_refusing_symlinks(dir: &fs::File, rel: &Path) -> Option<fs::File> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::io::FromRawFd as _;
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::path::Component;
 
     let mut parts: Vec<CString> = Vec::new();
@@ -118,40 +210,36 @@ fn open_todo_refusing_symlinks(cwd: &Path, rel: &Path) -> Option<fs::File> {
         }
     }
     let (last, dirs) = parts.split_last()?;
-    let cwd_c = CString::new(cwd.as_os_str().as_bytes()).ok()?;
-    // SAFETY: every fd returned below is checked before use and closed
-    // exactly once; the final fd's ownership passes to the returned File.
-    let mut fd = unsafe {
-        libc::open(
-            cwd_c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return None;
-    }
-    for dir in dirs {
+    // The caller's fd is only borrowed; each directory opened below is owned
+    // here and closed when the next replaces it.
+    let mut owned: Option<OwnedFd> = None;
+    for part in dirs {
+        let from = owned.as_ref().map_or(dir.as_raw_fd(), |fd| fd.as_raw_fd());
+        // SAFETY: `from` is a live fd; the result is checked before use.
         let next = unsafe {
             libc::openat(
-                fd,
-                dir.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                from,
+                part.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NOCTTY,
             )
         };
-        unsafe { libc::close(fd) };
         if next < 0 {
             return None;
         }
-        fd = next;
+        owned = Some(unsafe { OwnedFd::from_raw_fd(next) });
     }
+    let from = owned.as_ref().map_or(dir.as_raw_fd(), |fd| fd.as_raw_fd());
     let file_fd = unsafe {
         libc::openat(
-            fd,
+            from,
             last.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY,
         )
     };
-    unsafe { libc::close(fd) };
     if file_fd < 0 {
         return None;
     }
@@ -193,19 +281,25 @@ pub enum WatchEvent {
 #[derive(Debug)]
 pub struct PaneWatch {
     config: WatchdogConfig,
-    cwd: PathBuf,
+    work_dir: WorkDir,
     agent: Agent,
     /// The backend id of the pane this watch was registered for. A name
     /// reused by a later start is a different pane and never this watch's.
     pane_id: String,
     /// The turn counter at the last observation. A turn that advances on
     /// its own clears the consecutive count and a give-up: progress is the
-    /// reset. The turn a nudge itself causes (nudged turn + 1) does not
-    /// clear anything — otherwise every answered nudge would reset the
+    /// reset. Turns a nudge itself causes do not clear anything (see
+    /// `nudge_allowance`) — otherwise every answered nudge would reset the
     /// cap and the watchdog would nudge forever.
     last_turn: Option<u64>,
-    /// The turn the last successful nudge was sent on.
-    nudged_turn: Option<u64>,
+    /// How many turn advances the nudges sent so far may still explain:
+    /// set to [`NUDGE_TURN_ALLOWANCE`] by each nudge (not summed, so
+    /// nudges that produced no turn do not build up credit), used up by
+    /// the advances observed afterwards, and zero when no nudge is
+    /// outstanding. A nudge may produce no turn, one, or a few (the agent
+    /// runs a turn and then a follow-up); an advance within the allowance
+    /// is the nudge's doing, a larger one is progress.
+    nudge_allowance: u64,
     /// Whether the todo file was unreadable at the last observation, so a
     /// transition into unreadable can be logged once.
     todo_unreadable: bool,
@@ -224,14 +318,17 @@ pub struct PaneWatch {
 }
 
 impl PaneWatch {
+    /// A watch over a pane that runs in `cwd`. The working directory is
+    /// resolved here, once, and every later todo read goes through that
+    /// resolution.
     pub fn new(config: WatchdogConfig, cwd: PathBuf, agent: Agent, pane_id: String) -> Self {
         Self {
             config,
-            cwd,
+            work_dir: WorkDir::open(&cwd),
             agent,
             pane_id,
             last_turn: None,
-            nudged_turn: None,
+            nudge_allowance: 0,
             todo_unreadable: false,
             finished_turn: None,
             finished_seen: false,
@@ -246,8 +343,10 @@ impl PaneWatch {
         &self.config
     }
 
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
+    /// A handle on the working directory this watch resolved when it was
+    /// registered, for reading the todo file outside the map's lock.
+    pub fn work_dir(&self) -> WorkDir {
+        self.work_dir.try_clone()
     }
 
     pub fn pane_id(&self) -> &str {
@@ -300,17 +399,24 @@ impl PaneWatch {
     pub fn observe(&mut self, info: &TerminalInfo, todo: Todo, now: Instant) -> WatchEvent {
         // Turn bookkeeping runs even while the watchdog is stopped for this
         // pane, because an advancing turn is what clears the stop. The one
-        // exception is the turn a nudge itself causes: a nudge sent on turn
-        // N makes the agent run turn N+1, and that advance is the watchdog's
-        // own doing, not progress — it must not reset the cap, or an agent
-        // that answers every nudge would be nudged forever.
+        // exception is the turns a nudge itself causes: the agent that
+        // answers a nudge runs a turn (or a few), and that advance is the
+        // watchdog's own doing, not progress — it must not reset the cap,
+        // or an agent that answers every nudge would be nudged forever.
+        // What a nudge may explain is bounded by `nudge_allowance`; the cap
+        // itself counts nudges sent, so it holds however many turns, or
+        // none, each nudge produces.
         if info.turn != self.last_turn {
             if let (Some(before), Some(after)) = (self.last_turn, info.turn) {
-                let nudge_caused = self.nudged_turn == Some(before) && after == before + 1;
-                if after > before && !nudge_caused {
-                    self.consecutive = 0;
-                    self.gave_up = false;
-                    self.nudged_turn = None;
+                if after > before {
+                    let advance = after - before;
+                    if advance <= self.nudge_allowance {
+                        self.nudge_allowance -= advance;
+                    } else {
+                        self.consecutive = 0;
+                        self.gave_up = false;
+                        self.nudge_allowance = 0;
+                    }
                 }
             }
             self.last_turn = info.turn;
@@ -362,11 +468,11 @@ impl PaneWatch {
         })
     }
 
-    /// Record that the nudge text went in at `now`, on turn `turn`.
-    pub fn note_nudged(&mut self, now: Instant, turn: Option<u64>) {
+    /// Record that the nudge text went in at `now`.
+    pub fn note_nudged(&mut self, now: Instant) {
         self.consecutive += 1;
         self.last_nudge = Some(now);
-        self.nudged_turn = turn;
+        self.nudge_allowance = NUDGE_TURN_ALLOWANCE;
     }
 
     /// Record that a nudge was refused or failed at `now`. A failed attempt
@@ -578,7 +684,7 @@ mod tests {
             watch.observe(&done, Todo::NotConfigured, at(t0, 60)),
             WatchEvent::Nudge(_)
         ));
-        watch.note_nudged(at(t0, 60), Some(3));
+        watch.note_nudged(at(t0, 60));
         // Inside the 30 s cooldown: nothing, even though the pane is idle.
         assert_eq!(
             watch.observe(&done, Todo::NotConfigured, at(t0, 89)),
@@ -590,7 +696,7 @@ mod tests {
                 watch.observe(&done, Todo::NotConfigured, at(t0, at_secs)),
                 WatchEvent::Nudge(_)
             ));
-            watch.note_nudged(at(t0, at_secs), Some(3));
+            watch.note_nudged(at(t0, at_secs));
         }
         // The cap is 3: the next due observation gives up, once.
         assert_eq!(
@@ -614,16 +720,16 @@ mod tests {
                 watch.observe(&done, Todo::NotConfigured, at(t0, at_secs)),
                 WatchEvent::Nudge(_)
             ));
-            watch.note_nudged(at(t0, at_secs), Some(3));
+            watch.note_nudged(at(t0, at_secs));
         }
         assert_eq!(
             watch.observe(&done, Todo::NotConfigured, at(t0, 150)),
             WatchEvent::GaveUp
         );
-        // The agent picks the work up on its own and runs past the turn a
-        // nudge could have caused: a jump from turn 3 to turn 5 is not the
-        // single step a nudge on turn 3 would produce, so it is progress
-        // and clears both the count and the give-up.
+        // The agent picks the work up on its own and runs past the turns a
+        // nudge could have caused: a jump from turn 3 to turn 9 is more
+        // than a nudge explains, so it is progress and clears both the
+        // count and the give-up.
         assert_eq!(
             watch.observe(
                 &info(State::Working, Some(3)),
@@ -632,7 +738,7 @@ mod tests {
             ),
             WatchEvent::None
         );
-        let next = info(State::Done, Some(5));
+        let next = info(State::Done, Some(9));
         assert_eq!(
             watch.observe(&next, Todo::NotConfigured, at(t0, 300)),
             WatchEvent::None
@@ -667,7 +773,7 @@ mod tests {
                 ),
                 "turn {turn}"
             );
-            watch.note_nudged(at(t0, at_secs), Some(turn));
+            watch.note_nudged(at(t0, at_secs));
             // The agent answers the nudge: exactly one new finished turn.
             turn += 1;
             at_secs += 1;
@@ -691,6 +797,127 @@ mod tests {
             ),
             WatchEvent::GaveUp
         );
+    }
+
+    #[test]
+    fn a_nudge_that_produces_several_turns_does_not_reset_the_cap() {
+        // Each nudge makes the agent run two turns (the answer and a
+        // follow-up), which the old one-nudge-one-turn rule took for
+        // progress. The cap counts nudges sent, so it still holds.
+        let t0 = Instant::now();
+        let mut watch = pane_watch(Agent::Kiro);
+        let mut turn = 3u64;
+        let mut at_secs = 0u64;
+        watch.observe(&info(State::Done, Some(turn)), Todo::NotConfigured, t0);
+        for _ in 0..3 {
+            at_secs += 60;
+            assert!(matches!(
+                watch.observe(
+                    &info(State::Done, Some(turn)),
+                    Todo::NotConfigured,
+                    at(t0, at_secs)
+                ),
+                WatchEvent::Nudge(_)
+            ));
+            watch.note_nudged(at(t0, at_secs));
+            // Two turns, seen in one observation.
+            turn += 2;
+            at_secs += 1;
+            assert_eq!(
+                watch.observe(
+                    &info(State::Done, Some(turn)),
+                    Todo::NotConfigured,
+                    at(t0, at_secs)
+                ),
+                WatchEvent::None
+            );
+        }
+        at_secs += 60;
+        assert_eq!(
+            watch.observe(
+                &info(State::Done, Some(turn)),
+                Todo::NotConfigured,
+                at(t0, at_secs)
+            ),
+            WatchEvent::GaveUp
+        );
+    }
+
+    #[test]
+    fn a_nudge_whose_turns_are_seen_one_at_a_time_does_not_reset_the_cap() {
+        // Same loop, but the two turns a nudge causes show up in separate
+        // observations (working, then done, for each).
+        let t0 = Instant::now();
+        let mut watch = pane_watch(Agent::Kiro);
+        let mut turn = 3u64;
+        let mut at_secs = 0u64;
+        watch.observe(&info(State::Done, Some(turn)), Todo::NotConfigured, t0);
+        for _ in 0..3 {
+            at_secs += 60;
+            assert!(matches!(
+                watch.observe(
+                    &info(State::Done, Some(turn)),
+                    Todo::NotConfigured,
+                    at(t0, at_secs)
+                ),
+                WatchEvent::Nudge(_)
+            ));
+            watch.note_nudged(at(t0, at_secs));
+            for _ in 0..2 {
+                turn += 1;
+                at_secs += 1;
+                watch.observe(
+                    &info(State::Working, Some(turn)),
+                    Todo::NotConfigured,
+                    at(t0, at_secs),
+                );
+            }
+            at_secs += 1;
+            watch.observe(
+                &info(State::Done, Some(turn)),
+                Todo::NotConfigured,
+                at(t0, at_secs),
+            );
+        }
+        at_secs += 60;
+        assert_eq!(
+            watch.observe(
+                &info(State::Done, Some(turn)),
+                Todo::NotConfigured,
+                at(t0, at_secs)
+            ),
+            WatchEvent::GaveUp
+        );
+    }
+
+    #[test]
+    fn nudges_that_produce_no_turn_stop_at_the_cap_and_build_no_credit() {
+        // The agent ignores every nudge: the turn never moves. The cap
+        // counts nudges sent, so the third due observation gives up; and a
+        // later advance past one nudge's allowance is still progress, not
+        // absorbed by credit from the nudges that did nothing.
+        let t0 = Instant::now();
+        let mut watch = pane_watch(Agent::Kiro);
+        let done = info(State::Done, Some(3));
+        watch.observe(&done, Todo::NotConfigured, t0);
+        for at_secs in [60, 90, 120] {
+            assert!(matches!(
+                watch.observe(&done, Todo::NotConfigured, at(t0, at_secs)),
+                WatchEvent::Nudge(_)
+            ));
+            watch.note_nudged(at(t0, at_secs));
+        }
+        assert_eq!(
+            watch.observe(&done, Todo::NotConfigured, at(t0, 150)),
+            WatchEvent::GaveUp
+        );
+        let jump = 3 + NUDGE_TURN_ALLOWANCE + 1;
+        let next = info(State::Done, Some(jump));
+        watch.observe(&next, Todo::NotConfigured, at(t0, 200));
+        assert!(matches!(
+            watch.observe(&next, Todo::NotConfigured, at(t0, 260)),
+            WatchEvent::Nudge(_)
+        ));
     }
 
     #[test]
@@ -776,6 +1003,51 @@ mod tests {
     }
 
     #[test]
+    fn a_working_directory_swapped_for_a_symlink_after_the_watch_started_is_not_followed() {
+        // The directory is resolved once, when the watch opens it. If its
+        // path is later replaced by a symlink to somewhere else (the real
+        // directory moved aside), reads still come from the directory the
+        // watch began with, never from the symlink's target.
+        #[cfg(unix)]
+        {
+            let parent = TempDir::new("watchdog-todo-swap");
+            let cwd = parent.path().join("work");
+            std::fs::create_dir(&cwd).unwrap();
+            std::fs::write(cwd.join("TODO.md"), "- [x] done\n").unwrap();
+            let outside = parent.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("TODO.md"), "- [ ] planted\n").unwrap();
+            let rel = Path::new("TODO.md");
+            let work = WorkDir::open(&cwd);
+            assert_eq!(read_todo_in(&work, rel), Todo::Finished);
+            std::fs::rename(&cwd, parent.path().join("work.moved")).unwrap();
+            std::os::unix::fs::symlink(&outside, &cwd).unwrap();
+            // Control: a path-based read now follows the symlink.
+            assert_eq!(read_todo(&cwd, rel), Todo::Unchecked);
+            // The watch's own handle does not.
+            assert_eq!(read_todo_in(&work, rel), Todo::Finished);
+            assert_eq!(read_todo_in(&work.try_clone(), rel), Todo::Finished);
+        }
+    }
+
+    #[test]
+    fn unchecked_items_inside_a_fenced_code_block_do_not_count() {
+        let dir = TempDir::new("watchdog-todo-fence");
+        let file = dir.path().join("TODO.md");
+        let rel = Path::new("TODO.md");
+        std::fs::write(&file, "- [x] done\n```\n- [ ] example\n```\n").unwrap();
+        assert_eq!(read_todo(dir.path(), rel), Todo::Finished);
+        std::fs::write(&file, "~~~md\n- [ ] example\n~~~\n- [ ] real\n").unwrap();
+        assert_eq!(read_todo(dir.path(), rel), Todo::Unchecked);
+        // A fence that is never closed hides the rest, like Markdown.
+        std::fs::write(&file, "```\n- [ ] example\n").unwrap();
+        assert_eq!(read_todo(dir.path(), rel), Todo::Finished);
+        // A tilde line does not close a backtick fence.
+        std::fs::write(&file, "```\n~~~\n- [ ] still fenced\n```\n").unwrap();
+        assert_eq!(read_todo(dir.path(), rel), Todo::Finished);
+    }
+
+    #[test]
     fn a_zero_cooldown_allows_the_next_nudge_at_the_next_observation() {
         let t0 = Instant::now();
         let mut watch = PaneWatch::new(
@@ -793,7 +1065,7 @@ mod tests {
             watch.observe(&done, Todo::NotConfigured, at(t0, 60)),
             WatchEvent::Nudge(_)
         ));
-        watch.note_nudged(at(t0, 60), Some(3));
+        watch.note_nudged(at(t0, 60));
         assert!(matches!(
             watch.observe(&done, Todo::NotConfigured, at(t0, 61)),
             WatchEvent::Nudge(_)

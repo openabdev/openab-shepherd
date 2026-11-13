@@ -455,6 +455,27 @@ pub enum ErrorKind {
     Other,
 }
 
+/// The part of a paste-without-Enter failure's detail that names it. The
+/// backend that two-steps a send (paste, then Enter) builds the failure with
+/// [`pasted_unsubmitted`]; the watchdog recognizes it with
+/// [`is_pasted_unsubmitted`]. Both use this one text, so rewording it cannot
+/// separate them.
+const PASTED_UNSUBMITTED: &str = "the text was pasted but Enter was not pressed";
+
+/// The failure of a send whose text was pasted into pane `pane_id` but whose
+/// Enter was refused, for `why`. The text is left on the input line.
+pub fn pasted_unsubmitted(pane_id: &str, why: &str) -> BackendError {
+    BackendError::new(
+        ErrorKind::Other,
+        format!("native: {pane_id}: {PASTED_UNSUBMITTED}: {why}"),
+    )
+}
+
+/// Whether a backend failure's `detail` is a [`pasted_unsubmitted`] one.
+pub fn is_pasted_unsubmitted(detail: &str) -> bool {
+    detail.contains(PASTED_UNSUBMITTED)
+}
+
 /// A backend failure. `detail` is the backend's own text, for debugging only;
 /// it may use the backend's vocabulary and is never shown as Shepherd's message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,7 +639,15 @@ pub trait TerminalBackend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::dialog_kind;
+    use super::{dialog_kind, is_pasted_unsubmitted, pasted_unsubmitted, ErrorKind};
+
+    #[test]
+    fn a_pasted_unsubmitted_failure_is_recognized_by_its_detail() {
+        let err = pasted_unsubmitted("t1", "the program became blocked");
+        assert_eq!(err.kind, ErrorKind::Other);
+        assert!(is_pasted_unsubmitted(&err.detail), "{}", err.detail);
+        assert!(!is_pasted_unsubmitted("native: t1: the write failed"));
+    }
 
     #[test]
     fn known_dialog_kinds_pass_through() {

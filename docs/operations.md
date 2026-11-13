@@ -211,15 +211,21 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
   start drops the registration). Fields:
   - `idle_timeout_secs` (required): 10 to 86400.
   - `nudge_text` (required): the text typed, under the `send_input` input rules
-    (trimmed, at most 4096 bytes, no control characters except TAB).
+    (trimmed, at most 4096 bytes, no control characters except TAB). A bare
+    confirmation or menu answer is refused when the profiles file is read:
+    a single character, a number of one or two digits, or a word such as
+    `yes`, `ok`, `enter`, `allow`, `always`, `deny`, `reject`, `bypass` or
+    `trust`. Use a sentence that tells the agent what to do.
   - `cooldown_secs` (optional, default `idle_timeout_secs`): 0 to 86400, the
     least time between two nudges to the same pane.
   - `max_consecutive_nudges` (optional, default 3): 1 to 100. After that many
     nudges without progress the watchdog did not cause, the watchdog stops
-    for the pane and logs that it gave up. The turn a nudge itself causes —
-    the nudge's turn plus one, when the agent answers the nudge and finishes
-    again — does not count as progress and does not clear the count or the
-    stop; a later advance does. Failed or refused nudge attempts also count
+    for the pane and logs that it gave up. The cap counts nudges sent. The
+    turns a nudge itself causes — up to 3 turn advances after each nudge,
+    whether the agent answers with one turn or a follow-up as well — do not
+    count as progress and do not clear the count or the stop; a larger
+    advance, or one with no nudge outstanding, does. A nudge that produces
+    no turn counts like any other. Failed or refused nudge attempts also count
     toward the cap and are spaced by the cooldown, so a pane that refuses
     every nudge is not retried on every check. Without a `todo_file`, every
     finished turn is a nudge candidate, so a pane whose work is in fact
@@ -230,12 +236,14 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
     first non-blank characters are `- [ ]` — in that file. No unchecked item
     (every item checked, or no items at all) counts as finished work, and the
     pane is never nudged; a file that cannot be read is never nudged either.
-    The match is a plain line scan, so `- [ ]` inside a fenced code block
-    counts too. The file is read defensively: it must be a regular file, a
+    The match is a plain line scan that skips fenced code blocks (a line
+    starting with three backticks or tildes opens and closes one). The file is read defensively: it must be a regular file, a
     file over 256 KiB counts as unreadable, and the transition to
     unreadable is logged once. On Unix the working directory is the
-    boundary: it is opened as a directory handle (so a working directory
-    reached through a symlinked ancestor still reads), and a symlink in
+    boundary: it is canonicalized and opened as a directory handle once,
+    when the pane is registered (so a working directory reached through a
+    symlinked ancestor still reads, and swapping it or an ancestor for a
+    symlink later is not followed), and a symlink in
     any component of the `todo_file` path below it counts as unreadable.
     On non-Unix the read is a plain open and follows symlinks.
   Watchdog profiles are meant for unattended panes. The watchdog types
@@ -246,6 +254,9 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
   advance it did not cause. A person at the pane in the meantime could
   submit that pasted text by pressing Enter themselves. A watched pane
   whose program has ended is forgotten, not re-checked on every pass.
+  The watchdog thread serves every watched pane, so it waits at most 2 s
+  for a pane's lock: a pane another call holds for longer is skipped for
+  that check, with nothing sent and nothing counted.
   The watchdog's audit trail is Shepherd's stderr log: every nudge (with
   the pane's idle seconds), every give-up and every failed attempt is a
   line there, and nowhere else — a client cannot tell a watchdog nudge

@@ -95,6 +95,9 @@ pub struct FakeState {
     /// When set, the next `remove` signals the sender once it has started,
     /// then waits for the receiver before it removes the pane.
     pub remove_gate: Option<(Sender<()>, Receiver<()>)>,
+    /// When set, the next `send` that passes its guard fails with this
+    /// instead of writing.
+    pub send_error: Option<BackendError>,
 }
 
 /// An in-memory backend. `get`, `send`, `remove`, and (with
@@ -321,6 +324,9 @@ impl TerminalBackend for FakeBackend {
             }
         }
         let mut state = self.state.lock().unwrap();
+        if let Some(err) = state.send_error.take() {
+            return Err(err);
+        }
         let held = state
             .locks
             .as_ref()

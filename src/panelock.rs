@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Default)]
 struct Table {
@@ -38,14 +39,39 @@ impl PaneLocks {
 
     /// Block until `address` is free, then hold it.
     pub fn lock(self: &Arc<Self>, address: &str) -> PaneGuard {
+        self.lock_until(address, None)
+            .expect("a lock with no deadline never times out")
+    }
+
+    /// Wait at most `wait` for `address` to be free, then hold it. `None`
+    /// when it stayed held for the whole wait.
+    pub fn lock_within(self: &Arc<Self>, address: &str, wait: Duration) -> Option<PaneGuard> {
+        self.lock_until(address, Some(Instant::now() + wait))
+    }
+
+    fn lock_until(self: &Arc<Self>, address: &str, deadline: Option<Instant>) -> Option<PaneGuard> {
         let mut table = self.table();
         if table.held.contains(address) {
             *table.waiting.entry(address.to_string()).or_insert(0) += 1;
+            let mut timed_out = false;
             while table.held.contains(address) {
-                table = self
-                    .freed
-                    .wait(table)
-                    .unwrap_or_else(PoisonError::into_inner);
+                table = match deadline {
+                    None => self
+                        .freed
+                        .wait(table)
+                        .unwrap_or_else(PoisonError::into_inner),
+                    Some(deadline) => {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            timed_out = true;
+                            break;
+                        }
+                        self.freed
+                            .wait_timeout(table, left)
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0
+                    }
+                };
             }
             if let Some(count) = table.waiting.get_mut(address) {
                 *count -= 1;
@@ -53,12 +79,15 @@ impl PaneLocks {
                     table.waiting.remove(address);
                 }
             }
+            if timed_out {
+                return None;
+            }
         }
         table.held.insert(address.to_string());
-        PaneGuard {
+        Some(PaneGuard {
             locks: Arc::clone(self),
             address: address.to_string(),
-        }
+        })
     }
 
     /// How many calls are blocked waiting for `address`. Tests use it to know a
@@ -111,5 +140,17 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(locks.waiting("t8"), 0);
         assert!(locks.table().held.is_empty());
+    }
+
+    #[test]
+    fn a_bounded_lock_gives_up_while_the_address_stays_held() {
+        let locks = Arc::new(PaneLocks::default());
+        let first = locks.lock("t8");
+        assert!(locks.lock_within("t8", Duration::from_millis(30)).is_none());
+        assert_eq!(locks.waiting("t8"), 0);
+        // A free address, and the same address once released, are taken.
+        assert!(locks.lock_within("t9", Duration::from_millis(30)).is_some());
+        drop(first);
+        assert!(locks.lock_within("t8", Duration::from_millis(30)).is_some());
     }
 }
