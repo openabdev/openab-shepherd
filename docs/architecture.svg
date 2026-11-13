@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1080" viewBox="0 0 1200 1080" role="img" aria-labelledby="title desc">
   <title id="title">OpenAB Shepherd architecture</title>
-  <desc id="desc">An MCP client reaches Shepherd through Tailscale on the tailnet. Shepherd checks the Host header and the bearer token, runs the MCP tools under a per-pane lock and safety rules, and drives a kiro-cli pane through the native core or the hc backend. Side panels show the answer_dialog path and the credential path from a launch profile into the child environment.</desc>
+  <desc id="desc">An MCP client reaches Shepherd through Tailscale on the tailnet. Shepherd checks the Host header and the bearer token, runs the MCP tools under a per-pane lock and safety rules, and drives a kiro-cli pane through the native core. Side panels show the answer_dialog path and the credential path from a launch profile into the child environment.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">
       <path d="M0,0 L10,5 L0,10 z" fill="#3b4252"/>
@@ -62,22 +62,15 @@
 
     <g id="backend">
       <rect x="40" y="674" width="600" height="196" rx="8" fill="#f5f5f5" stroke="#3b4252" stroke-width="1.5"/>
-      <text x="340" y="698" text-anchor="middle" font-size="16" font-weight="bold">Backend, chosen by OPENAB_SHEPHERD_BACKEND</text>
+      <text x="340" y="698" text-anchor="middle" font-size="16" font-weight="bold">Backend (native is the only one)</text>
       <g id="native">
-        <rect x="56" y="712" width="340" height="144" rx="6" fill="#ffffff" stroke="#3b4252" stroke-width="1.5"/>
-        <text x="226" y="734" text-anchor="middle" font-weight="bold">native core (default)</text>
+        <rect x="56" y="712" width="568" height="144" rx="6" fill="#ffffff" stroke="#3b4252" stroke-width="1.5"/>
+        <text x="340" y="734" text-anchor="middle" font-weight="bold">native core</text>
         <text x="72" y="758">PTY per pane, own session (setsid)</text>
         <text x="72" y="782">VT emulator (vt100) draws the screen</text>
         <text x="72" y="806">OSC 7501 parser: status and turn</text>
         <text x="72" y="830">Process tree: group and descendants,</text>
         <text x="72" y="848">signalled on remove, exit, shutdown</text>
-      </g>
-      <g id="hc">
-        <rect x="412" y="712" width="212" height="144" rx="6" fill="#ffffff" stroke="#3b4252" stroke-width="1.5" stroke-dasharray="6 4"/>
-        <text x="518" y="734" text-anchor="middle" font-weight="bold">hc backend (optional)</text>
-        <text x="518" y="762" text-anchor="middle">herdr-core JSON-RPC</text>
-        <text x="518" y="786" text-anchor="middle">over the HC_SOCKET</text>
-        <text x="518" y="810" text-anchor="middle">Unix socket</text>
       </g>
     </g>
 
@@ -85,8 +78,6 @@
     <text x="128" y="893">text, keys</text>
     <line x1="270" y1="906" x2="270" y2="870" stroke="#3b4252" stroke-width="2" marker-end="url(#arrow)"/>
     <text x="278" y="893">output, OSC 7501</text>
-    <line x1="518" y1="870" x2="518" y2="906" stroke="#3b4252" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
-    <text x="526" y="893">via herdr-core</text>
 
     <g id="pane">
       <rect x="40" y="906" width="600" height="88" rx="8" fill="#e8f1ea" stroke="#3b4252" stroke-width="1.5"/>
@@ -113,7 +104,7 @@
       <line x1="925" y1="520" x2="925" y2="536" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
       <rect x="710" y="536" width="430" height="40" rx="6" fill="#ffffff" stroke="#1f6feb"/>
       <text x="726" y="561">5. Same dialog and turn: Enter; else refuse</text>
-      <text x="710" y="600">Native: the check and Enter are one guarded write.</text>
+      <text x="710" y="600">The check and Enter are one guarded write.</text>
       <text x="710" y="622">Rule-creating options are never offered.</text>
     </g>
     <line x1="640" y1="446" x2="690" y2="446" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
@@ -135,7 +126,7 @@
       <line x1="925" y1="874" x2="925" y2="920" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow-orange)"/>
       <rect x="710" y="920" width="430" height="56" rx="6" fill="#ffffff" stroke="#c2410c"/>
       <text x="726" y="944">Profile env, kept as a redacted secret</text>
-      <text x="726" y="966">native adds it to the child; hc refuses it</text>
+      <text x="726" y="966">added to the child environment</text>
     </g>
     <line x1="710" y1="948" x2="640" y2="948" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow-orange)"/>
     <text x="645" y="938" fill="#9a3412" font-size="14">child</text>
@@ -145,12 +136,10 @@
     <g id="legend">
       <line x1="40" y1="1040" x2="80" y2="1040" stroke="#3b4252" stroke-width="2" marker-end="url(#arrow)"/>
       <text x="88" y="1045">request path</text>
-      <line x1="200" y1="1040" x2="240" y2="1040" stroke="#3b4252" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
-      <text x="248" y="1045">optional hc backend</text>
-      <line x1="400" y1="1040" x2="440" y2="1040" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
-      <text x="448" y="1045">answer_dialog path</text>
-      <line x1="600" y1="1040" x2="640" y2="1040" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow-orange)"/>
-      <text x="648" y="1045">credential path, into the child environment only</text>
+      <line x1="200" y1="1040" x2="240" y2="1040" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+      <text x="248" y="1045">answer_dialog path</text>
+      <line x1="400" y1="1040" x2="440" y2="1040" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+      <text x="448" y="1045">credential path, into the child environment only</text>
     </g>
   </g>
 </svg>
