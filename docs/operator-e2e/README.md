@@ -321,7 +321,7 @@ The binary `~/.local/bin/openab-shepherd` and the copy on the build host stay; d
 - **HTTP 401** (`unauthorized`): the token file differs from the one the server loaded. Restart the server or fix `SHEPHERD_TOKEN_FILE`.
 - **HTTP 403** (`forbidden`): the Host header is not `127.0.0.1`, `[::1]` or `localhost` (with or without a port). Use the default `SHEPHERD_URL`.
 - **Server exits 2 at start**: stderr says why. Typical: token or profiles file inside a git repository or inside the server's start folder, token mode wider than 0600, profiles file group/other-writable, a `cwds` entry that does not exist, token shorter than 16 characters.
-- **`start_pane` returns `not_found`**: `argv[0]` is not an executable at that path (re-run `setup.sh` after fixing `PATH`), or the cwd is outside the profile's `cwds`.
+- **`start_pane` returns `not_found`**: `argv[0]` is not an executable at that path (re-run `setup.sh` after fixing `PATH`), or the cwd does not exist. A cwd outside the profile's `cwds` is refused with a `cwd: ...` validation error instead.
 - **`send_input` text sits in the input box**: Shepherd pastes the text and then presses Enter; if `started` is false and the state stays `idle`, record it and read the screen.
 - **`wait_status` returns `timeout`**: a check-in only; call it again.
 
