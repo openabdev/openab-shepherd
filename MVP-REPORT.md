@@ -1,5 +1,20 @@
 # OpenAB Shepherd MVP report
 
+> **Historical record, last reviewed against `origin/main` 6dba579 (0.2.0 plus the Devin and
+> OpenCode changes).** The sections below were written at the points in time they name and are
+> not rewritten. Counts and statements in them (70, 120, 170 tests; seven tools; "crate not yet
+> committed") describe those moments. **Current facts:** 9 tools (`TOOL_NAMES` in
+> `src/tools.rs`); 264 unit tests (lib 261, bin 3, `cargo test` on the build host); the crate is
+> committed and released as 0.2.0; supported agents are kiro-cli 3.1.0 and Devin CLI 3000.12.43
+> (dialogs measured) and OpenCode (startup only; its permission dialog is unmeasured and
+> `answer_dialog` refuses it). **The one maintained known-limits list is in
+> [README.md](README.md#status-and-known-limits)** and
+> [docs/operations.md](docs/operations.md#known-limits-mvp-scope). The "Known limits" section
+> below is a snapshot kept for the record; where it differs from those, they win.
+> The operator run at the end of this file did succeed with plain-mode framing (no `hello`
+> sent) against herdr-core, so the "plain-mode framing is unverified" item below is out of date
+> for the MVP-era hc client; it was not re-run against the current hc adapter (unverified).
+
 ## Status
 
 ### Current: native core (branch `feat/native-core`)
@@ -234,7 +249,7 @@ curl -s -i $URL -H "$AUTH" -H 'Content-Type: application/json' -d '{"jsonrpc":"2
 - Whitespace-only: text `line: input is empty after trimming`.
 - Control character: text `line: input contains control character U+0007; remove it and retry`.
 
-## Known limits
+## Known limits (snapshot; see README for the maintained list)
 
 - **No multi-client authorization.** Any holder of the token controls every pane.
 - **Permission dialogs: what `answer_dialog` guarantees.** `send_input` is refused while a pane is
