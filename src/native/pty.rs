@@ -213,7 +213,51 @@ fn child_setup() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+    cloexec_above_stdio();
     default_signals()
+}
+
+/// Upper bound for the fallback descriptor loop.
+const FD_SCAN_LIMIT: libc::c_long = 65536;
+
+/// Mark every descriptor above 2 close-on-exec, so the exec'd program
+/// receives only 0, 1 and 2 whatever the launching environment left open.
+///
+/// This marks instead of closing on purpose: `std::process::Command` keeps a
+/// close-on-exec pipe (a descriptor above 2) open during `pre_exec` to carry
+/// a failed `pre_exec` or `exec` back to the parent. Closing it here would
+/// make every such failure look like a successful spawn. A close-on-exec
+/// descriptor is closed by the kernel at exec, so the pipe still reports
+/// failures and nothing above 2 survives into the program.
+///
+/// Async-signal-safe: raw syscalls and fcntl only, no allocation, no locks.
+fn cloexec_above_stdio() {
+    // SAFETY: plain syscalls on this process's descriptor table.
+    unsafe {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // CLOSE_RANGE_CLOEXEC (kernel 5.11, flag value 4).
+            let rc = libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 4u32);
+            if rc == 0 {
+                return;
+            }
+            // ENOSYS, EINVAL or a seccomp refusal: use the loop below.
+        }
+        let open_max = libc::sysconf(libc::_SC_OPEN_MAX);
+        let limit = if open_max < 0 {
+            FD_SCAN_LIMIT
+        } else {
+            open_max.min(FD_SCAN_LIMIT)
+        };
+        let mut fd: libc::c_int = 3;
+        while libc::c_long::from(fd) < limit {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags != -1 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+            fd += 1;
+        }
+    }
 }
 
 /// Default dispositions for the signals Shepherd handles and an empty mask.
