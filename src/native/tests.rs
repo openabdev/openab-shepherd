@@ -1348,3 +1348,76 @@ fn shutdown_and_drop_end_a_descendant_that_detached_at_once() {
         );
     }
 }
+
+// Linux environment-scrubbing descendants (design review
+// .agents/tasks/pr11-design-review.md, escape table). Each test pins the
+// behavior observed on Linux, not a wish.
+
+/// Like `detach_helper`, but the detached child changes its own environment
+/// before it prints `gc:<pid>`: mode `clearenv` calls clearenv(3); mode
+/// `fresh` execs `env -i sleep 300`, which keeps the pid but starts from an
+/// empty environment.
+#[cfg(target_os = "linux")]
+fn scrub_helper(dir: &TempDir) -> String {
+    let src = dir.path().join("scrub.c");
+    let bin = dir.path().join("scrub");
+    std::fs::write(
+        &src,
+        "#define _GNU_SOURCE\n#include <stdlib.h>\n#include <string.h>\n\
+         #include <unistd.h>\n#include <stdio.h>\n#include <sys/types.h>\n\
+         int main(int argc, char **argv){\n\
+         if (argc < 2) return 1;\n\
+         if (setsid() == -1) return 1;\n\
+         pid_t p = fork();\n\
+         if (p < 0) return 1;\n\
+         if (p > 0) _exit(0);\n\
+         printf(\"gc:%d\\n\", (int)getpid()); fflush(stdout);\n\
+         close(0); close(1); close(2);\n\
+         if (strcmp(argv[1], \"clearenv\") == 0) { clearenv(); sleep(300); return 0; }\n\
+         execl(\"/usr/bin/env\", \"env\", \"-i\", \"sleep\", \"300\", (char *)0);\n\
+         return 1;\n}\n",
+    )
+    .unwrap();
+    let ok = Command::new("cc")
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .expect("cc to build the scrub helper")
+        .success();
+    assert!(ok, "the scrub helper did not compile");
+    bin.to_string_lossy().into_owned()
+}
+
+// Review table row 6: clearenv() in the descendant. Observed on Linux:
+// caught, because /proc/<pid>/environ still reads the original env region.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_descendant_that_calls_clearenv_is_caught() {
+    let dir = TempDir::new("native-clearenv");
+    let b = backend();
+    let line = format!("{} clearenv & sleep 60", scrub_helper(&dir));
+    let info = b.run(&spec_line("clr", &line, &dir)).unwrap();
+    let gc = printed_pid(&b, &info, "gc:");
+    b.remove(&info.reference(), None).unwrap();
+    assert!(detached_ended(gc), "grandchild {gc} outlived remove");
+}
+
+// Review table row 7: execve with a fresh environment (`env -i`). Known
+// escape: the new image carries no marker, so the sweep cannot find it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_descendant_started_with_env_i_is_a_known_escape() {
+    let dir = TempDir::new("native-env-i");
+    let b = backend();
+    let line = format!("{} fresh & sleep 60", scrub_helper(&dir));
+    let info = b.run(&spec_line("envi", &line, &dir)).unwrap();
+    let gc = printed_pid(&b, &info, "gc:");
+    b.remove(&info.reference(), None).unwrap();
+    let survived = !process_gone_within(gc, Duration::from_secs(3));
+    // SAFETY: a test's own grandchild; clean up whatever the sweep missed.
+    unsafe {
+        libc::kill(gc, libc::SIGKILL);
+    }
+    assert!(survived, "grandchild {gc} was ended: the escape is closed");
+}
