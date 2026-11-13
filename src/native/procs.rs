@@ -481,8 +481,12 @@ mod tests {
     fn a_sweep_finds_processes_by_their_marker_only() {
         let marker = new_marker();
         let spawn = |value: &str| {
-            Command::new("/bin/sleep")
-                .arg("30")
+            // Not /bin/sleep: on macOS the environment of SIP-restricted Apple
+            // binaries is withheld from KERN_PROCARGS2, so the sweep cannot see
+            // their marker. Re-run this test binary as an ordinary executable.
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "native::procs::tests::sweep_sleeper"])
+                .env("SHEPHERD_SWEEP_SLEEPER", "1")
                 .env(MARKER_KEY, value)
                 .stdin(Stdio::null())
                 .spawn()
@@ -490,6 +494,8 @@ mod tests {
         };
         let mut ours = spawn(&marker);
         let mut other = spawn(&new_marker());
+        // Let both children finish exec; before it they show the parent's environment.
+        thread_sleep(500);
         let mut tree = Tree::new(&marker);
         let added = tree.sweep();
         let found = tree.members.contains_key(&(ours.id() as i32));
@@ -516,6 +522,14 @@ mod tests {
         assert!(!os::procargs_has(&data, b"OPENAB_SHEPHERD_PANE=a"));
         assert!(!os::procargs_has(&data, b"junk"));
         assert!(!os::procargs_has(&data[..3], b"K=v"));
+    }
+
+    /// The child of the sweep test: sleeps when asked, otherwise a no-op.
+    #[test]
+    fn sweep_sleeper() {
+        if std::env::var_os("SHEPHERD_SWEEP_SLEEPER").is_some() {
+            thread_sleep(30_000);
+        }
     }
 
     fn thread_sleep(ms: u64) {
