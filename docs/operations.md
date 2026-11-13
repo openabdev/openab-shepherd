@@ -578,7 +578,7 @@ Pane ids are `n:<k>`
   under the input rules (empty allowed), for that pane only. It may not set `HOME`,
   `PATH`, `USER`, `LANG`, `TERM` or any `DYLD_*`/`LD_*` name (refused with
   `invalid_input`). Shepherd's token, token file path, profiles path,
-  `OPENAB_SHEPHERD_BACKEND` and everything else never reach a child. Descriptors are close-on-exec and native spawns are serialized.
+  `OPENAB_SHEPHERD_BACKEND` and everything else never reach a child. Shepherd's own descriptors are close-on-exec, native spawns are serialized, and the child marks every descriptor above 2 close-on-exec just before exec, so no descriptor above 2 survives exec, including ones Shepherd inherited from its parent. The list of descriptors is read in Shepherd (from `/proc/self/fd`, or `/dev/fd` on macOS) while the spawn lock is held, and the child only applies it; on Linux 5.11 or later `close_range` does the whole job in one call. If the list cannot be read, Shepherd scans every number up to the hard `RLIMIT_NOFILE` instead, and if that range is too large to scan (above 1048576) the spawn fails rather than leave descriptors open. A descriptor that cannot be marked also fails the spawn. One limit remains: a descriptor that another Shepherd thread opens without close-on-exec between the listing and the fork is not covered, so every descriptor Shepherd opens must stay close-on-exec. Cost: the listing is proportional to the number of open descriptors, not to the descriptor limit, so a spawn does not slow down when the limit is raised.
 - **Process groups and descendants.** Each child is a session and group leader with
   the PTY as its controlling terminal. Shepherd also tracks every descendant of the
   child, by pid and start time: by parent pid every 250 ms while the child runs and
@@ -727,6 +727,36 @@ The unit tests need no external daemon. The backend-neutral tool tests use an in
 `FakeBackend`, and the config tests run `git init` in a scratch directory, so `git` must be installed.
 The native integration tests (`native::tests`) run real programs on a PTY, so the
 build host needs `sh`, `cat`, `printf`, `env` and `ls`.
+
+The operator end-to-end runbook, which drives real Devin and OpenCode panes through the MCP tools, is in [`docs/operator-e2e/`](operator-e2e/README.md).
+
+## CI
+
+`.github/workflows/ci.yml` runs on every pull request and on pushes to `main`. It uses no
+secrets and only read access to the repository.
+
+- `test` runs on `ubuntu-latest` and `macos-latest`: `cargo fmt --check`,
+  `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked --no-fail-fast`.
+  It times out after 20 minutes.
+- `docker-build` checks that the Dockerfile's `rust:<version>-bookworm` builder matches
+  `rust-toolchain.toml`, builds the `Dockerfile` with its default build arguments (no
+  Devin CLI), pushes nothing, and runs `openab-shepherd --help` in the image. It times out
+  after 15 minutes.
+
+To reproduce the `test` job, run these three commands in the crate directory on the build
+host (see "Build offload"), never on the laptop:
+
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --no-fail-fast
+```
+
+`rust-toolchain.toml` pins the Rust version for CI, the build host and the Docker build
+stage, so a new stable release does not change results on its own. rustup on the build
+host installs the pinned version on first use. To move to a newer Rust, change `channel`
+in `rust-toolchain.toml` and the `FROM rust:<version>-bookworm` line in the `Dockerfile`
+in the same commit, then fix any new clippy or rustfmt findings.
 
 ## Build offload
 

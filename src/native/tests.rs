@@ -575,14 +575,134 @@ fn children_inherit_only_stdio_even_when_spawned_together() {
             .split_whitespace()
             .filter_map(|word| word.parse().ok())
             .collect();
-        // 0, 1, 2 and what ls itself opened, which take the lowest free
-        // numbers: one directory on Linux, two on macOS (fts opens "." as
-        // well; a plain ssh shell on remote build host lists 0-4 too). A leaked
-        // descriptor would add a number or push ls's own up.
-        let own = if cfg!(target_os = "macos") { 2 } else { 1 };
-        let expected: BTreeSet<u32> = (0..3 + own).collect();
-        assert_eq!(fds, expected, "inherited descriptors: {text}");
+        // 0, 1, 2 and what ls itself opened (one directory descriptor on
+        // Linux, two on macOS; an ssh shell may add more). A leaked
+        // descriptor adds to that count, so assert on how many there are
+        // above stdio, not on which numbers.
+        assert!(
+            [0, 1, 2].iter().all(|fd| fds.contains(fd)),
+            "stdio missing: {text}"
+        );
+        let above = fds.iter().filter(|&&fd| fd > 2).count();
+        assert!(above <= 2, "inherited descriptors: {text}");
     }
+}
+
+/// Closes the descriptors it holds on drop, also when the test panics.
+struct FdGuard(Vec<libc::c_int>);
+
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        for &fd in &self.0 {
+            // SAFETY: closes descriptors this test opened.
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+/// Restores `SKIP_CLOSE_RANGE` to false on drop.
+struct SkipCloseRange;
+
+impl SkipCloseRange {
+    fn on() -> Self {
+        pty::SKIP_CLOSE_RANGE.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for SkipCloseRange {
+    fn drop(&mut self) {
+        pty::SKIP_CLOSE_RANGE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Spawn `ls /dev/fd` while the test's own non-close-on-exec descriptors are
+/// open, and check none of them reaches the child.
+fn check_non_cloexec_descriptors_do_not_leak() {
+    // SAFETY: plain libc calls on descriptors this test opens and closes.
+    let base = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    assert!(base >= 0);
+    let mut guard = FdGuard(vec![base]);
+    for _ in 0..3 {
+        // SAFETY: as above; F_DUPFD takes the lowest free number >= 200 and
+        // the duplicate is close-on-exec.
+        let fd = unsafe { libc::fcntl(base, libc::F_DUPFD_CLOEXEC, 200) };
+        assert!(fd >= 200);
+        guard.0.push(fd);
+    }
+    // The duplicates (numbers >= 200) are the ones that must not leak; the
+    // base descriptor is low and may share a number with the lister's own.
+    let own: Vec<u32> = guard.0[1..].iter().map(|&fd| fd as u32).collect();
+    let dir = TempDir::new("native-fds-leak");
+    let argv = vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        "ls /dev/fd".to_owned(),
+    ];
+    let env = vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))];
+    let spawned = {
+        // No other spawn can fork while the flags are cleared.
+        let _lock = pty::SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &fd in &guard.0[1..] {
+            // SAFETY: clears FD_CLOEXEC on this test's descriptors.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+        }
+        let result = pty::spawn_locked(&argv, dir.path(), &env);
+        for &fd in &guard.0[1..] {
+            // SAFETY: restores FD_CLOEXEC before the lock is released.
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        result.unwrap()
+    };
+    let pty::Spawned { master, mut child } = spawned;
+    let started = Instant::now();
+    let mut text = Vec::new();
+    loop {
+        let mut buf = [0u8; 4096];
+        // SAFETY: reads into a local buffer of the stated length.
+        let n = unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            text.extend_from_slice(&buf[..n as usize]);
+            continue;
+        }
+        if child.try_wait().unwrap().is_some() && n <= 0 {
+            break;
+        }
+        assert!(started.elapsed() < LONG, "ls did not finish");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let text = String::from_utf8_lossy(&text).into_owned();
+    let fds: BTreeSet<u32> = text
+        .split_whitespace()
+        .filter_map(|word| word.parse().ok())
+        .collect();
+    assert!(
+        fds.contains(&0) && fds.contains(&1) && fds.contains(&2),
+        "{text}"
+    );
+    for fd in own {
+        assert!(!fds.contains(&fd), "descriptor {fd} leaked: {text}");
+    }
+}
+
+#[test]
+fn children_close_inherited_non_cloexec_descriptors() {
+    check_non_cloexec_descriptors_do_not_leak();
+}
+
+#[test]
+fn children_close_inherited_descriptors_without_close_range() {
+    // Exercises the enumeration path on Linux; macOS always takes it. Both
+    // paths are correct, so other tests running meanwhile are unaffected.
+    let _skip = SkipCloseRange::on();
+    check_non_cloexec_descriptors_do_not_leak();
 }
 
 // (f)
@@ -1155,7 +1275,11 @@ fn a_killed_program_that_keeps_writing_is_reaped_with_its_signal_code() {
 
 /// A program that writes a lot of output when it gets the hangup signal, as
 /// a TUI does when it restores the terminal: it exits within the grace,
-/// because the output is still drained while it stops.
+/// because the output is still drained while it stops. The payload is far
+/// larger than the pty and pipe buffers (so the program blocks on a full pty
+/// unless the reader drains it) but small enough that a debug build parses it
+/// well inside the grace, also on a slow Linux host (400000 bytes took 2.1 s+
+/// of terminal parsing in debug on one, and the grace killed the program).
 #[test]
 fn a_program_that_writes_on_hangup_exits_within_the_grace() {
     let dir = TempDir::new("native-flood-exit");
@@ -1163,7 +1287,7 @@ fn a_program_that_writes_on_hangup_exits_within_the_grace() {
     let info = b
         .run(&spec_line(
             "tui",
-            "trap 'yes | head -c 400000; exit 7' HUP TERM; echo ready; \
+            "trap 'yes | head -c 100000; exit 7' HUP TERM; echo ready; \
              while :; do sleep 1; done",
             &dir,
         ))

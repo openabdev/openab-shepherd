@@ -126,6 +126,10 @@ Every variable, profile field, tool argument, error code and bound is described 
 How the operator signs in to the coding CLI or supplies its key is described in
 [docs/credentials.md](docs/credentials.md).
 
+Notes on using Shepherd from a human terminal client, including a proposed
+pairing with openab-pty, are in
+[docs/terminal-clients.md](docs/terminal-clients.md).
+
 ## OpenCode CLI
 
 Observed on a laptop with OpenCode 2.2.7 (`opencode --version`), installed locally with bun.
@@ -193,7 +197,7 @@ checked end to end against OpenCode. Those checks are operator-run.
 
 ## Status and known limits
 
-Shepherd is an MVP (version 0.2.0). The native backend was verified against
+Shepherd is an MVP (version 0.3.0). The native backend was verified against
 kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 [MVP-REPORT.md](MVP-REPORT.md) (a dated record, not a current status), and the native core's design is in
 [docs/adr/native-core.md](docs/adr/native-core.md).

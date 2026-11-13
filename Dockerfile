@@ -6,7 +6,8 @@
 # section). The server binds 127.0.0.1 only; the pod's tailnet sidecar forwards to it.
 
 # --- Build stage ---
-FROM rust:1-bookworm AS builder
+# Keep the version in sync with rust-toolchain.toml (CI checks this).
+FROM rust:1.100.0-bookworm AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./

@@ -132,12 +132,21 @@ pub(crate) fn spawn(
     cwd: &Path,
     env: &[(OsString, OsString)],
 ) -> Result<Spawned, BackendError> {
+    let _lock = SPAWN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    spawn_locked(argv, cwd, env)
+}
+
+/// `spawn` for a caller that already holds `SPAWN_LOCK`.
+pub(crate) fn spawn_locked(
+    argv: &[String],
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+) -> Result<Spawned, BackendError> {
     let argv0 = argv.first().map_or("", String::as_str);
     let fail = |kind: ErrorKind, detail: String, err: &io::Error| {
         eprintln!("openab-shepherd: native: spawn failed: {argv0}: {err}");
         BackendError::new(kind, detail)
     };
-    let _lock = SPAWN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let (master, slave) = open_pty().map_err(|err| {
         fail(
             ErrorKind::Other,
@@ -165,10 +174,23 @@ pub(crate) fn spawn(
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr);
+    // Discover the descriptors to mark here, in the parent under SPAWN_LOCK,
+    // as late as possible so only another thread opening a descriptor
+    // without close-on-exec before the fork can escape it.
+    let plan = match CloexecPlan::new() {
+        Ok(plan) => plan,
+        Err(err) => {
+            return Err(fail(
+                ErrorKind::Other,
+                format!("native: spawn {argv0} failed: {err}"),
+                &err,
+            ))
+        }
+    };
     // SAFETY: `child_setup` runs in the forked child before exec and calls
-    // only async-signal-safe functions.
+    // only async-signal-safe functions on a plan built in the parent.
     unsafe {
-        command.pre_exec(child_setup);
+        command.pre_exec(move || child_setup(&plan));
     }
     let spawned = command.spawn();
     // The Command holds the parent's copies of the slave until dropped.
@@ -202,8 +224,9 @@ pub(crate) fn effective_uid() -> u32 {
 }
 
 /// In the child, after stdio is the slave: a new session, the slave as the
-/// controlling terminal, default signal dispositions and an empty mask.
-fn child_setup() -> io::Result<()> {
+/// controlling terminal, every descriptor above 2 close-on-exec, default
+/// signal dispositions and an empty mask.
+fn child_setup(plan: &CloexecPlan) -> io::Result<()> {
     // SAFETY: plain libc calls on this process; all are async-signal-safe.
     unsafe {
         if libc::setsid() == -1 {
@@ -213,7 +236,201 @@ fn child_setup() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+    plan.apply()?;
     default_signals()
+}
+
+/// Backstop for a hard descriptor limit of `RLIM_INFINITY`, and the largest
+/// range the fallback scan will cover.
+const FD_SCAN_BACKSTOP: libc::c_int = 1 << 20;
+
+/// Test-only switch: skip `close_range` so the enumeration and the scan are
+/// exercised on Linux too. Also set by `SHEPHERD_TEST_SKIP_CLOSE_RANGE`.
+#[cfg(test)]
+pub(crate) static SKIP_CLOSE_RANGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(test, target_os = "linux"))]
+fn close_range_allowed() -> bool {
+    !SKIP_CLOSE_RANGE.load(std::sync::atomic::Ordering::SeqCst)
+        && std::env::var_os("SHEPHERD_TEST_SKIP_CLOSE_RANGE").is_none()
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn close_range_allowed() -> bool {
+    true
+}
+
+/// Which descriptors the child marks close-on-exec. Everything that needs
+/// allocation, `sysconf` or `getrlimit` is decided in the parent (under
+/// `SPAWN_LOCK`); the child only applies it.
+struct CloexecPlan {
+    /// Try `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` first (Linux >= 5.11).
+    #[cfg(target_os = "linux")]
+    close_range: bool,
+    fds: FdSet,
+}
+
+enum FdSet {
+    /// The parent's open descriptors above 2 at planning time.
+    Listed(Vec<libc::c_int>),
+    /// Enumeration failed: every descriptor from 3 below this bound.
+    Scan(libc::c_int),
+}
+
+impl CloexecPlan {
+    /// Parent side. Fails when neither the enumeration nor a scan bounded by
+    /// the hard descriptor limit can cover every descriptor.
+    fn new() -> io::Result<Self> {
+        let fds = match list_open_descriptors() {
+            Ok(list) => FdSet::Listed(list),
+            Err(_) => FdSet::Scan(scan_bound()?),
+        };
+        Ok(Self {
+            #[cfg(target_os = "linux")]
+            close_range: close_range_allowed(),
+            fds,
+        })
+    }
+
+    /// Child side: async-signal-safe, no allocation. Marks instead of closing
+    /// on purpose: `std::process::Command` keeps a close-on-exec pipe (a
+    /// descriptor above 2) open during `pre_exec` to carry a failed `pre_exec`
+    /// or `exec` back to the parent. Closing it here would make every such
+    /// failure look like a successful spawn.
+    fn apply(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.close_range {
+            // SAFETY: a raw syscall on this process's descriptor table.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_close_range,
+                    3 as libc::c_uint,
+                    libc::c_uint::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC as libc::c_uint,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            // ENOSYS, EINVAL or a seccomp refusal: use the descriptor list.
+        }
+        match &self.fds {
+            FdSet::Listed(list) => {
+                for &fd in list {
+                    mark_cloexec(fd)?;
+                }
+            }
+            FdSet::Scan(bound) => {
+                for fd in 3..*bound {
+                    mark_cloexec(fd)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Set `FD_CLOEXEC` on `fd`. A descriptor that is not open is skipped; one
+/// that `F_GETFD` accepts and `F_SETFD` then refuses fails the spawn.
+fn mark_cloexec(fd: libc::c_int) -> io::Result<()> {
+    // SAFETY: fcntl on a descriptor number has no memory-safety preconditions.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags == -1 {
+            return Ok(());
+        }
+        if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Exclusive upper bound for a scan: the hard `RLIMIT_NOFILE`, with a
+/// backstop for an unlimited hard limit. A finite hard limit above the
+/// backstop cannot be covered, so it is an error.
+fn scan_bound() -> io::Result<libc::c_int> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid out-pointer for the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if limit.rlim_max == libc::RLIM_INFINITY {
+        return Ok(FD_SCAN_BACKSTOP);
+    }
+    match libc::c_int::try_from(limit.rlim_max) {
+        Ok(bound) if bound <= FD_SCAN_BACKSTOP => Ok(bound),
+        _ => Err(io::Error::other(format!(
+            "cannot list open descriptors and the hard descriptor limit {} is too large to scan",
+            limit.rlim_max
+        ))),
+    }
+}
+
+/// The descriptors above 2 this process has open, from `/proc/self/fd`
+/// (Linux) or `/dev/fd`, excluding the directory descriptor used to read it.
+fn list_open_descriptors() -> io::Result<Vec<libc::c_int>> {
+    #[cfg(target_os = "linux")]
+    let path = c"/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    let path = c"/dev/fd";
+    // SAFETY: `path` is NUL-terminated; the DIR is closed on every path.
+    unsafe {
+        let dir = libc::opendir(path.as_ptr());
+        if dir.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let own = libc::dirfd(dir);
+        let mut fds = Vec::new();
+        let mut result = Ok(());
+        loop {
+            *errno_location() = 0;
+            let entry = libc::readdir(dir);
+            if entry.is_null() {
+                if *errno_location() != 0 {
+                    result = Err(io::Error::last_os_error());
+                }
+                break;
+            }
+            let name = std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()).to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            match std::str::from_utf8(name)
+                .ok()
+                .and_then(|n| n.parse::<libc::c_int>().ok())
+            {
+                Some(fd) if fd > 2 => {
+                    if fd != own {
+                        fds.push(fd);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    result = Err(io::Error::other("unparseable descriptor entry"));
+                    break;
+                }
+            }
+        }
+        libc::closedir(dir);
+        result.map(|()| fds)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: returns the calling thread's errno slot.
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: returns the calling thread's errno slot.
+    unsafe { libc::__error() }
 }
 
 /// Default dispositions for the signals Shepherd handles and an empty mask.
