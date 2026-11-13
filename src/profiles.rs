@@ -558,6 +558,13 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         Some(Value::Bool(allow)) => *allow,
         Some(_) => return Err(err(format!("{at}: allow_bypass must be true or false"))),
     };
+    if agent == Agent::OpenCode {
+        if let Some(arg) = argv.iter().find(|a| is_opencode_auto_flag(a)) {
+            return Err(err(format!(
+                "{at}: argv and extra_args may not pass {arg} for opencode: OpenCode auto-approve flags are refused"
+            )));
+        }
+    }
     match (agent, permission_mode) {
         (Agent::Kiro, PermissionMode::AcceptEdits) => {
             return Err(err(format!(
@@ -657,6 +664,18 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         permission_mode,
         allow_bypass,
     })
+}
+
+/// True for an argument that approves OpenCode permission prompts without a
+/// dialog: `--auto` (with or without `=value`), any `--auto-…` flag, and any
+/// `autoaccept` or `auto-accept` spelling, such as `session.permissions=autoaccept`.
+fn is_opencode_auto_flag(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    let flag = lower.split('=').next().unwrap_or_default();
+    flag == "--auto"
+        || flag.starts_with("--auto-")
+        || lower.contains("autoaccept")
+        || lower.contains("auto-accept")
 }
 
 fn parse_source(
@@ -915,6 +934,42 @@ mod tests {
         assert_eq!(profile.agent, Agent::OpenCode);
         assert_eq!(profile.permission_mode, PermissionMode::Normal);
         assert!(profile.permission_args().is_empty());
+    }
+
+    #[test]
+    fn an_opencode_profile_refuses_every_auto_approve_spelling_in_argv_or_extra_args() {
+        let dir = TempDir::new("profiles-opencode-auto");
+        let d = dir.path().to_string_lossy().into_owned();
+        let with_argv = |argv: Value| {
+            json!({"profiles": [{"name": "oc", "agent": "opencode", "argv": argv, "cwds": [d]}]})
+                .to_string()
+        };
+        for flag in [
+            "--auto",
+            "--auto=true",
+            "--autoaccept",
+            "--auto-accept",
+            "--auto-approve",
+            "session.permissions=autoaccept",
+            "--config=session.permissions=AutoAccept",
+        ] {
+            let message = refused(&with_argv(json!(["opencode", "--standalone", flag])));
+            assert!(
+                message.contains(flag) && message.contains("opencode"),
+                "{flag}: {message}"
+            );
+        }
+        let in_extra = json!({"profiles": [{"name": "oc", "agent": "opencode",
+            "argv": ["opencode"], "extra_args": ["--auto"], "cwds": [d]}]})
+        .to_string();
+        assert!(refused(&in_extra).contains("--auto"));
+        // A normal argv passes, and a value that is only the word "auto" is not a flag.
+        let normal = with_argv(json!(["opencode", "--standalone", "--model", "auto"]));
+        let policy = parse(&normal, true).unwrap();
+        assert_eq!(
+            policy.profile("oc").unwrap().argv,
+            ["opencode", "--standalone", "--model", "auto"]
+        );
     }
 
     #[test]
