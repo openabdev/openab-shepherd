@@ -119,8 +119,9 @@ How the operator signs in to the coding CLI or supplies its key is described in
 ## OpenCode CLI
 
 Observed on a laptop with OpenCode 2.2.7 (`opencode --version`), installed locally with bun.
-Only the TUI startup was observed, with no model turn and no credentials. These
-observations are not yet attached to issue 2.
+The startup, the permission dialog and the OSC 7501 states were measured in live sessions
+with real model turns (the dialog on OpenCode v2.2.7); Shepherd itself has not yet been
+checked end to end against OpenCode. Those checks are operator-run.
 
 - Launch with `argv: ["opencode", "--standalone"]`. Without `--standalone`, OpenCode
   starts a background server (`opencode serve --service`) that keeps running after the
@@ -138,16 +139,42 @@ observations are not yet attached to issue 2.
 - At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. This report was
   observed on the laptop. The output filter removes it. Whether herdr-core turns it into a
   `get_status` result is not yet verified. It is an open point pending a live check.
-- OpenCode has a dialect slot but no measured permission dialog. `answer_dialog` refuses an
-  OpenCode pane before it reads the screen, and sends no keys. A launch profile may name
-  `agent: "opencode"`, but only with `permission_mode` `normal`: no OpenCode mode was measured,
-  so `accept-edits` and `bypass` are rejected. Its startup status (`state=idle:app=opencode`) and
-  its ST-terminated `7501;?` query were observed on the laptop and are parsed. Working turns, the `blocked` state for
-  permission prompts, and the dialog layout are not yet measured.
+- A launch profile may name `agent: "opencode"`, but only with `permission_mode` `normal`:
+  no OpenCode mode was measured, so `accept-edits` and `bypass` are rejected.
+- The permission dialog was measured on OpenCode v2.2.7 in a live session (shell and file
+  edit). OpenCode reports `state=idle|working|blocked|clear` over OSC 7501, with ST
+  terminators and colon-separated fields, and `kind=permission` on `blocked`. It has no `done`
+  state: a turn ends `clear`, then `idle`. For an OpenCode pane, `wait_status` reports
+  `done` for an `idle` that follows at least one turn, and `cancelled` after a dialog that
+  `answer_dialog` denied.
+- **A dialog appears only when the effective OpenCode config has an `ask` rule.** With no
+  rule, a shell command ran at once and the pane went `working` to `idle` with no `blocked`.
+  Shepherd then has no dialog to answer, and that turn is complete. To get a dialog, the
+  operator must set `ask` rules for `shell` and `edit` in OpenCode's own config, for
+  example in `~/.config/opencode/opencode.json`:
+  `"permissions": [{"action": "shell", "resource": "*", "effect": "ask"}, {"action": "edit", "resource": "*", "effect": "ask"}]`.
+  No environment variable or explicit config path that sets permissions is documented
+  (`opencode --help` and opencode.ai/docs/config were read), so Shepherd does not set
+  one and writes no file into the working directory.
+- `answer_dialog` on an OpenCode pane needs the pane to be `blocked` with kind `permission`
+  and the screen to show the whole dialog: `△ Permission required`, a `$ <command>` or
+  `→ Edit <path>` line, then `Allow once`, `Always allow`, `Reject` in that order and the
+  `ctrl+f fullscreen` hint. Anything else is refused with no key sent.
+  - `deny_once` sends `Esc`, which cancels exactly like `Reject` (measured with marker
+    files) and ends the turn (`idle`). It re-checks status and turn just before the key.
+  - `allow_once` is refused with no key sent: `Enter` is safe only when `Allow once` is the
+    highlighted option, OpenCode draws the highlight as a background colour (selected
+    `fab283`, no reverse video, no glyph), and the native screen read returns text without
+    colours. Verifying it needs the native screen model to expose styled cells (the `vt100` cells carry the
+    colour). That would change the backend `read` contract, so it is not part of this change.
+  - `Always allow` is never selected, and `Right` is never sent.
+- Not measured: MCP tools (the configured server was failing), number or letter
+  shortcuts and `Tab` in the dialog, the effect of `Always allow`, and a file write without
+  an `ask` rule.
 
 ## Status and known limits
 
-Shepherd is an MVP (version 0.2.0, 264 unit tests: lib 261, bin 3). The native backend was verified against
+Shepherd is an MVP (version 0.2.0). The native backend was verified against
 kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 [MVP-REPORT.md](MVP-REPORT.md) (a dated record, not a current status), and the native core's design is in
 [docs/adr/native-core.md](docs/adr/native-core.md).
@@ -156,9 +183,10 @@ kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 - **Two dialog choices only.** `answer_dialog` answers `allow_once` or `deny_once`
   and nothing else. Other dialog kinds (`question`, `auth`) are not answered.
 - **Text-based dialog parsing.** The dialog is parsed from screen text. Measured
-  agents: kiro-cli 3.1.0 (V3 shell permission dialogs) and Devin CLI 3000.12.43
-  (shell commands). OpenCode's permission dialog is unmeasured, so `answer_dialog`
-  refuses an OpenCode pane without sending a key.
+  agents: kiro-cli 3.1.0 (V3 shell permission dialogs), Devin CLI 3000.12.43
+  (shell commands) and OpenCode v2.2.7 (shell and edit dialogs, see below). For OpenCode,
+  `deny_once` is answered with Esc; `allow_once` is refused with no key sent, because
+  the highlighted option is a background colour that the screen text does not carry.
 - **A fast detached descendant escapes cleanup.** A descendant that is re-parented
   and fully detaches (new session, no terminal, parents gone) within the 250 ms
   between looks at the process table is never seen and survives. macOS has no

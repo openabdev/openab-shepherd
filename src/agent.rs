@@ -13,7 +13,8 @@ use crate::dialog::{self, Choice};
 pub enum Agent {
     Kiro,
     Devin,
-    /// No permission dialog has been measured for OpenCode. See [`Agent::option`].
+    /// OpenCode's dialog is read by `opencode_dialog`, which has its own answer path
+    /// in answer_dialog because the highlight is a colour, not text.
     OpenCode,
 }
 
@@ -50,8 +51,8 @@ impl Agent {
     }
 
     /// Where `choice` sits in this agent's dialog: the option's position and the
-    /// label the dialog shows for it. None when the dialog has not been measured,
-    /// so the caller must refuse and send no keys.
+    /// label the dialog shows for it. None for OpenCode, whose dialog is answered
+    /// by its own path, so a caller of this generic path must refuse and send no keys.
     pub fn option(self, choice: Choice) -> Option<(usize, &'static str)> {
         match (self, choice) {
             (Self::Kiro, _) => Some((choice.index(), choice.label())),
@@ -62,10 +63,10 @@ impl Agent {
     }
 }
 
-/// The refusal for an agent whose permission dialog was not measured.
+/// The refusal for an agent the generic cursor-moving path does not serve.
 pub fn unmeasured(agent: Agent) -> String {
     format!(
-        "the {} permission dialog has not been measured, so no dialect applies",
+        "the {} permission dialog has no cursor to read from screen text, so the generic dialect does not apply",
         agent.as_str()
     )
 }
@@ -137,13 +138,13 @@ mod tests {
     }
 
     #[test]
-    fn opencode_has_no_measured_dialect_so_no_option_and_no_parse() {
+    fn opencode_has_no_generic_dialect_so_no_option_and_no_parse() {
         for choice in [Choice::AllowOnce, Choice::DenyOnce] {
             assert_eq!(Agent::OpenCode.option(choice), None);
         }
         let err = Agent::OpenCode.parse_dialog("Allow once\n").unwrap_err();
         assert!(
-            err.contains("opencode permission dialog has not been measured"),
+            err.contains("opencode permission dialog has no cursor"),
             "{err}"
         );
     }
