@@ -66,6 +66,10 @@ pub struct FakeState {
     /// When set, the Nth `get` (1-based, counting every get) first turns the
     /// pane it finds blocked with kind permission.
     pub block_on_get: Option<usize>,
+    /// When set, the Nth `get` (1-based, counting every get) first moves the
+    /// pane it finds to this state, and to this turn when given: a pane that
+    /// changes between an observation and a later send.
+    pub flip_on_get: Option<(usize, State, Option<u64>)>,
     /// What `read` returns. `None` makes `read` unsupported.
     pub screen: Option<String>,
     /// Keys passed to `keys`, one entry per call.
@@ -91,6 +95,9 @@ pub struct FakeState {
     /// When set, the next `remove` signals the sender once it has started,
     /// then waits for the receiver before it removes the pane.
     pub remove_gate: Option<(Sender<()>, Receiver<()>)>,
+    /// When set, the next `send` that passes its guard fails with this
+    /// instead of writing.
+    pub send_error: Option<BackendError>,
 }
 
 /// An in-memory backend. `get`, `send`, `remove`, and (with
@@ -219,6 +226,23 @@ impl TerminalBackend for FakeBackend {
                 });
             }
         }
+        if let Some((nth, flipped, turn)) = state.flip_on_get.clone() {
+            if nth == gets {
+                if let Some(pane) = state
+                    .panes
+                    .iter_mut()
+                    .find(|p| p.id == t.as_str() || p.name.as_deref() == Some(t.as_str()))
+                {
+                    pane.status = Some(ProgramStatus {
+                        kind: (flipped == State::Blocked).then(|| "permission".to_string()),
+                        state: flipped,
+                    });
+                    if turn.is_some() {
+                        pane.turn = turn;
+                    }
+                }
+            }
+        }
         drop(state);
         self.find(t)
     }
@@ -275,7 +299,34 @@ impl TerminalBackend for FakeBackend {
                 ));
             }
         }
+        // As a backend with an atomic guard does: the state and turn the
+        // caller conditioned the send on must still hold.
+        if self.caps.conditional_input {
+            let state = pane.status.as_ref().map(|s| &s.state);
+            if guard
+                .if_state
+                .as_ref()
+                .is_some_and(|want| state != Some(want))
+            {
+                return Err(BackendError::new(
+                    ErrorKind::StatusMismatch,
+                    "fake: the state did not match; nothing was written",
+                ));
+            }
+            if guard
+                .expect_turn
+                .is_some_and(|want| pane.turn != Some(want))
+            {
+                return Err(BackendError::new(
+                    ErrorKind::StatusMismatch,
+                    "fake: the turn did not match; nothing was written",
+                ));
+            }
+        }
         let mut state = self.state.lock().unwrap();
+        if let Some(err) = state.send_error.take() {
+            return Err(err);
+        }
         let held = state
             .locks
             .as_ref()

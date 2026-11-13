@@ -2,6 +2,15 @@
 
 ## 0.3.0
 
+### Changes
+
+- A launch profile may set a `watchdog`: Shepherd checks its panes every 5 s
+  and, when a finished turn sits untouched past `idle_timeout_secs` (with an
+  unchecked item left in the profile's `todo_file`, when one is set), types the
+  profile's `nudge_text` through the `send_input` path. At most
+  `max_consecutive_nudges` nudges go in without progress the watchdog did
+  not itself cause. Off unless a profile sets it (issue #38).
+
 ### Breaking changes
 
 - The herdr-core (hc) backend is removed. Native is the only backend.
