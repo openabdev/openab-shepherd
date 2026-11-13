@@ -17,21 +17,28 @@ logged-in state is used.
 
 | CLI | What the operator provides | Status |
 |-----|----------------------------|--------|
-| Kiro | An API key in an environment variable, shown here as `<KIRO_API_KEY>` | Documented approach |
+| Kiro | An API key in an environment variable, shown here as `<KIRO_API_KEY>` | Documented in Shepherd's own docs |
 | Devin | `credentials.toml`, written by one interactive login | See below |
 | OpenCode | Not yet verified: the provider and the credential location are not confirmed | Not yet verified |
 
 ### Kiro
 
 Set the key in the environment of the pane through a launch profile `env` entry that
-reads from the pod's environment. The name of the variable is the one the Kiro CLI
-documents. The value is always a placeholder here: `<KIRO_API_KEY>`.
+reads from the pod's environment. This is the approach Shepherd's own docs describe
+([operations.md](operations.md), [native-core ADR](adr/native-core.md)); "documented"
+in the table means documented there. The variable name `KIRO_API_KEY` comes from the
+operator's own setup and from a probe recorded in that ADR, where a Kiro run without
+it stopped at "You are not logged in". This repo does not check it against Kiro's
+documentation. The value is always a placeholder here: `<KIRO_API_KEY>`.
 
 ### Devin
 
 Log in once, interactively, as the operator. The CLI writes `credentials.toml`. Keep
 that file as a Kubernetes Secret (`<DEVIN_CREDENTIALS_TOML>`) and mount it in the pod.
 Per the Devin docs, the token does not expire by default.
+
+Mounting `credentials.toml` as a Secret for Devin is untested here. Secret mounts are
+read-only, so use the writable-copy step in the pod pattern below as the mitigation.
 
 `WINDSURF_API_KEY` is documented only for `devin acp`. It is not verified for any
 other mode, so do not rely on it for panes.
@@ -82,9 +89,15 @@ Checked on origin/main by reading code and tests only (no run). Details in
 
 Verified, env passthrough:
 - The child environment is cleared, then set from HOME, PATH, USER, LANG, TERM and
-  the profile's extras (`src/native/pty.rs`).
-- A profile `env` is the only route for a credential. Names must be valid, at most
-  32, and protected names are refused (`src/profiles.rs`).
+  the profile's extras (`src/native/pty.rs`). A profile extra with the same name
+  replaces the baseline value.
+- A profile `env` is the only route for a credential. Names must be valid and at most
+  32. At load, a profile `env` is refused if it sets `TERM`, `PATH`, a `DYLD_*` or
+  `LD_*` name, or a name starting `OPENAB_SHEPHERD_` or `HC_` (`src/profiles.rs`); for
+  a Devin profile it is also refused if it sets `DEVIN_PERMISSION_MODE`. `HOME`,
+  `USER` and `LANG` are not refused there. The caller's per-run `env` (arbitrary
+  commands only) is refused for all of `HOME`, `PATH`, `USER`, `LANG`, `TERM`,
+  `DYLD_*` and `LD_*` (`src/native/pty.rs`).
 - Panes started with a caller `argv` or `line` get no profile env
   (`src/native/mod.rs`).
 - `list_panes` has no env field. `Secret` prints `<redacted>` in Debug output.
