@@ -1155,7 +1155,11 @@ fn a_killed_program_that_keeps_writing_is_reaped_with_its_signal_code() {
 
 /// A program that writes a lot of output when it gets the hangup signal, as
 /// a TUI does when it restores the terminal: it exits within the grace,
-/// because the output is still drained while it stops.
+/// because the output is still drained while it stops. The payload is far
+/// larger than the pty and pipe buffers (so the program blocks on a full pty
+/// unless the reader drains it) but small enough that a debug build parses it
+/// well inside the grace, also on a slow Linux host (400000 bytes took 2.1 s+
+/// of terminal parsing in debug on one, and the grace killed the program).
 #[test]
 fn a_program_that_writes_on_hangup_exits_within_the_grace() {
     let dir = TempDir::new("native-flood-exit");
@@ -1163,7 +1167,7 @@ fn a_program_that_writes_on_hangup_exits_within_the_grace() {
     let info = b
         .run(&spec_line(
             "tui",
-            "trap 'yes | head -c 400000; exit 7' HUP TERM; echo ready; \
+            "trap 'yes | head -c 100000; exit 7' HUP TERM; echo ready; \
              while :; do sleep 1; done",
             &dir,
         ))
