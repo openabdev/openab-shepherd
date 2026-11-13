@@ -178,13 +178,35 @@ impl Shepherd {
         self.watchdog.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn register_watchdog(&self, name: &str, config: WatchdogConfig, cwd: PathBuf, agent: Agent) {
-        self.watchdog_map()
-            .insert(name.to_string(), PaneWatch::new(config, cwd, agent));
+    fn register_watchdog(
+        &self,
+        name: &str,
+        config: WatchdogConfig,
+        cwd: PathBuf,
+        agent: Agent,
+        pane_id: String,
+    ) {
+        self.watchdog_map().insert(
+            name.to_string(),
+            PaneWatch::new(config, cwd, agent, pane_id),
+        );
     }
 
     fn forget_watchdog(&self, name: &str) {
         self.watchdog_map().remove(name);
+    }
+
+    /// Forget the watch for `name` only when it is still the watch that was
+    /// registered for pane `pane_id`: a new `start_pane` may have reused
+    /// the name and registered its own watch in between.
+    fn forget_watchdog_if(&self, name: &str, pane_id: &str) {
+        let mut map = self.watchdog_map();
+        if map
+            .get(name)
+            .is_some_and(|watch| watch.pane_id() == pane_id)
+        {
+            map.remove(name);
+        }
     }
 
     /// Start the watchdog thread (see `watchdog`), when any launch profile
@@ -212,46 +234,73 @@ impl Shepherd {
     pub(crate) fn watchdog_tick(&self, now: Instant) {
         let names: Vec<String> = self.watchdog_map().keys().cloned().collect();
         for name in names {
-            self.watchdog_check(&name, now);
+            // One pane's panic must not end the watchdog thread (or the
+            // checks of the panes after it) silently.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.watchdog_check(&name, now);
+            }));
+            if result.is_err() {
+                eprintln!(
+                    "openab-shepherd: watchdog: pane {name}: the watchdog check panicked; \
+                     skipping this pane for this tick"
+                );
+            }
         }
     }
 
     fn watchdog_check(&self, name: &str, now: Instant) {
-        let (config, todo_path) = {
+        let (config, todo_path, pane_id, finished_state) = {
             let map = self.watchdog_map();
             let Some(watch) = map.get(name) else {
                 return;
             };
             let config = watch.config().clone();
             let todo = config.todo_file.as_ref().map(|file| watch.cwd().join(file));
-            (config, todo)
+            (
+                config,
+                todo,
+                watch.pane_id().to_string(),
+                watch.finished_state(),
+            )
         };
         let info = match resolve(self, name) {
             Ok(info) => info,
             Err(err) => {
                 if err.data["error"] == "not_found" {
-                    self.forget_watchdog(name);
+                    self.forget_watchdog_if(name, &pane_id);
                 }
                 return;
             }
         };
+        // The name may have been reused by a new start while this check
+        // was resolving: that pane is not this watch's pane.
+        if info.id != pane_id {
+            return;
+        }
         let todo = match &todo_path {
             Some(path) => watchdog::read_todo(path),
             None => Todo::NotConfigured,
         };
-        let event = {
+        let (event, idle_secs) = {
             let mut map = self.watchdog_map();
             let Some(watch) = map.get_mut(name) else {
                 return;
             };
-            watch.observe(&info, todo, now)
+            if watch.note_todo(todo) {
+                eprintln!(
+                    "openab-shepherd: watchdog: pane {name}: the configured todo file \
+                     became unreadable; not nudging while it is"
+                );
+            }
+            let idle = watch.idle_for(now).map(|d| d.as_secs());
+            (watch.observe(&info, todo, now), idle)
         };
         match event {
             WatchEvent::None => {}
             WatchEvent::GaveUp => {
                 eprintln!(
-                    "openab-shepherd: watchdog: pane {name}: {} nudges without the turn \
-                     advancing; not nudging again until it does",
+                    "openab-shepherd: watchdog: pane {name}: {} nudges without progress \
+                     the watchdog did not cause; not nudging again until there is some",
                     config.max_consecutive_nudges
                 );
             }
@@ -259,17 +308,32 @@ impl Shepherd {
                 let turn = info
                     .turn
                     .map_or_else(|| "?".to_string(), |turn| turn.to_string());
-                match send_text(self, name, &config.nudge_text) {
+                // Condition the send on the state this check observed: if
+                // the pane changed (working, blocked, a new turn) between
+                // the observation and the send, the send is refused as a
+                // status mismatch instead of typed into a live turn.
+                let guard = InputGuard {
+                    refuse_when_blocked: true,
+                    if_state: Some(finished_state),
+                    expect_turn: info.turn,
+                    ..InputGuard::default()
+                };
+                match send_text_guarded(self, name, &config.nudge_text, Some(guard)) {
                     Ok(_) => {
                         if let Some(watch) = self.watchdog_map().get_mut(name) {
-                            watch.note_nudged(now);
+                            watch.note_nudged(now, info.turn);
                         }
                         eprintln!(
-                            "openab-shepherd: watchdog: nudged pane {name} (turn {turn}): {}",
+                            "openab-shepherd: watchdog: nudged pane {name} (turn {turn}, \
+                             idle {}s): {}",
+                            idle_secs.unwrap_or(0),
                             reason.as_str()
                         );
                     }
                     Err(err) => {
+                        if let Some(watch) = self.watchdog_map().get_mut(name) {
+                            watch.note_failed(now);
+                        }
                         eprintln!(
                             "openab-shepherd: watchdog: pane {name}: the nudge was not sent: {}",
                             err.text
@@ -529,7 +593,14 @@ fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
             .and_then(|p| p.watchdog.clone().map(|config| (config, p.agent)));
         match (watched, spec.cwd.as_deref()) {
             (Some((config, agent)), Some(cwd)) => {
-                sh.register_watchdog(name, config, PathBuf::from(cwd), agent)
+                sh.register_watchdog(name, config, PathBuf::from(cwd), agent, info.id.clone())
+            }
+            (Some(_), None) => {
+                eprintln!(
+                    "openab-shepherd: watchdog: pane {name}: the start named no working \
+                     directory, so the watchdog does not watch this pane"
+                );
+                sh.forget_watchdog(name);
             }
             _ => sh.forget_watchdog(name),
         }
@@ -747,7 +818,21 @@ fn send_input(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
 /// path, under the pane lock and with its refusals (a blocked pane, the Devin
 /// mode-switch rule). The watchdog's nudge goes through here too, so a nudge
 /// is refused exactly where a caller's text would be.
+///
+/// This function must not grow caller-specific behaviour: the only
+/// difference a caller may add is an extra [`InputGuard`] condition through
+/// `send_text_guarded`, which narrows when a send is refused, never what is
+/// sent.
 fn send_text(sh: &Shepherd, terminal: &str, text: &str) -> Result<Value, ToolError> {
+    send_text_guarded(sh, terminal, text, None)
+}
+
+fn send_text_guarded(
+    sh: &Shepherd,
+    terminal: &str,
+    text: &str,
+    extra_guard: Option<InputGuard>,
+) -> Result<Value, ToolError> {
     let (_guard, pane, now) = lock_pane(sh, terminal)?;
     if sh.agent_of(terminal) == Some(Agent::Devin) && is_devin_mode_switch(text) {
         return Err(ToolError::new(
@@ -757,9 +842,17 @@ fn send_text(sh: &Shepherd, terminal: &str, text: &str) -> Result<Value, ToolErr
         .with("terminal", terminal));
     }
     // Idle and done are both sendable; a blocked program is never typed into.
-    let guard = InputGuard {
-        refuse_when_blocked: true,
-        ..InputGuard::default()
+    let guard = match extra_guard {
+        Some(extra) => InputGuard {
+            refuse_when_blocked: true,
+            if_state: extra.if_state,
+            if_kind: extra.if_kind,
+            expect_turn: extra.expect_turn,
+        },
+        None => InputGuard {
+            refuse_when_blocked: true,
+            ..InputGuard::default()
+        },
     };
     if !sh.backend.capabilities().conditional_input {
         // The backend cannot refuse atomically: check the status got inside the
@@ -770,6 +863,26 @@ fn send_text(sh: &Shepherd, terminal: &str, text: &str) -> Result<Value, ToolErr
                 status.kind.clone(),
                 "refused by Shepherd: the status read inside the pane lock was blocked",
             ));
+        }
+        if let Some(want) = &guard.if_state {
+            if now.status.as_ref().map(|s| &s.state) != Some(want) {
+                return Err(ToolError::new(
+                    "status_mismatch",
+                    "refused by Shepherd: the status read inside the pane lock no longer matches the state the send was conditioned on; nothing was sent"
+                        .to_string(),
+                )
+                .with("terminal", terminal));
+            }
+        }
+        if let Some(want) = guard.expect_turn {
+            if now.turn != Some(want) {
+                return Err(ToolError::new(
+                    "status_mismatch",
+                    "refused by Shepherd: the turn read inside the pane lock no longer matches the turn the send was conditioned on; nothing was sent"
+                        .to_string(),
+                )
+                .with("terminal", terminal));
+            }
         }
     }
     match sh.backend.send(&pane, text, &guard) {
@@ -3384,8 +3497,16 @@ mod tests {
         watchdog: Value,
         tag: &str,
     ) -> (Shepherd, FakeBackend, crate::testutil::TempDir) {
+        watched_pane_with_caps(watchdog, tag, true)
+    }
+
+    fn watched_pane_with_caps(
+        watchdog: Value,
+        tag: &str,
+        conditional_input: bool,
+    ) -> (Shepherd, FakeBackend, crate::testutil::TempDir) {
         let dir = crate::testutil::TempDir::new(tag);
-        let fake = FakeBackend::new(true);
+        let fake = FakeBackend::new(conditional_input);
         fake.state.lock().unwrap().runnable = true;
         let sh = Shepherd::with_policy(fake.clone(), watchdog_policy(dir.path(), watchdog));
         fake.state.lock().unwrap().locks = Some(Arc::clone(sh.pane_locks()));
@@ -3438,6 +3559,62 @@ mod tests {
         }
         let t0 = Instant::now();
         sh.watchdog_tick(t0);
+        sh.watchdog_tick(t0 + Duration::from_secs(3600));
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn a_guarded_nudge_is_refused_when_the_pane_changed_after_the_observation() {
+        // The watchdog conditions its send on the finished state and turn
+        // it observed. If the pane flipped to blocked, went back to
+        // working, or advanced to a new turn before the send, nothing is
+        // typed.
+        for (state, turn) in [
+            (State::Blocked, Some(3)),
+            (State::Working, Some(3)),
+            (State::Done, Some(4)),
+        ] {
+            // A backend without conditional input: Shepherd's own re-check
+            // under the pane lock is what refuses these sends. (With a
+            // conditional backend the same guard is enforced atomically by
+            // the backend, as the `keys` guard tests show.)
+            let (sh, fake, _dir) = watched_pane_with_caps(
+                json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
+                "tools-watchdog-flip",
+                false,
+            );
+            {
+                let mut fake_state = fake.state.lock().unwrap();
+                fake_state.panes[0].status = Some(ProgramStatus {
+                    state: state.clone(),
+                    kind: (state == State::Blocked).then(|| "permission".to_string()),
+                });
+                fake_state.panes[0].turn = turn;
+            }
+            let guard = InputGuard {
+                refuse_when_blocked: true,
+                if_state: Some(State::Done),
+                expect_turn: Some(3),
+                ..InputGuard::default()
+            };
+            let err = send_text_guarded(&sh, "work", "continue", Some(guard)).unwrap_err();
+            assert!(
+                ["pane_blocked", "status_mismatch"].contains(&err.data["error"].as_str().unwrap()),
+                "{state:?} turn {turn:?}: {err:?}"
+            );
+            assert!(fake.state.lock().unwrap().sent.is_empty(), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn removing_a_watched_pane_unregisters_it() {
+        let (sh, fake, _dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
+            "tools-watchdog-remove",
+        );
+        call(&sh, "remove_pane", &args(json!({"terminal": "work"}))).unwrap();
+        assert!(sh.watchdog_map().is_empty());
+        let t0 = Instant::now();
         sh.watchdog_tick(t0 + Duration::from_secs(3600));
         assert!(fake.state.lock().unwrap().sent.is_empty());
     }
