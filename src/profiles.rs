@@ -692,7 +692,7 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
             .ok_or_else(|| err(format!("{at}: env: {key} must be a string")))?;
         env.push((key.clone(), parse_source(text, &at, key, keychain_ok)?));
     }
-    let watchdog = parse_watchdog(map.get("watchdog"), &at)?;
+    let watchdog = parse_watchdog(map.get("watchdog"), &at, agent)?;
     Ok(Profile {
         name,
         argv,
@@ -724,7 +724,26 @@ fn watchdog_secs(
 /// A profile's `watchdog` section. Every number is bounded; the nudge text
 /// follows the same input rules as `send_input`'s text, because the watchdog
 /// types it through that path.
-fn parse_watchdog(value: Option<&Value>, at: &str) -> Result<Option<WatchdogConfig>, ConfigError> {
+/// A whole number (not seconds) from a `watchdog` field, when set.
+fn watchdog_count(
+    map: &Map<String, Value>,
+    field: &str,
+    at: &str,
+) -> Result<Option<u64>, ConfigError> {
+    match map.get(field) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| err(format!("{at}: watchdog: {field} must be a whole number"))),
+    }
+}
+
+fn parse_watchdog(
+    value: Option<&Value>,
+    at: &str,
+    agent: Agent,
+) -> Result<Option<WatchdogConfig>, ConfigError> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -756,7 +775,7 @@ fn parse_watchdog(value: Option<&Value>, at: &str) -> Result<Option<WatchdogConf
         )));
     }
     let max_nudges =
-        watchdog_secs(map, "max_consecutive_nudges", at)?.unwrap_or(WATCHDOG_DEFAULT_NUDGES);
+        watchdog_count(map, "max_consecutive_nudges", at)?.unwrap_or(WATCHDOG_DEFAULT_NUDGES);
     if !(1..=WATCHDOG_MAX_NUDGES).contains(&max_nudges) {
         return Err(err(format!(
             "{at}: watchdog: max_consecutive_nudges must be between 1 and {WATCHDOG_MAX_NUDGES}"
@@ -769,6 +788,11 @@ fn parse_watchdog(value: Option<&Value>, at: &str) -> Result<Option<WatchdogConf
         }
         Some(_) => return Err(err(format!("{at}: watchdog: nudge_text must be a string"))),
     };
+    if agent == Agent::Devin && nudge_text.trim().eq_ignore_ascii_case("/yolo") {
+        return Err(err(format!(
+            "{at}: watchdog: nudge_text may not be /yolo for devin: the Devin mode-switch rule refuses it at runtime, so the watchdog could never send it"
+        )));
+    }
     let todo_file = match map.get("todo_file") {
         None => None,
         Some(Value::String(text)) => {
@@ -794,7 +818,7 @@ fn parse_watchdog(value: Option<&Value>, at: &str) -> Result<Option<WatchdogConf
     Ok(Some(WatchdogConfig {
         idle_timeout: Duration::from_secs(idle_timeout_secs),
         cooldown: Duration::from_secs(cooldown_secs),
-        max_consecutive_nudges: max_nudges as u32,
+        max_consecutive_nudges: u32::try_from(max_nudges).unwrap_or(u32::MAX),
         todo_file,
         nudge_text,
     }))
@@ -1532,5 +1556,17 @@ mod tests {
             let message = refused(&watchdog_policy(dir.path(), case.clone()));
             assert!(message.contains("watchdog"), "{case}: {message}");
         }
+    }
+
+    #[test]
+    fn a_devin_watchdog_may_not_nudge_with_yolo() {
+        let dir = TempDir::new("profiles-watchdog-devin-yolo");
+        let text = json!({"profiles": [{"name": "dn", "argv": ["devin"],
+            "cwds": [dir.path()], "agent": "devin",
+            "watchdog": {"idle_timeout_secs": 120, "nudge_text": "/yolo"}}]})
+        .to_string();
+        let message = refused(&text);
+        assert!(message.contains("watchdog"), "{message}");
+        assert!(message.contains("/yolo"), "{message}");
     }
 }
