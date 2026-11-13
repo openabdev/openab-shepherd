@@ -7,6 +7,7 @@ use crate::testutil::TempDir;
 use crate::tools::{self, Args, Shepherd};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
+use std::process::Command;
 
 const LONG: Duration = Duration::from_secs(10);
 
