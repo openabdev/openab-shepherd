@@ -144,17 +144,18 @@ observations are not yet attached to issue 2.
 
 ## Status and known limits
 
-Shepherd is an MVP (version 0.1.0). The native backend was verified against
+Shepherd is an MVP (version 0.2.0, 264 unit tests: lib 261, bin 3). The native backend was verified against
 kiro-cli 3.1.0 with a real-Kiro probe; the results are in
-[MVP-REPORT.md](MVP-REPORT.md), and the native core's design is in
+[MVP-REPORT.md](MVP-REPORT.md) (a dated record, not a current status), and the native core's design is in
 [docs/adr/native-core.md](docs/adr/native-core.md).
 
 - **No multi-client authorization.** Anyone holding the token controls every pane.
 - **Two dialog choices only.** `answer_dialog` answers `allow_once` or `deny_once`
   and nothing else. Other dialog kinds (`question`, `auth`) are not answered.
-- **Text-based dialog parsing.** The dialog is parsed from screen text and is tested
-  only against kiro-cli 3.1.0 (V3) shell permission dialogs. OpenCode has no dialect,
-  so its dialogs are refused without a key sent.
+- **Text-based dialog parsing.** The dialog is parsed from screen text. Measured
+  agents: kiro-cli 3.1.0 (V3 shell permission dialogs) and Devin CLI 3000.12.43
+  (shell commands). OpenCode's permission dialog is unmeasured, so `answer_dialog`
+  refuses an OpenCode pane without sending a key.
 - **A fast detached descendant escapes cleanup.** A descendant that is re-parented
   and fully detaches (new session, no terminal, parents gone) within the 250 ms
   between looks at the process table is never seen and survives. macOS has no
