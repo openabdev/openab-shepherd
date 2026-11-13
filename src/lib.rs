@@ -19,6 +19,7 @@ pub mod opencode_dialog;
 pub mod panelock;
 pub mod profiles;
 pub mod tools;
+pub mod watchdog;
 
 #[cfg(test)]
 mod testutil;
