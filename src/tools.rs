@@ -676,7 +676,7 @@ fn blocked_kind_of(info: &TerminalInfo) -> Option<String> {
 }
 
 /// Resolve `terminal`, the caller's pane name, with `get`. A backend may also
-/// accept its own references (herdr-core: an address), so the pane found must
+/// accept its own references (for example its own id), so the pane found must
 /// carry exactly this name; otherwise no pane has it. Every later backend call
 /// uses the resolved pane's id ([`TerminalInfo::reference`]), never the
 /// caller's string.
@@ -1660,7 +1660,7 @@ mod tests {
         fake.state.lock().unwrap().panes[1].name = None;
         fake.state.lock().unwrap().screen = Some("screen".to_string());
         let sh = shepherd(&fake);
-        // The fake's get also accepts ids, as herdr-core accepts addresses.
+        // The fake's get also accepts ids, as a backend may accept its own ids.
         for terminal in ["id-work", "id-anon"] {
             for (tool, extra) in [
                 ("send_input", json!({"text": "hi"})),

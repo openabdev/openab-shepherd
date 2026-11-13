@@ -1,7 +1,6 @@
 //! The `openab-shepherd` binary: argument parsing and startup over the library.
 
 use openab_shepherd::config::BackendChoice;
-use openab_shepherd::hc::HcBackend;
 use openab_shepherd::http::AppState;
 use openab_shepherd::native::{NativeBackend, NativeConfig};
 use openab_shepherd::profiles::LaunchPolicy;
@@ -17,10 +16,9 @@ Usage: openab-shepherd [--host 127.0.0.1] [--port 8765]
 Environment:
   OPENAB_SHEPHERD_TOKEN_FILE  path to the bearer token file (preferred)
   OPENAB_SHEPHERD_TOKEN       the bearer token itself (use one of the two)
-  OPENAB_SHEPHERD_BACKEND     native or hc (default {})
+  OPENAB_SHEPHERD_BACKEND     native, the only backend (default {})
   OPENAB_SHEPHERD_PROFILES    launch profiles file (JSON, outside any git repo);
                               without it start_pane starts nothing
-  HC_SOCKET                   herdr-core Unix socket path (required for hc only)
   OPENAB_SHEPHERD_ALLOWED_HOSTS
                               extra Host header values to accept, comma-separated
                               name or name:port (exact, case-insensitive; a name
@@ -127,8 +125,7 @@ fn main() -> ExitCode {
     };
 
     let backend_name = config.backend.name();
-    let mut native_handle = None;
-    let shepherd = match config.backend {
+    let (shepherd, native_handle) = match config.backend {
         BackendChoice::Native => {
             let native = NativeBackend::new(NativeConfig::default());
             // Before any other thread starts, so all of them leave these
@@ -150,11 +147,8 @@ fn main() -> ExitCode {
                     on_panic.shutdown();
                 }
             }));
-            native_handle = Some(native.clone());
-            tools::Shepherd::with_policy(native, policy)
-        }
-        BackendChoice::Hc { socket } => {
-            tools::Shepherd::with_policy(HcBackend::new(socket), policy)
+            let handle = Some(native.clone());
+            (tools::Shepherd::with_policy(native, policy), handle)
         }
     };
     let state = Arc::new(AppState {

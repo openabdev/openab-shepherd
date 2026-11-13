@@ -1,9 +1,9 @@
 //! The terminal backend: what Shepherd needs from the program that runs panes.
 //!
 //! The MCP tools in `tools.rs` talk only to [`TerminalBackend`]. Every type here
-//! is Shepherd's own vocabulary; an adapter (`hc::HcBackend`, and the native
-//! core in `native/`) maps its backend's wire format onto it. Safety rules (input validation, the pane
-//! lock, refusing to type into a blocked pane, the answer_dialog checks) live in
+//! is Shepherd's own vocabulary; an adapter (the native
+//! core in `native/`) maps its backend's wire format onto it. Safety rules
+//! (input validation, the pane lock, refusing to type into a blocked pane, the answer_dialog checks) live in
 //! Shepherd, not in a backend. [`Capabilities`] tells Shepherd which of them a
 //! backend can also enforce atomically.
 

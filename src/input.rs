@@ -10,8 +10,7 @@ use std::fmt;
 /// exact text sent to the backend.
 pub const MAX_INPUT_BYTES: usize = 4096;
 
-/// Longest accepted pane name (1-32 of a-z 0-9 - _ .; herdr-core uses the same
-/// rule).
+/// Longest accepted pane name (1-32 of a-z 0-9 - _ .).
 pub const MAX_NAME_CHARS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

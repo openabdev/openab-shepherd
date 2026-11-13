@@ -1,6 +1,5 @@
 //! Helpers shared by unit tests: scratch directories, a git repository
 //! initializer, and a fake terminal backend. Compiled only for `cargo test`.
-//! The fake herdr-core socket is in `hc/fake.rs`.
 
 pub mod scripted;
 

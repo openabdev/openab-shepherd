@@ -140,7 +140,8 @@ impl fmt::Debug for LaunchPolicy {
 }
 
 /// Names a profile may not set and `env:` may not copy: Shepherd's own
-/// configuration (token, token file, profiles path, backend, HC_SOCKET).
+/// configuration (token, token file, profiles path, backend). The `HC_` prefix
+/// stays reserved from the removed hc backend.
 fn is_shepherd_own(name: &str) -> bool {
     name.starts_with("OPENAB_SHEPHERD_") || name.starts_with("HC_")
 }

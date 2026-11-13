@@ -1,5 +1,4 @@
-//! Startup checks: bearer token, bind address, and the terminal backend (with
-//! the herdr-core socket path when the backend is hc).
+//! Startup checks: bearer token, bind address, and the terminal backend.
 //!
 //! Every check runs before the server opens a listening socket. A failed check
 //! makes the binary exit with status 2 and print the reason on stderr.
@@ -13,11 +12,7 @@ use std::process::{Command, Stdio};
 
 pub const TOKEN_FILE_ENV: &str = "OPENAB_SHEPHERD_TOKEN_FILE";
 pub const TOKEN_ENV: &str = "OPENAB_SHEPHERD_TOKEN";
-/// herdr-core socket override. The name appears in the herdr-core binary's own
-/// error text. Its precedence against HC_SESSION and the config file is unverified,
-/// so this server reads only this variable.
-pub const SOCKET_ENV: &str = "HC_SOCKET";
-/// Which terminal backend runs the panes: `native` or `hc`.
+/// Which terminal backend runs the panes. Only `native` is accepted.
 pub const BACKEND_ENV: &str = "OPENAB_SHEPHERD_BACKEND";
 /// The backend used when [`BACKEND_ENV`] is unset or empty. `native` since the
 /// real-Kiro probe passed (kiro-cli 3.1.0, examples/native_probe.rs).
@@ -43,9 +38,7 @@ impl std::error::Error for ConfigError {}
 /// The terminal backend chosen at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendChoice {
-    /// herdr-core over its Unix socket.
-    Hc { socket: PathBuf },
-    /// Shepherd's own PTY core; needs no socket.
+    /// Shepherd's own PTY core, the only backend.
     Native,
 }
 
@@ -53,7 +46,6 @@ impl BackendChoice {
     /// The value of [`BACKEND_ENV`] that selects it.
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Hc { .. } => "hc",
             Self::Native => "native",
         }
     }
@@ -101,8 +93,8 @@ where
     if port == 0 {
         return Err(ConfigError("port 0 is not allowed".to_string()));
     }
-    let token = load_token(&lookup, project_dir)?;
     let backend = load_backend(&lookup)?;
+    let token = load_token(&lookup, project_dir)?;
     let allowed_hosts = parse_allowed_hosts(lookup(ALLOWED_HOSTS_ENV).as_deref().unwrap_or(""))?;
     Ok(Config {
         token,
@@ -309,7 +301,8 @@ fn git_toplevel(dir: &Path) -> Result<Option<PathBuf>, ConfigError> {
     }
 }
 
-/// `native` needs nothing else (HC_SOCKET is ignored); `hc` needs HC_SOCKET.
+/// Unset, empty or `native` selects native. `hc` (the removed herdr-core
+/// backend) and any other value are refused.
 fn load_backend<F>(lookup: &F) -> Result<BackendChoice, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
@@ -317,21 +310,13 @@ where
     let value = non_empty(lookup(BACKEND_ENV).map(|v| v.trim().to_string()));
     match value.as_deref().unwrap_or(DEFAULT_BACKEND) {
         "native" => Ok(BackendChoice::Native),
-        "hc" => Ok(BackendChoice::Hc {
-            socket: load_socket_path(lookup)?,
-        }),
-        _ => Err(ConfigError(format!("{BACKEND_ENV} must be native or hc"))),
-    }
-}
-
-fn load_socket_path<F>(lookup: &F) -> Result<PathBuf, ConfigError>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    match non_empty(lookup(SOCKET_ENV).map(|v| v.trim().to_string())) {
-        Some(path) => Ok(PathBuf::from(path)),
-        None => Err(ConfigError(format!(
-            "no herdr-core socket: set {SOCKET_ENV} to the socket path"
+        "hc" => Err(ConfigError(format!(
+            "{BACKEND_ENV}=hc is no longer supported: the herdr-core (hc) backend was \
+             removed and native is the only backend. Unset {BACKEND_ENV} or set it to native"
+        ))),
+        other => Err(ConfigError(format!(
+            "{BACKEND_ENV}={other:?} is not a backend: native is the only backend. \
+             Unset {BACKEND_ENV} or set it to native"
         ))),
     }
 }
@@ -345,7 +330,6 @@ mod tests {
 
     // Example values only; not credentials.
     const GOOD_TOKEN: &str = "test-token-0123456789abcdef";
-    const SOCKET: &str = "/tmp/shepherd-test-absent.sock";
 
     fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs
@@ -363,7 +347,7 @@ mod tests {
     fn load_with_token_file(token: &Path, project: &Path) -> Result<Config, ConfigError> {
         let token = token.to_string_lossy().to_string();
         load_config(
-            env_from(&[(TOKEN_FILE_ENV, token.as_str()), (SOCKET_ENV, SOCKET)]),
+            env_from(&[(TOKEN_FILE_ENV, token.as_str())]),
             "127.0.0.1",
             DEFAULT_PORT,
             project,
@@ -373,13 +357,7 @@ mod tests {
     #[test]
     fn refuses_without_any_token() {
         let dir = TempDir::new("no-token");
-        let err = load_config(
-            env_from(&[(SOCKET_ENV, SOCKET)]),
-            "127.0.0.1",
-            8765,
-            dir.path(),
-        )
-        .unwrap_err();
+        let err = load_config(env_from(&[]), "127.0.0.1", 8765, dir.path()).unwrap_err();
         assert!(err.0.contains("no bearer token"), "{err}");
     }
 
@@ -387,7 +365,7 @@ mod tests {
     fn refuses_short_token() {
         let dir = TempDir::new("short");
         let err = load_config(
-            env_from(&[(TOKEN_ENV, "short"), (SOCKET_ENV, SOCKET)]),
+            env_from(&[(TOKEN_ENV, "short")]),
             "127.0.0.1",
             8765,
             dir.path(),
@@ -397,38 +375,29 @@ mod tests {
     }
 
     #[test]
-    fn token_env_and_socket_accepted() {
+    fn token_env_accepted() {
         let dir = TempDir::new("env-ok");
         let config = load_config(
-            env_from(&[
-                (TOKEN_ENV, GOOD_TOKEN),
-                (SOCKET_ENV, SOCKET),
-                (BACKEND_ENV, "hc"),
-            ]),
+            env_from(&[(TOKEN_ENV, GOOD_TOKEN), (BACKEND_ENV, "native")]),
             "127.0.0.1",
             8765,
             dir.path(),
         )
         .unwrap();
         assert_eq!(config.token, GOOD_TOKEN);
-        assert_eq!(
-            config.backend,
-            BackendChoice::Hc {
-                socket: PathBuf::from(SOCKET)
-            }
-        );
+        assert_eq!(config.backend, BackendChoice::Native);
         assert_eq!(config.bind, "127.0.0.1:8765".parse().unwrap());
     }
 
     #[test]
-    fn native_backend_needs_no_socket() {
+    fn native_backend_needs_nothing_else_and_hc_socket_is_ignored() {
         let dir = TempDir::new("native");
         for env in [
             vec![(TOKEN_ENV, GOOD_TOKEN), (BACKEND_ENV, "native")],
             vec![
                 (TOKEN_ENV, GOOD_TOKEN),
                 (BACKEND_ENV, " native "),
-                (SOCKET_ENV, SOCKET),
+                ("HC_SOCKET", "/tmp/ignored.sock"),
             ],
         ] {
             let config = load_config(env_from(&env), "127.0.0.1", 8765, dir.path()).unwrap();
@@ -437,42 +406,55 @@ mod tests {
         }
     }
 
+    /// Backend selection: unset, empty and `native` select native; `hc` and any
+    /// other value are refused (the binary turns the error into exit status 2).
     #[test]
-    fn unknown_backend_refused() {
-        let dir = TempDir::new("bad-backend");
-        for value in ["tmux", "NATIVE", "native,hc"] {
-            let err = load_config(
-                env_from(&[
-                    (TOKEN_ENV, GOOD_TOKEN),
-                    (SOCKET_ENV, SOCKET),
-                    (BACKEND_ENV, value),
-                ]),
-                "127.0.0.1",
-                8765,
-                dir.path(),
-            )
-            .unwrap_err();
+    fn backend_selection_unset_empty_native_hc_other() {
+        let dir = TempDir::new("select");
+        let select = |backend: Option<&str>| {
+            let mut env = vec![(TOKEN_ENV, GOOD_TOKEN)];
+            if let Some(value) = backend {
+                env.push((BACKEND_ENV, value));
+            }
+            load_config(env_from(&env), "127.0.0.1", 8765, dir.path())
+        };
+        for value in [None, Some(""), Some("  "), Some("native")] {
             assert_eq!(
-                err.0, "OPENAB_SHEPHERD_BACKEND must be native or hc",
-                "{value}"
+                select(value).unwrap().backend,
+                BackendChoice::Native,
+                "{value:?}"
+            );
+        }
+        for value in ["hc", " hc "] {
+            let err = select(Some(value)).unwrap_err();
+            assert!(err.0.contains("hc"), "{value}: {err}");
+            assert!(err.0.contains("removed"), "{value}: {err}");
+            assert!(
+                err.0.contains("native is the only backend"),
+                "{value}: {err}"
+            );
+        }
+        for value in ["tmux", "NATIVE", "native,hc", "HC"] {
+            let err = select(Some(value)).unwrap_err();
+            assert!(err.0.contains(&format!("{value:?}")), "{value}: {err}");
+            assert!(
+                err.0.contains("native is the only backend"),
+                "{value}: {err}"
             );
         }
     }
 
     #[test]
-    fn unset_backend_uses_the_default() {
-        let dir = TempDir::new("default-backend");
-        for env in [
-            vec![(TOKEN_ENV, GOOD_TOKEN), (SOCKET_ENV, SOCKET)],
-            vec![
-                (TOKEN_ENV, GOOD_TOKEN),
-                (SOCKET_ENV, SOCKET),
-                (BACKEND_ENV, "  "),
-            ],
-        ] {
-            let config = load_config(env_from(&env), "127.0.0.1", 8765, dir.path()).unwrap();
-            assert_eq!(config.backend.name(), DEFAULT_BACKEND);
-        }
+    fn hc_is_refused_even_without_a_token() {
+        let dir = TempDir::new("hc-no-token");
+        let err = load_config(
+            env_from(&[(BACKEND_ENV, "hc")]),
+            "127.0.0.1",
+            8765,
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(err.0.contains("removed"), "{err}");
     }
 
     #[test]
@@ -485,7 +467,6 @@ mod tests {
             env_from(&[
                 (TOKEN_FILE_ENV, token_text.as_str()),
                 (TOKEN_ENV, GOOD_TOKEN),
-                (SOCKET_ENV, SOCKET),
             ]),
             "127.0.0.1",
             8765,
@@ -493,19 +474,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.0.contains("not both"), "{err}");
-    }
-
-    #[test]
-    fn missing_socket_env_refused() {
-        let dir = TempDir::new("no-socket");
-        let err = load_config(
-            env_from(&[(TOKEN_ENV, GOOD_TOKEN), (BACKEND_ENV, "hc")]),
-            "127.0.0.1",
-            8765,
-            dir.path(),
-        )
-        .unwrap_err();
-        assert!(err.0.contains("HC_SOCKET"), "{err}");
     }
 
     #[test]
@@ -602,7 +570,7 @@ mod tests {
         // Full config path: a bad host fails even with a valid token and socket.
         let dir = TempDir::new("bind-refuse");
         let err = load_config(
-            env_from(&[(TOKEN_ENV, GOOD_TOKEN), (SOCKET_ENV, SOCKET)]),
+            env_from(&[(TOKEN_ENV, GOOD_TOKEN)]),
             "0.0.0.0",
             8765,
             dir.path(),
@@ -615,7 +583,7 @@ mod tests {
     fn port_zero_refused() {
         let dir = TempDir::new("port0");
         let err = load_config(
-            env_from(&[(TOKEN_ENV, GOOD_TOKEN), (SOCKET_ENV, SOCKET)]),
+            env_from(&[(TOKEN_ENV, GOOD_TOKEN)]),
             "127.0.0.1",
             0,
             dir.path(),
