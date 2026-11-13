@@ -48,6 +48,7 @@ later is a contained change.
 | `src/tools.rs` | The nine tools, their schemas, the safety rules, and the backend calls each one makes |
 | `src/dialog.rs` | Text parser for the kiro-cli permission dialog |
 | `src/devin_dialog.rs` | Text parser for the Devin CLI permission dialog |
+| `src/opencode_dialog.rs` | Text parser for the OpenCode permission dialog |
 | `src/agent.rs` | The agents a profile can name (`kiro`, `devin`, `opencode`), their dialects, and `permission_mode` |
 | `src/panelock.rs` | The per-pane lock that serializes calls typing into one pane |
 | `src/mcp.rs` | MCP message handling |
@@ -176,8 +177,8 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
   environment, whatever program it runs.
 - `agent` (optional, default `kiro`): `kiro`, `devin` or `opencode`. It decides which permission
   dialog `answer_dialog` reads for panes this profile starts, and, for `devin`, the
-  launch flag below. `opencode` has no measured dialog: `answer_dialog` refuses its panes with
-  no keys sent, and its profiles must use `permission_mode` `normal`. A pane started any other way has no agent, so `answer_dialog`
+  launch flag below. For `opencode`, `answer_dialog` sends Esc for `deny_once` and refuses
+  `allow_once` with no keys sent (see the OpenCode section of the README), and its profiles must use `permission_mode` `normal`. A pane started any other way has no agent, so `answer_dialog`
   refuses it with no keys sent. Panes started before this Shepherd process have no
   record of their agent, so they are refused too.
   A profile whose `argv` or `extra_args` names `opencode` (case-insensitive substring) and contains an auto-approve spelling (`--auto`, `autoaccept`, `auto-accept`) is refused at load. This prevents accidental configuration; it does not defend against a renamed binary, a wrapper script, or `allow_arbitrary_command`.
@@ -348,8 +349,13 @@ must not be `blocked`, then the text is sent, still inside the lock.
    - `devin`: the dialog needs a line reading `Running command`, then `$ <command>`,
      then three option rows in this order: `Allow` (its scope selector may follow on
      the same row), `Bypass mode`, `Deny`, with one `❭` on the highlighted row.
-   - `opencode`: no dialog has been measured, so this step refuses before it reads the screen
-     and sends nothing.
+   - `opencode` (OpenCode v2.2.7): the dialog needs a line starting `△ Permission required`,
+     then `$ <command>` or `→ Edit <path>` (an edit may show a diff preview), then one row of
+     `Allow once`, `Always allow`, `Reject` in that order, followed by the `ctrl+f fullscreen`
+     hint. `allow_once` is refused here without reading the screen: the highlighted option is
+     a background colour, which the screen text lacks, so it cannot be verified. `deny_once`
+     skips steps 3 and 4 below: after the re-check it sends `esc` (equal to `Reject`) once,
+     never `enter`, `right` or any move key, and never selects `Always allow`.
 
    Anything else is refused.
 3. Move the cursor. For `kiro`, `up` or `down` keys (`keys`) go out in one batch:

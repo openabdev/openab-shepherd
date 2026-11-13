@@ -15,6 +15,7 @@ pub mod http;
 pub mod input;
 pub mod mcp;
 pub mod native;
+pub mod opencode_dialog;
 pub mod panelock;
 pub mod profiles;
 pub mod tools;
