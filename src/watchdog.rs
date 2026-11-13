@@ -40,7 +40,8 @@ pub enum Todo {
 /// anything larger is treated as unreadable rather than read into memory.
 pub const MAX_TODO_BYTES: u64 = 256 * 1024;
 
-/// Read the todo file at `path`. An unchecked item is a line whose first
+/// Read the todo file named by the relative path `rel` inside the pane's
+/// working directory `cwd`. An unchecked item is a line whose first
 /// non-blank characters are `- [ ]`; `- [x]`, other bullets and prose do
 /// not count. (`- [ ]` inside a fenced code block counts too; the check is
 /// a plain line scan, not a Markdown parse.)
@@ -48,19 +49,25 @@ pub const MAX_TODO_BYTES: u64 = 256 * 1024;
 /// The file is read defensively: the supervised agent writes in the same
 /// directory, so the path could be a FIFO (which would block a plain read
 /// forever and stall the single watchdog thread), a symlink out of the
-/// directory, or an unbounded file. On Unix the path is walked one
-/// component at a time with `openat` and `O_NOFOLLOW`, so a symlink in
-/// any component — an intermediate directory, not just the file itself —
-/// is refused, and no component can be swapped for a symlink between a
-/// check and the open. The handle must be a regular file, and at most
+/// directory, or an unbounded file. The working directory is the boundary
+/// the read enforces: on Unix, `cwd` itself is opened as a directory fd
+/// (its ancestors are resolved by that open, so a working directory
+/// reached through a symlinked ancestor — `/tmp` on macOS, say — reads
+/// normally), and only the components of `rel` are then walked with
+/// `openat` and `O_NOFOLLOW`, so a symlink in any component of `rel` —
+/// an intermediate directory, not just the file itself — is refused, and
+/// no component can be swapped for a symlink between a check and the
+/// open. The handle must be a regular file, and at most
 /// [`MAX_TODO_BYTES`] are read. Any failure, or a file over the limit,
-/// maps to [`Todo::Unreadable`]: fail closed, no nudge.
-pub fn read_todo(path: &Path) -> Todo {
+/// maps to [`Todo::Unreadable`]: fail closed, no nudge. (On non-Unix the
+/// read is a plain open of `cwd.join(rel)` and follows symlinks; the
+/// symlink refusal above is Unix-only.)
+pub fn read_todo(cwd: &Path, rel: &Path) -> Todo {
     use std::io::Read as _;
     #[cfg(unix)]
-    let opened = open_todo_refusing_symlinks(path);
+    let opened = open_todo_refusing_symlinks(cwd, rel);
     #[cfg(not(unix))]
-    let opened = fs::File::open(path).ok();
+    let opened = fs::File::open(cwd.join(rel)).ok();
     let Some(mut file) = opened else {
         return Todo::Unreadable;
     };
@@ -84,35 +91,39 @@ pub fn read_todo(path: &Path) -> Todo {
     }
 }
 
-/// Open `path` for reading, refusing a symlink in every component. Each
-/// directory component is opened relative to the previous one with
-/// `O_NOFOLLOW`, so the walk never follows a link and never resolves the
-/// whole path at once (which would let a swapped intermediate directory
-/// escape the pane's working directory). `..` components are refused
+/// Open the todo file `rel` inside `cwd` for reading, refusing a symlink
+/// in every component of `rel`. The working directory is the boundary:
+/// `cwd` is opened as a directory fd with a plain open (which resolves
+/// any symlinked ancestors of the working directory itself — the walk
+/// does not police directories outside the boundary it enforces), and
+/// each component of `rel` is then opened relative to the previous one
+/// with `O_NOFOLLOW`, so the walk never follows a link inside the
+/// boundary and no component can be swapped for a symlink between a
+/// check and the open. `..` and absolute components are refused
 /// outright; profiles already reject them, and a reader that resolves
 /// them component by component has no safe meaning for them here.
 #[cfg(unix)]
-fn open_todo_refusing_symlinks(path: &Path) -> Option<fs::File> {
+fn open_todo_refusing_symlinks(cwd: &Path, rel: &Path) -> Option<fs::File> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::io::FromRawFd as _;
     use std::path::Component;
 
     let mut parts: Vec<CString> = Vec::new();
-    for part in path.components() {
+    for part in rel.components() {
         match part {
             Component::Normal(name) => parts.push(CString::new(name.as_bytes()).ok()?),
-            Component::CurDir | Component::RootDir => {}
-            Component::ParentDir | Component::Prefix(_) => return None,
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
         }
     }
     let (last, dirs) = parts.split_last()?;
-    let start = CString::new(if path.is_absolute() { "/" } else { "." }).ok()?;
+    let cwd_c = CString::new(cwd.as_os_str().as_bytes()).ok()?;
     // SAFETY: every fd returned below is checked before use and closed
     // exactly once; the final fd's ownership passes to the returned File.
     let mut fd = unsafe {
         libc::open(
-            start.as_ptr(),
+            cwd_c.as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
@@ -200,8 +211,12 @@ pub struct PaneWatch {
     todo_unreadable: bool,
     /// The turn the pane was first seen finished at, and when. The idle
     /// clock runs from here, so time spent working on that turn never
-    /// counts as idle.
+    /// counts as idle. `finished_seen` is tracked separately from the
+    /// turn value: a backend may report a finished state with
+    /// `turn = None`, and `None` must still count as "seen finished",
+    /// not as "no finished turn yet".
     finished_turn: Option<u64>,
+    finished_seen: bool,
     finished_since: Option<Instant>,
     consecutive: u32,
     last_nudge: Option<Instant>,
@@ -219,6 +234,7 @@ impl PaneWatch {
             nudged_turn: None,
             todo_unreadable: false,
             finished_turn: None,
+            finished_seen: false,
             finished_since: None,
             consecutive: 0,
             last_nudge: None,
@@ -308,12 +324,14 @@ impl PaneWatch {
         // rule in one visible place and restarts the idle clock afterwards.
         let finished = info.live && !blocked && self.turn_finished(info);
         if finished {
-            if self.finished_turn != info.turn {
+            if !self.finished_seen || self.finished_turn != info.turn {
                 self.finished_turn = info.turn;
+                self.finished_seen = true;
                 self.finished_since = Some(now);
             }
         } else {
             self.finished_turn = None;
+            self.finished_seen = false;
             self.finished_since = None;
         }
         if self.gave_up || !finished {
@@ -358,6 +376,19 @@ impl PaneWatch {
     pub fn note_failed(&mut self, now: Instant) {
         self.consecutive += 1;
         self.last_nudge = Some(now);
+    }
+
+    /// Record that the nudge text was pasted into the pane but Enter was
+    /// not pressed (the native backend's two-step send refused the second
+    /// step). The text is sitting on the pane's input line: retrying
+    /// would paste a second copy, and a person pressing Enter in the
+    /// meantime would submit text the watchdog recorded as unsent. The
+    /// watchdog therefore stops for this pane — as it does at the cap —
+    /// until a turn advance the watchdog did not cause clears the stop.
+    pub fn note_pasted_unsubmitted(&mut self, now: Instant) {
+        self.consecutive += 1;
+        self.last_nudge = Some(now);
+        self.gave_up = true;
     }
 }
 
@@ -675,21 +706,27 @@ mod tests {
                 .status()
                 .expect("mkfifo");
             assert!(made.success());
-            assert_eq!(read_todo(&fifo), Todo::Unreadable);
+            assert_eq!(
+                read_todo(dir.path(), Path::new("fifo.md")),
+                Todo::Unreadable
+            );
             // A symlink is refused even when its target is a normal todo
             // file inside the same directory.
             let target = dir.path().join("real.md");
             std::fs::write(&target, "- [ ] left\n").unwrap();
             let link = dir.path().join("link.md");
             std::os::unix::fs::symlink(&target, &link).unwrap();
-            assert_eq!(read_todo(&link), Todo::Unreadable);
+            assert_eq!(
+                read_todo(dir.path(), Path::new("link.md")),
+                Todo::Unreadable
+            );
         }
         // Over the read limit: unreadable, even with an unchecked item.
         let big = dir.path().join("big.md");
         let mut text = "- [ ] left\n".to_string();
         text.push_str(&"x".repeat(MAX_TODO_BYTES as usize));
         std::fs::write(&big, text).unwrap();
-        assert_eq!(read_todo(&big), Todo::Unreadable);
+        assert_eq!(read_todo(dir.path(), Path::new("big.md")), Todo::Unreadable);
     }
 
     #[test]
@@ -703,12 +740,38 @@ mod tests {
             let outside = TempDir::new("watchdog-todo-outside");
             std::fs::write(outside.path().join("TODO.md"), "- [ ] left\n").unwrap();
             std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
-            assert_eq!(read_todo(&dir.path().join("sub/TODO.md")), Todo::Unreadable);
+            assert_eq!(
+                read_todo(dir.path(), Path::new("sub/TODO.md")),
+                Todo::Unreadable
+            );
             // A real subdirectory in between reads normally.
             let real = dir.path().join("real");
             std::fs::create_dir(&real).unwrap();
             std::fs::write(real.join("TODO.md"), "- [ ] left\n").unwrap();
-            assert_eq!(read_todo(&real.join("TODO.md")), Todo::Unchecked);
+            assert_eq!(
+                read_todo(dir.path(), Path::new("real/TODO.md")),
+                Todo::Unchecked
+            );
+        }
+    }
+
+    #[test]
+    fn read_todo_reads_a_working_directory_reached_through_a_symlinked_ancestor() {
+        // The boundary is the working directory, not the whole filesystem
+        // path to it: on macOS /tmp and /var are symlinks into /private,
+        // and a temp working directory must still read. Reaching the same
+        // directory through an explicit symlinked ancestor is that case.
+        #[cfg(unix)]
+        {
+            let dir = TempDir::new("watchdog-todo-symlink-ancestor");
+            std::fs::write(dir.path().join("TODO.md"), "- [ ] left\n").unwrap();
+            let alias_parent = TempDir::new("watchdog-todo-alias-parent");
+            let alias = alias_parent.path().join("alias");
+            std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+            assert_eq!(read_todo(&alias, Path::new("TODO.md")), Todo::Unchecked);
+            // The same holds for the directory this test itself lives in
+            // when its own ancestors contain a symlink (macOS temp dirs).
+            assert_eq!(read_todo(dir.path(), Path::new("TODO.md")), Todo::Unchecked);
         }
     }
 
@@ -741,18 +804,59 @@ mod tests {
     fn read_todo_counts_only_dash_unchecked_items() {
         let dir = TempDir::new("watchdog-todo");
         let file = dir.path().join("TODO.md");
+        let rel = Path::new("TODO.md");
         std::fs::write(&file, "- [x] done\n- [ ] left\n").unwrap();
-        assert_eq!(read_todo(&file), Todo::Unchecked);
+        assert_eq!(read_todo(dir.path(), rel), Todo::Unchecked);
         // An indented item is still an item.
         std::fs::write(&file, "- [x] done\n  - [ ] nested left\n").unwrap();
-        assert_eq!(read_todo(&file), Todo::Unchecked);
+        assert_eq!(read_todo(dir.path(), rel), Todo::Unchecked);
         std::fs::write(&file, "- [x] done\n- [X] also done\n").unwrap();
-        assert_eq!(read_todo(&file), Todo::Finished);
+        assert_eq!(read_todo(dir.path(), rel), Todo::Finished);
         // Other bullets and prose are not items.
         std::fs::write(&file, "* [ ] star bullet\nsome - [ ] prose\n").unwrap();
-        assert_eq!(read_todo(&file), Todo::Finished);
+        assert_eq!(read_todo(dir.path(), rel), Todo::Finished);
         std::fs::write(&file, "").unwrap();
-        assert_eq!(read_todo(&file), Todo::Finished);
-        assert_eq!(read_todo(&dir.path().join("missing.md")), Todo::Unreadable);
+        assert_eq!(read_todo(dir.path(), rel), Todo::Finished);
+        assert_eq!(
+            read_todo(dir.path(), Path::new("missing.md")),
+            Todo::Unreadable
+        );
+    }
+
+    #[test]
+    fn a_finished_turn_without_a_turn_number_still_becomes_idle() {
+        // The trait allows a finished state with `turn = None`; "seen
+        // finished" must not be keyed on the turn value, or such a pane
+        // would never start its idle clock.
+        let t0 = Instant::now();
+        let mut watch = pane_watch(Agent::Kiro);
+        let done = info(State::Done, None);
+        assert_eq!(
+            watch.observe(&done, Todo::NotConfigured, t0),
+            WatchEvent::None
+        );
+        assert_eq!(
+            watch.observe(&done, Todo::NotConfigured, at(t0, 60)),
+            WatchEvent::Nudge(NudgeReason::NoTodoFile)
+        );
+    }
+
+    #[test]
+    fn a_pasted_but_unsubmitted_nudge_is_not_retried() {
+        let t0 = Instant::now();
+        let mut watch = pane_watch(Agent::Kiro);
+        let done = info(State::Done, Some(3));
+        watch.observe(&done, Todo::NotConfigured, t0);
+        assert!(matches!(
+            watch.observe(&done, Todo::NotConfigured, at(t0, 60)),
+            WatchEvent::Nudge(_)
+        ));
+        watch.note_pasted_unsubmitted(at(t0, 60));
+        // Long past the cooldown, the watchdog still does not paste a
+        // second copy onto the input line.
+        assert_eq!(
+            watch.observe(&done, Todo::NotConfigured, at(t0, 3600)),
+            WatchEvent::None
+        );
     }
 }
