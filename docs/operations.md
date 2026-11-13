@@ -401,6 +401,11 @@ It refuses, sending `esc`, when the Allow row shows another scope than `Once`.
 pane goes to `idle`, not `done`; `wait_status` reports that as `cancelled`. Esc has
 the same end state.
 
+OpenCode reports no `done`: a turn ends `working`, `clear`, `idle`. After `allow_once`
+the command runs and `wait_status` reports that idle (after a turn) as `done`. After
+`deny_once` (Esc) the idle is `cancelled`. An allow clears an earlier deny's mark in
+the same turn, so the last answer decides, and a new turn starts with no mark.
+
 Supported Devin layouts: Devin CLI 3000.12.43 (measured in a plain PTY) and
 3000.12.57 (measured in an operator end-to-end run; it draws `⏺ Running command`,
 `└ $ <command>` and a wider scope selector). Other versions refuse until they are
