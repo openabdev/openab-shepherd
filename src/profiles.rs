@@ -680,11 +680,11 @@ fn is_opencode_auto_flag(arg: &str) -> bool {
     lower.contains("--auto") || lower.contains("autoaccept") || lower.contains("auto-accept")
 }
 
-/// True when an argument names the `opencode` program as a whole word: the argument is
-/// `opencode`, a path ending in `/opencode`, or a shell string with an `opencode` word.
+/// True when an argument contains `opencode`, ignoring case. A substring match catches
+/// `OpenCode`, `npx opencode`, `sh -c "true;opencode --auto"` and paths. Over-refusal is
+/// the safe direction.
 fn names_opencode(arg: &str) -> bool {
-    arg.split(|c: char| c.is_whitespace() || c == '/')
-        .any(|word| word == "opencode")
+    arg.to_ascii_lowercase().contains("opencode")
 }
 
 fn parse_source(
@@ -1014,6 +1014,22 @@ mod tests {
             let message = refused(&text);
             assert!(message.contains("opencode"), "{message}");
         }
+        // Case, shell separators and wrappers do not hide OpenCode.
+        for argv in [
+            json!(["sh", "-c", "true;opencode --auto"]),
+            json!(["OpenCode", "--auto"]),
+            json!(["npx", "opencode", "--auto"]),
+            json!(["opencode", "--auto"]),
+        ] {
+            let text = json!({"profiles": [{"name": "oc", "argv": argv, "cwds": [d]}]}).to_string();
+            assert!(refused(&text).contains("--auto"));
+        }
+        let normal = json!({"profiles": [{"name": "oc", "argv": ["opencode", "--standalone"], "cwds": [d]}]})
+            .to_string();
+        assert!(parse(&normal, true).is_ok());
+        let auto_path = json!({"profiles": [{"name": "k", "argv": ["/opt/auto/kiro-cli", "acp"], "cwds": [d]}]})
+            .to_string();
+        assert!(parse(&auto_path, true).is_ok());
         // The same flag on a program that is not OpenCode is the operator's own choice.
         let kiro =
             json!({"profiles": [{"name": "k", "argv": ["kiro-cli", "--auto"], "cwds": [d]}]})

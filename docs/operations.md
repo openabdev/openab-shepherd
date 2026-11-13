@@ -182,6 +182,7 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
   no keys sent, and its profiles must use `permission_mode` `normal`. A pane started any other way has no agent, so `answer_dialog`
   refuses it with no keys sent. Panes started before this Shepherd process have no
   record of their agent, so they are refused too.
+  A profile whose `argv` or `extra_args` names `opencode` (case-insensitive substring) and contains an auto-approve spelling (`--auto`, `autoaccept`, `auto-accept`) is refused at load. This prevents accidental configuration; it does not defend against a renamed binary, a wrapper script, or `allow_arbitrary_command`.
 - `permission_mode` (optional, default `normal`): what the agent may do without
   asking.
   - `normal`: a `devin` pane runs `devin --permission-mode auto`. Shell commands and
