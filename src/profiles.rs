@@ -91,7 +91,7 @@ impl Profile {
     /// profile's own `argv`.
     pub fn permission_args(&self) -> Vec<String> {
         match self.agent {
-            Agent::Kiro => Vec::new(),
+            Agent::Kiro | Agent::OpenCode => Vec::new(),
             Agent::Devin => vec![
                 "--permission-mode".to_string(),
                 self.permission_mode.devin_value().to_string(),
@@ -536,10 +536,9 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
 
     let agent = match map.get("agent") {
         None => Agent::Kiro,
-        Some(Value::String(text)) => {
-            Agent::parse(text).ok_or_else(|| err(format!("{at}: agent must be kiro or devin")))?
-        }
-        Some(_) => return Err(err(format!("{at}: agent must be kiro or devin"))),
+        Some(Value::String(text)) => Agent::parse(text)
+            .ok_or_else(|| err(format!("{at}: agent must be kiro, devin or opencode")))?,
+        Some(_) => return Err(err(format!("{at}: agent must be kiro, devin or opencode"))),
     };
     let permission_mode = match map.get("permission_mode") {
         None => PermissionMode::Normal,
@@ -559,6 +558,17 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         Some(Value::Bool(allow)) => *allow,
         Some(_) => return Err(err(format!("{at}: allow_bypass must be true or false"))),
     };
+    // The argv decides whether this is OpenCode, not only the declared agent: a profile
+    // with no `agent` field still defaults to Kiro, and a wrapper such as `sh -c` or `npx`
+    // runs OpenCode from a later element.
+    let runs_opencode = argv.iter().any(|a| names_opencode(a));
+    if agent == Agent::OpenCode || runs_opencode {
+        if let Some(arg) = argv.iter().find(|a| is_opencode_auto_flag(a)) {
+            return Err(err(format!(
+                "{at}: argv and extra_args may not pass {arg} for opencode: OpenCode auto-approve flags are refused"
+            )));
+        }
+    }
     match (agent, permission_mode) {
         (Agent::Kiro, PermissionMode::AcceptEdits) => {
             return Err(err(format!(
@@ -568,6 +578,11 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         (Agent::Kiro, PermissionMode::Bypass) if !allow_bypass => {
             return Err(err(format!(
                 "{at}: permission_mode bypass for kiro needs \"allow_bypass\": true"
+            )))
+        }
+        (Agent::OpenCode, PermissionMode::AcceptEdits | PermissionMode::Bypass) => {
+            return Err(err(format!(
+                "{at}: permission_mode must be normal for opencode: no OpenCode permission mode was measured"
             )))
         }
         (Agent::Devin, _)
@@ -653,6 +668,23 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         permission_mode,
         allow_bypass,
     })
+}
+
+/// True for an argument that contains an OpenCode auto-approve spelling. The
+/// match is a substring match on the whole argument, so `--auto`, `--auto=true`,
+/// `--auto-…`, `--config=--auto`, and a shell string such as `sh -c "opencode --auto"`
+/// are all refused. It also matches `autoaccept` or `auto-accept` anywhere, such as
+/// `session.permissions=autoaccept`. Over-refusal is the safe direction here.
+fn is_opencode_auto_flag(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    lower.contains("--auto") || lower.contains("autoaccept") || lower.contains("auto-accept")
+}
+
+/// True when an argument contains `opencode`, ignoring case. A substring match catches
+/// `OpenCode`, `npx opencode`, `sh -c "true;opencode --auto"` and paths. Over-refusal is
+/// the safe direction.
+fn names_opencode(arg: &str) -> bool {
+    arg.to_ascii_lowercase().contains("opencode")
 }
 
 fn parse_source(
@@ -840,8 +872,19 @@ mod tests {
             json!({"profiles": [map]}).to_string()
         };
         let cases = [
-            (json!({"agent": "opencode"}), "agent must be kiro or devin"),
-            (json!({"agent": 1}), "agent must be kiro or devin"),
+            (
+                json!({"agent": "open-code"}),
+                "agent must be kiro, devin or opencode",
+            ),
+            (json!({"agent": 1}), "agent must be kiro, devin or opencode"),
+            (
+                json!({"agent": "opencode", "permission_mode": "accept-edits"}),
+                "permission_mode must be normal for opencode",
+            ),
+            (
+                json!({"agent": "opencode", "permission_mode": "bypass", "allow_bypass": true}),
+                "permission_mode must be normal for opencode",
+            ),
             (
                 json!({"permission_mode": "yolo"}),
                 "permission_mode must be",
@@ -885,6 +928,113 @@ mod tests {
             let message = refused(&profile(extra.clone()));
             assert!(message.contains(want), "{extra}: {message}");
         }
+    }
+
+    #[test]
+    fn an_opencode_profile_is_accepted_in_normal_mode_with_no_mode_flag() {
+        let dir = TempDir::new("profiles-opencode-ok");
+        let d = dir.path().to_string_lossy().into_owned();
+        let text = json!({"profiles": [
+            {"name": "oc", "argv": ["opencode"], "cwds": [d], "agent": "opencode"},
+        ]})
+        .to_string();
+        let policy = parse(&text, true).unwrap();
+        let profile = policy.profile("oc").unwrap();
+        assert_eq!(profile.agent, Agent::OpenCode);
+        assert_eq!(profile.permission_mode, PermissionMode::Normal);
+        assert!(profile.permission_args().is_empty());
+    }
+
+    #[test]
+    fn an_opencode_profile_refuses_every_auto_approve_spelling_in_argv_or_extra_args() {
+        let dir = TempDir::new("profiles-opencode-auto");
+        let d = dir.path().to_string_lossy().into_owned();
+        let with_argv = |argv: Value| {
+            json!({"profiles": [{"name": "oc", "agent": "opencode", "argv": argv, "cwds": [d]}]})
+                .to_string()
+        };
+        for flag in [
+            "--auto",
+            "--auto=true",
+            "--autoaccept",
+            "--auto-accept",
+            "--auto-approve",
+            "session.permissions=autoaccept",
+            "--config=session.permissions=AutoAccept",
+            "--config=--auto",
+        ] {
+            let message = refused(&with_argv(json!(["opencode", "--standalone", flag])));
+            assert!(
+                message.contains(flag) && message.contains("opencode"),
+                "{flag}: {message}"
+            );
+        }
+        // A shell string that starts OpenCode with the flag is still an argv containing it.
+        let shell = with_argv(json!(["sh", "-c", "opencode --auto"]));
+        let message = refused(&shell);
+        assert!(
+            message.contains("--auto") && message.contains("opencode"),
+            "{message}"
+        );
+        let in_extra = json!({"profiles": [{"name": "oc", "agent": "opencode",
+            "argv": ["opencode"], "extra_args": ["--auto"], "cwds": [d]}]})
+        .to_string();
+        assert!(refused(&in_extra).contains("--auto"));
+        // A normal argv passes, and a value that is only the word "auto" is not a flag.
+        let normal = with_argv(json!(["opencode", "--standalone", "--model", "auto"]));
+        let policy = parse(&normal, true).unwrap();
+        assert_eq!(
+            policy.profile("oc").unwrap().argv,
+            ["opencode", "--standalone", "--model", "auto"]
+        );
+    }
+
+    #[test]
+    fn an_opencode_program_is_refused_auto_flags_even_without_an_agent_field() {
+        let dir = TempDir::new("profiles-opencode-program");
+        let d = dir.path().to_string_lossy().into_owned();
+        let no_agent =
+            json!({"profiles": [{"name": "oc", "argv": ["opencode", "--auto"], "cwds": [d]}]})
+                .to_string();
+        let message = refused(&no_agent);
+        assert!(
+            message.contains("--auto") && message.contains("opencode"),
+            "{message}"
+        );
+        let absolute = json!({"profiles": [{"name": "oc", "argv": ["/usr/local/bin/opencode", "--auto"], "cwds": [d]}]})
+            .to_string();
+        assert!(refused(&absolute).contains("--auto"));
+        // Wrappers that start OpenCode are refused even with no `agent` field.
+        for argv in [
+            json!(["sh", "-c", "opencode --auto"]),
+            json!(["npx", "opencode", "--auto"]),
+            json!(["env", "FOO=1", "/usr/local/bin/opencode", "--auto-accept"]),
+        ] {
+            let text = json!({"profiles": [{"name": "oc", "argv": argv, "cwds": [d]}]}).to_string();
+            let message = refused(&text);
+            assert!(message.contains("opencode"), "{message}");
+        }
+        // Case, shell separators and wrappers do not hide OpenCode.
+        for argv in [
+            json!(["sh", "-c", "true;opencode --auto"]),
+            json!(["OpenCode", "--auto"]),
+            json!(["npx", "opencode", "--auto"]),
+            json!(["opencode", "--auto"]),
+        ] {
+            let text = json!({"profiles": [{"name": "oc", "argv": argv, "cwds": [d]}]}).to_string();
+            assert!(refused(&text).contains("--auto"));
+        }
+        let normal = json!({"profiles": [{"name": "oc", "argv": ["opencode", "--standalone"], "cwds": [d]}]})
+            .to_string();
+        assert!(parse(&normal, true).is_ok());
+        let auto_path = json!({"profiles": [{"name": "k", "argv": ["/opt/auto/kiro-cli", "acp"], "cwds": [d]}]})
+            .to_string();
+        assert!(parse(&auto_path, true).is_ok());
+        // The same flag on a program that is not OpenCode is the operator's own choice.
+        let kiro =
+            json!({"profiles": [{"name": "k", "argv": ["kiro-cli", "--auto"], "cwds": [d]}]})
+                .to_string();
+        assert!(parse(&kiro, true).is_ok());
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //!   answer_dialog   -> get, read, keys
 //!   remove_pane     -> get (x2, see lock_pane), remove
 
-use crate::agent::{Agent, ParsedDialog};
+use crate::agent::{unmeasured, Agent, ParsedDialog};
 use crate::ansi::strip_terminal_escapes;
 use crate::backend::{
     dialog_kind, status_json, BackendError, ErrorKind, InputGuard, Key, KeysResult, RunSpec, State,
@@ -301,7 +301,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "answer_dialog",
-            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (tested on kiro-cli 3.1.0 V3 shell permission dialogs) or devin (Devin CLI 3000.12.43 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses). A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
+            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (tested on kiro-cli 3.1.0 V3 shell permission dialogs) or devin (Devin CLI 3000.12.43 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses); opencode has no measured dialog, so it is always refused with no keys sent. A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -988,6 +988,17 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     };
     // Every key goes to this dialog in this turn. A backend with conditional
     // keys enforces it; for one without, the checks below do (non-atomically).
+    // An agent whose dialog was not measured has no option to press: refuse
+    // before reading the screen, and send nothing.
+    let Some((target, label)) = agent.option(choice) else {
+        return Err(refusal(
+            &terminal,
+            choice,
+            unmeasured(agent),
+            json!({"status": status}),
+            &sent,
+        ));
+    };
     let key_guard = InputGuard {
         refuse_when_blocked: false,
         if_state: Some(State::Blocked),
@@ -1057,9 +1068,8 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
 
     // 3. Move the cursor. Kiro: all the moves at once, then one read. Devin:
     // one key at a time, each checked against the screen, never past the target.
-    let target = agent.target(choice);
     let moves = if agent == Agent::Devin {
-        step_devin(&ask, &mut sent, &first, &screen)?
+        step_devin(&ask, &mut sent, &first, &screen, target)?
     } else {
         let moves = target as isize - first.cursor as isize;
         if moves != 0 {
@@ -1124,7 +1134,7 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
             &mut sent,
             format!(
                 "the cursor is not confirmed on {:?} after {CONFIRM_READS} reads ({last_problem})",
-                agent.label(choice)
+                label
             ),
             json!({"screen": tail(&last_seen)}),
         )?);
@@ -1165,7 +1175,7 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         "terminal": terminal,
         "agent": agent.as_str(),
         "choice": choice.as_str(),
-        "selected": agent.label(choice),
+        "selected": label,
         "title": first.title,
         "command": first.command,
         "options": first.options,
@@ -1251,6 +1261,7 @@ fn step_devin(
     sent: &mut Vec<Vec<String>>,
     first: &ParsedDialog,
     first_screen: &str,
+    target: usize,
 ) -> Result<isize, ToolError> {
     if first.cursor != devin_dialog::INDEX_ALLOW {
         let reason = format!(
@@ -1266,7 +1277,6 @@ fn step_devin(
         );
         return Err(ask.mismatch(sent, reason, json!({"screen": tail(first_screen)}))?);
     }
-    let target = ask.agent.target(ask.choice);
     let mut cursor = first.cursor;
     let mut moves: isize = 0;
     while cursor < target {
@@ -1866,6 +1876,29 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.data["error"], "refused");
         assert!(err.text.contains("no dialect applies"), "{}", err.text);
+        assert!(key_names(&fake).is_empty());
+    }
+
+    #[test]
+    fn opencode_is_refused_without_keys_because_its_dialog_is_unmeasured() {
+        let fake = blocked_devin_pane(vec![devin_screen(0), devin_screen(1)]);
+        let sh = shepherd(&fake);
+        sh.assume_agent("work", Agent::OpenCode);
+        for choice in ["allow_once", "deny_once"] {
+            let err = call(
+                &sh,
+                "answer_dialog",
+                &args(json!({"terminal": "work", "choice": choice})),
+            )
+            .unwrap_err();
+            assert_eq!(err.data["error"], "refused");
+            assert!(
+                err.text
+                    .contains("opencode permission dialog has not been measured"),
+                "{}",
+                err.text
+            );
+        }
         assert!(key_names(&fake).is_empty());
     }
 

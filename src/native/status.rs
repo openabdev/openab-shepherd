@@ -234,6 +234,13 @@ mod tests {
     }
 
     #[test]
+    fn opencode_startup_report_is_idle() {
+        // Observed on a laptop (OpenCode 2.2.7, not yet posted to issue 2): the startup
+        // report is `state=idle:app=opencode`.
+        assert_eq!(parse("7501;state=idle:app=opencode"), status("idle", None));
+    }
+
+    #[test]
     fn fields_follow_the_rules() {
         // Unknown keys ignored; the first key wins.
         assert_eq!(parse("7501;app=kiro-cli:state=done"), status("done", None));

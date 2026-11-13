@@ -21,13 +21,13 @@ which answers a permission dialog may receive.
 - **Blocked-dialog handling.** `send_input` refuses to type while a pane is blocked
   on a dialog and returns `pane_blocked`. `answer_dialog` accepts only `allow_once`
   or `deny_once`; the rule-creating options cannot be chosen. It reads the dialog
-  for the pane's agent (`kiro` or `devin`), re-checks the dialog, its kind and its
+  for the pane's agent (`kiro`, `devin`, or `opencode`), re-checks the dialog, its kind and its
   turn number before it presses Enter. A Devin dialog never selects `Bypass mode`.
 - **Launch profiles.** `start_pane` starts only what the operator's profiles file
   allows: a fixed `argv`, a list of allowed working directories, and environment
   variables. Each variable is a literal value or is read when the pane starts from
   a `keychain:` (macOS Keychain) or `env:` source. A profile names its `agent`
-  (`kiro` or `devin`) and a `permission_mode` (`normal`, `accept-edits`, or
+  (`kiro`, `devin`, or `opencode`) and a `permission_mode` (`normal`, `accept-edits`, or
   `bypass`). Caller-chosen commands are off
   unless the file sets `"allow_arbitrary_command": true`, and such panes never get
   a profile's environment. Without a profiles file, `start_pane` starts nothing.
@@ -113,6 +113,35 @@ put it behind `tailscale serve` and allow that name, for example
 Every variable, profile field, tool argument, error code and bound is described in
 [docs/operations.md](docs/operations.md).
 
+## OpenCode CLI
+
+Observed on a laptop with OpenCode 2.2.7 (`opencode --version`), installed locally with bun.
+Only the TUI startup was observed, with no model turn and no credentials. These
+observations are not yet attached to issue 2.
+
+- Launch with `argv: ["opencode", "--standalone"]`. Without `--standalone`, OpenCode
+  starts a background server (`opencode serve --service`) that keeps running after the
+  TUI exits. Stop it with `opencode service stop`, which exits 0 and ends the process
+  (observed on the laptop).
+- Never pass `--auto`, and never set `session.permissions` to `autoaccept`. Both
+  approve permission prompts without a dialog. A profile whose `argv` or `extra_args`
+  contains `--auto`, a `--auto-…` flag, or an `autoaccept` or `auto-accept` spelling is
+  refused when the config loads. This applies when the profile sets `agent: "opencode"`,
+  or when any argv element names `opencode` (for example `npx opencode`, `sh -c "opencode …"`,
+  or `/usr/local/bin/opencode`), even with no `agent` field. The check does not cover `env` or OpenCode's own config
+  file, and it does not cover a command given to `start_pane` through
+  `allow_arbitrary_command`.
+  This check prevents accidental auto-approve configuration. It matches by name (case-insensitive substring `opencode`) and does not defend against a deliberately renamed binary, a wrapper script, or the `allow_arbitrary_command` path.
+- At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. This report was
+  observed on the laptop. The output filter removes it. Whether herdr-core turns it into a
+  `get_status` result is not yet verified. It is an open point pending a live check.
+- OpenCode has a dialect slot but no measured permission dialog. `answer_dialog` refuses an
+  OpenCode pane before it reads the screen, and sends no keys. A launch profile may name
+  `agent: "opencode"`, but only with `permission_mode` `normal`: no OpenCode mode was measured,
+  so `accept-edits` and `bypass` are rejected. Its startup status (`state=idle:app=opencode`) and
+  its ST-terminated `7501;?` query were observed on the laptop and are parsed. Working turns, the `blocked` state for
+  permission prompts, and the dialog layout are not yet measured.
+
 ## Status and known limits
 
 Shepherd is an MVP (version 0.1.0). The native backend was verified against
@@ -124,7 +153,8 @@ kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 - **Two dialog choices only.** `answer_dialog` answers `allow_once` or `deny_once`
   and nothing else. Other dialog kinds (`question`, `auth`) are not answered.
 - **Text-based dialog parsing.** The dialog is parsed from screen text and is tested
-  only against kiro-cli 3.1.0 (V3) shell permission dialogs.
+  only against kiro-cli 3.1.0 (V3) shell permission dialogs. OpenCode has no dialect,
+  so its dialogs are refused without a key sent.
 - **A fast detached descendant escapes cleanup.** A descendant that is re-parented
   and fully detaches (new session, no terminal, parents gone) within the 250 ms
   between looks at the process table is never seen and survives. macOS has no

@@ -149,4 +149,23 @@ mod tests {
         let text = "line one\r\n\tline two 你好";
         assert_eq!(strip_terminal_escapes(text), text);
     }
+
+    // The ST form was observed on a laptop from OpenCode 2.2.7 TUI startup (four runs).
+    // Those captures are not yet attached to issue 2.
+    // The BEL form is a generic OSC terminator case, not observed from OpenCode.
+    #[test]
+    fn opencode_startup_status_st_observed_bel_generic_stripped() {
+        let bel = "\u{1b}]7501;state=idle:app=opencode\u{7}Build · Big Pickle";
+        assert_eq!(strip_terminal_escapes(bel), "Build · Big Pickle");
+        let st = "\u{1b}]7501;state=idle:app=opencode\u{1b}\\Build · Big Pickle";
+        assert_eq!(strip_terminal_escapes(st), "Build · Big Pickle");
+    }
+
+    #[test]
+    fn opencode_startup_queries_stripped() {
+        let text = "\u{1b}]7501;?\u{1b}\\\u{1b}[>0q\u{1b}[>4;1mAsk anything";
+        assert_eq!(strip_terminal_escapes(text), "Ask anything");
+        let bel = "\u{1b}]7501;?\u{7}Ask anything";
+        assert_eq!(strip_terminal_escapes(bel), "Ask anything");
+    }
 }
