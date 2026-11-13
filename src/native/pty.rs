@@ -242,7 +242,7 @@ fn default_signals() -> io::Result<()> {
 fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
-    let mut size = libc::winsize {
+    let size = libc::winsize {
         ws_row: ROWS,
         ws_col: COLS,
         ws_xpixel: 0,
@@ -255,7 +255,7 @@ fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
             &mut slave,
             ptr::null_mut(),
             ptr::null_mut::<libc::termios>(),
-            &mut size,
+            ptr::from_ref(&size).cast_mut(),
         )
     };
     if rc != 0 {
