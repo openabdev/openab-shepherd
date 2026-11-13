@@ -585,6 +585,48 @@ fn children_inherit_only_stdio_even_when_spawned_together() {
     }
 }
 
+#[test]
+fn children_close_inherited_non_cloexec_descriptors() {
+    // Descriptors the launching environment left open without close-on-exec
+    // must not reach a pane child.
+    let mut extra: Vec<libc::c_int> = Vec::new();
+    // SAFETY: plain libc calls on descriptors this test opens and closes.
+    unsafe {
+        for _ in 0..3 {
+            let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+            assert!(fd >= 0);
+            extra.push(fd);
+        }
+        let high = libc::dup2(extra[0], 200);
+        assert_eq!(high, 200);
+        extra.push(high);
+        for &fd in &extra {
+            assert_eq!(libc::fcntl(fd, libc::F_SETFD, 0), 0);
+            assert_eq!(libc::fcntl(fd, libc::F_GETFD), 0);
+        }
+    }
+    let dir = TempDir::new("native-fds-leak");
+    let b = backend();
+    let info = b.run(&spec_line("leak", "ls /dev/fd", &dir)).unwrap();
+    b.wait(&info.reference(), LONG).unwrap();
+    let text = screen(&b, &info);
+    // SAFETY: closes the descriptors opened above.
+    for &fd in &extra {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    let fds: BTreeSet<u32> = text
+        .split_whitespace()
+        .filter_map(|word| word.parse().ok())
+        .collect();
+    // 0, 1, 2 plus ls's own directory descriptors (one on Linux, two on
+    // macOS); any leaked descriptor adds a number such as 200.
+    let own = if cfg!(target_os = "macos") { 2 } else { 1 };
+    let expected: BTreeSet<u32> = (0..3 + own).collect();
+    assert_eq!(fds, expected, "inherited descriptors: {text}");
+}
+
 // (f)
 #[test]
 fn interrupt_sends_ctrl_c_to_a_program_without_status() {

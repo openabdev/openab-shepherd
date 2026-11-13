@@ -521,7 +521,7 @@ Pane ids are `n:<k>`
   under the input rules (empty allowed), for that pane only. It may not set `HOME`,
   `PATH`, `USER`, `LANG`, `TERM` or any `DYLD_*`/`LD_*` name (refused with
   `invalid_input`). Shepherd's token, token file path, profiles path,
-  `OPENAB_SHEPHERD_BACKEND` and everything else never reach a child. Descriptors are close-on-exec and native spawns are serialized.
+  `OPENAB_SHEPHERD_BACKEND` and everything else never reach a child. Shepherd's own descriptors are close-on-exec, native spawns are serialized, and the child marks every descriptor above 2 close-on-exec just before exec, so no descriptor above 2 survives exec, including ones Shepherd inherited from its parent.
 - **Process groups and descendants.** Each child is a session and group leader with
   the PTY as its controlling terminal. Shepherd also tracks every descendant of the
   child, by pid and start time: by parent pid every 250 ms while the child runs and
