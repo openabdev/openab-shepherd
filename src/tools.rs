@@ -286,6 +286,12 @@ impl Shepherd {
             let Some(watch) = map.get_mut(name) else {
                 return;
             };
+            // The name may have been reused since this check resolved the
+            // pane: that watch belongs to a different pane, and this
+            // check's observation must not change its state.
+            if watch.pane_id() != pane_id {
+                return;
+            }
             if watch.note_todo(todo) {
                 eprintln!(
                     "openab-shepherd: watchdog: pane {name}: the configured todo file \
@@ -318,10 +324,13 @@ impl Shepherd {
                     expect_turn: info.turn,
                     ..InputGuard::default()
                 };
-                match send_text_guarded(self, name, &config.nudge_text, Some(guard)) {
+                match send_text_guarded(self, name, &config.nudge_text, Some(guard), Some(&pane_id))
+                {
                     Ok(_) => {
                         if let Some(watch) = self.watchdog_map().get_mut(name) {
-                            watch.note_nudged(now, info.turn);
+                            if watch.pane_id() == pane_id {
+                                watch.note_nudged(now, info.turn);
+                            }
                         }
                         eprintln!(
                             "openab-shepherd: watchdog: nudged pane {name} (turn {turn}, \
@@ -332,7 +341,9 @@ impl Shepherd {
                     }
                     Err(err) => {
                         if let Some(watch) = self.watchdog_map().get_mut(name) {
-                            watch.note_failed(now);
+                            if watch.pane_id() == pane_id {
+                                watch.note_failed(now);
+                            }
                         }
                         eprintln!(
                             "openab-shepherd: watchdog: pane {name}: the nudge was not sent: {}",
@@ -824,7 +835,7 @@ fn send_input(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
 /// `send_text_guarded`, which narrows when a send is refused, never what is
 /// sent.
 fn send_text(sh: &Shepherd, terminal: &str, text: &str) -> Result<Value, ToolError> {
-    send_text_guarded(sh, terminal, text, None)
+    send_text_guarded(sh, terminal, text, None, None)
 }
 
 fn send_text_guarded(
@@ -832,8 +843,24 @@ fn send_text_guarded(
     terminal: &str,
     text: &str,
     extra_guard: Option<InputGuard>,
+    expected_pane_id: Option<&str>,
 ) -> Result<Value, ToolError> {
     let (_guard, pane, now) = lock_pane(sh, terminal)?;
+    // A caller that observed a specific pane (the watchdog) can pin the
+    // send to that pane's id: if the name was reused while waiting for
+    // the pane lock, `lock_pane`'s own check sees two reads of the NEW
+    // pane and passes, so compare against the observed id here.
+    if let Some(expected) = expected_pane_id {
+        if now.id != expected {
+            return Err(ToolError::new(
+                "terminal_changed",
+                format!(
+                    "{terminal} named a different pane than the one this send was conditioned on; nothing was sent"
+                ),
+            )
+            .with("terminal", terminal));
+        }
+    }
     if sh.agent_of(terminal) == Some(Agent::Devin) && is_devin_mode_switch(text) {
         return Err(ToolError::new(
             "refused",
@@ -1181,7 +1208,10 @@ fn remove_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         .remove(&pane, Some(Duration::from_secs_f64(grace)))
         .map_err(|err| backend_failure(Some(&terminal), err))?;
     sh.forget_agent(&terminal);
-    sh.forget_watchdog(&terminal);
+    // Forget only this pane's watch, keyed by the id `lock_pane`
+    // resolved: a new start may have reused the name and registered its
+    // own watch while this removal was still running.
+    sh.forget_watchdog_if(&terminal, pane.as_str());
     Ok(json!({
         "name": terminal,
         "was_live": removed.was_live,
@@ -3597,7 +3627,7 @@ mod tests {
                 expect_turn: Some(3),
                 ..InputGuard::default()
             };
-            let err = send_text_guarded(&sh, "work", "continue", Some(guard)).unwrap_err();
+            let err = send_text_guarded(&sh, "work", "continue", Some(guard), None).unwrap_err();
             assert!(
                 ["pane_blocked", "status_mismatch"].contains(&err.data["error"].as_str().unwrap()),
                 "{state:?} turn {turn:?}: {err:?}"
@@ -3617,6 +3647,62 @@ mod tests {
         let t0 = Instant::now();
         sh.watchdog_tick(t0 + Duration::from_secs(3600));
         assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn removing_a_pane_does_not_drop_a_reused_names_watch() {
+        // While `remove_pane` is still inside the backend remove, a new
+        // start reuses the freed name and registers its own watch. The
+        // removal's cleanup is keyed by the OLD pane's id, so the new
+        // pane's watch must survive it.
+        use std::sync::mpsc;
+        let (sh, fake, dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
+            "tools-watchdog-remove-race",
+        );
+        let (started_tx, started) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        fake.state.lock().unwrap().remove_gate = Some((started_tx, proceed_rx));
+        let remover = {
+            let sh = sh.clone();
+            thread::spawn(move || call(&sh, "remove_pane", &args(json!({"terminal": "work"}))))
+        };
+        started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("remove never started");
+        // The new start's registration under the reused name.
+        let config = sh.watchdog_map().get("work").unwrap().config().clone();
+        sh.register_watchdog(
+            "work",
+            config,
+            dir.path().to_path_buf(),
+            Agent::Kiro,
+            "id-work-2".to_string(),
+        );
+        proceed_tx.send(()).unwrap();
+        remover.join().unwrap().unwrap();
+        let map = sh.watchdog_map();
+        assert_eq!(
+            map.get("work").map(|watch| watch.pane_id()),
+            Some("id-work-2"),
+            "the removal dropped the new pane's watch"
+        );
+    }
+
+    #[test]
+    fn a_guarded_send_pinned_to_another_pane_id_is_refused() {
+        // The watchdog passes the id of the pane it observed; if the name
+        // now resolves to a different pane, nothing is typed into it.
+        let (sh, fake, _dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
+            "tools-watchdog-wrong-pane",
+        );
+        let err = send_text_guarded(&sh, "work", "continue", None, Some("id-other")).unwrap_err();
+        assert_eq!(err.data["error"], "terminal_changed");
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+        // The observed pane itself accepts the pinned send.
+        send_text_guarded(&sh, "work", "continue", None, Some("id-work")).unwrap();
+        assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
     }
 
     #[test]
