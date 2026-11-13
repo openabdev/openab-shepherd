@@ -26,9 +26,11 @@ use crate::dialog::Choice;
 use crate::input::{validate_input, validate_name};
 use crate::opencode_dialog;
 use crate::panelock::{PaneGuard, PaneLocks};
-use crate::profiles::{CwdError, LaunchPolicy};
+use crate::profiles::{CwdError, LaunchPolicy, WatchdogConfig};
+use crate::watchdog::{self, PaneWatch, Todo, WatchEvent};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -88,6 +90,7 @@ pub struct Shepherd {
     locks: Arc<PaneLocks>,
     policy: Arc<LaunchPolicy>,
     panes: Arc<Mutex<HashMap<String, PaneAgent>>>,
+    watchdog: Arc<Mutex<HashMap<String, PaneWatch>>>,
 }
 
 /// What this process knows about a pane a profile started, keyed by pane name.
@@ -114,6 +117,7 @@ impl Shepherd {
             locks: Arc::new(PaneLocks::default()),
             policy: Arc::new(policy),
             panes: Arc::new(Mutex::new(HashMap::new())),
+            watchdog: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -168,6 +172,112 @@ impl Shepherd {
 
     fn forget_agent(&self, name: &str) {
         self.panes().remove(name);
+    }
+
+    fn watchdog_map(&self) -> MutexGuard<'_, HashMap<String, PaneWatch>> {
+        self.watchdog.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn register_watchdog(&self, name: &str, config: WatchdogConfig, cwd: PathBuf, agent: Agent) {
+        self.watchdog_map()
+            .insert(name.to_string(), PaneWatch::new(config, cwd, agent));
+    }
+
+    fn forget_watchdog(&self, name: &str) {
+        self.watchdog_map().remove(name);
+    }
+
+    /// Start the watchdog thread (see `watchdog`), when any launch profile
+    /// sets a watchdog. With none there is no thread and nothing to watch.
+    /// The binary calls this once at startup; tests drive
+    /// [`Shepherd::watchdog_tick`] directly instead.
+    pub fn spawn_watchdog(&self) {
+        if !self.policy.has_watchdog() {
+            return;
+        }
+        let sh = self.clone();
+        let spawned = thread::Builder::new()
+            .name("watchdog".to_string())
+            .spawn(move || loop {
+                thread::sleep(watchdog::CHECK_INTERVAL);
+                sh.watchdog_tick(Instant::now());
+            });
+        if let Err(err) = spawned {
+            eprintln!("openab-shepherd: watchdog: cannot start the watchdog thread: {err}");
+        }
+    }
+
+    /// One watchdog pass: read every watched pane once and act on what its
+    /// observation decided. A pane that no longer resolves is forgotten.
+    pub(crate) fn watchdog_tick(&self, now: Instant) {
+        let names: Vec<String> = self.watchdog_map().keys().cloned().collect();
+        for name in names {
+            self.watchdog_check(&name, now);
+        }
+    }
+
+    fn watchdog_check(&self, name: &str, now: Instant) {
+        let (config, todo_path) = {
+            let map = self.watchdog_map();
+            let Some(watch) = map.get(name) else {
+                return;
+            };
+            let config = watch.config().clone();
+            let todo = config.todo_file.as_ref().map(|file| watch.cwd().join(file));
+            (config, todo)
+        };
+        let info = match resolve(self, name) {
+            Ok(info) => info,
+            Err(err) => {
+                if err.data["error"] == "not_found" {
+                    self.forget_watchdog(name);
+                }
+                return;
+            }
+        };
+        let todo = match &todo_path {
+            Some(path) => watchdog::read_todo(path),
+            None => Todo::NotConfigured,
+        };
+        let event = {
+            let mut map = self.watchdog_map();
+            let Some(watch) = map.get_mut(name) else {
+                return;
+            };
+            watch.observe(&info, todo, now)
+        };
+        match event {
+            WatchEvent::None => {}
+            WatchEvent::GaveUp => {
+                eprintln!(
+                    "openab-shepherd: watchdog: pane {name}: {} nudges without the turn \
+                     advancing; not nudging again until it does",
+                    config.max_consecutive_nudges
+                );
+            }
+            WatchEvent::Nudge(reason) => {
+                let turn = info
+                    .turn
+                    .map_or_else(|| "?".to_string(), |turn| turn.to_string());
+                match send_text(self, name, &config.nudge_text) {
+                    Ok(_) => {
+                        if let Some(watch) = self.watchdog_map().get_mut(name) {
+                            watch.note_nudged(now);
+                        }
+                        eprintln!(
+                            "openab-shepherd: watchdog: nudged pane {name} (turn {turn}): {}",
+                            reason.as_str()
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "openab-shepherd: watchdog: pane {name}: the nudge was not sent: {}",
+                            err.text
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -410,6 +520,19 @@ fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
             // earlier pane with the same name had.
             None => sh.forget_agent(name),
         }
+        // The watchdog watches only a pane a watchdog profile started here;
+        // any other start under this name drops an earlier registration.
+        let watched = spec
+            .profile
+            .as_deref()
+            .and_then(|p| sh.policy.profile(p))
+            .and_then(|p| p.watchdog.clone().map(|config| (config, p.agent)));
+        match (watched, spec.cwd.as_deref()) {
+            (Some((config, agent)), Some(cwd)) => {
+                sh.register_watchdog(name, config, PathBuf::from(cwd), agent)
+            }
+            _ => sh.forget_watchdog(name),
+        }
     }
     Ok(info.to_json())
 }
@@ -617,13 +740,21 @@ fn generated_name() -> String {
 fn send_input(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     let terminal = terminal_arg(args)?;
     let text = validate_input(required_str(args, "text")?).map_err(|err| format!("text: {err}"))?;
-    let (_guard, pane, now) = lock_pane(sh, &terminal)?;
-    if sh.agent_of(&terminal) == Some(Agent::Devin) && is_devin_mode_switch(&text) {
+    send_text(sh, &terminal, &text)
+}
+
+/// Type `text` into the pane `terminal` and press Enter: send_input's whole
+/// path, under the pane lock and with its refusals (a blocked pane, the Devin
+/// mode-switch rule). The watchdog's nudge goes through here too, so a nudge
+/// is refused exactly where a caller's text would be.
+fn send_text(sh: &Shepherd, terminal: &str, text: &str) -> Result<Value, ToolError> {
+    let (_guard, pane, now) = lock_pane(sh, terminal)?;
+    if sh.agent_of(terminal) == Some(Agent::Devin) && is_devin_mode_switch(text) {
         return Err(ToolError::new(
             "refused",
             "refused by the Devin mode-switch rule: /yolo can switch Devin into Bypass mode, which Shepherd never allows; nothing was sent",
         )
-        .with("terminal", terminal.as_str()));
+        .with("terminal", terminal));
     }
     // Idle and done are both sendable; a blocked program is never typed into.
     let guard = InputGuard {
@@ -635,17 +766,17 @@ fn send_input(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         // lock, then send.
         if let Some(status) = now.status.as_ref().filter(|s| s.state == State::Blocked) {
             return Err(pane_blocked(
-                &terminal,
+                terminal,
                 status.kind.clone(),
                 "refused by Shepherd: the status read inside the pane lock was blocked",
             ));
         }
     }
-    match sh.backend.send(&pane, &text, &guard) {
+    match sh.backend.send(&pane, text, &guard) {
         Ok(sent) => {
             // A new OpenCode turn must not inherit a deny from an earlier one.
-            if sent.started != Some(false) && sh.agent_of(&terminal) == Some(Agent::OpenCode) {
-                sh.clear_answer(&terminal);
+            if sent.started != Some(false) && sh.agent_of(terminal) == Some(Agent::OpenCode) {
+                sh.clear_answer(terminal);
             }
             Ok(json!({
                 "terminal": terminal,
@@ -666,9 +797,9 @@ fn send_input(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
                 .ok()
                 .and_then(|info| blocked_kind_of(&info))
                 .or_else(|| blocked_kind_of(&now));
-            Err(pane_blocked(&terminal, blocked_kind, detail))
+            Err(pane_blocked(terminal, blocked_kind, detail))
         }
-        Err(err) => Err(backend_failure(Some(&terminal), err)),
+        Err(err) => Err(backend_failure(Some(terminal), err)),
     }
 }
 
@@ -937,6 +1068,7 @@ fn remove_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         .remove(&pane, Some(Duration::from_secs_f64(grace)))
         .map_err(|err| backend_failure(Some(&terminal), err))?;
     sh.forget_agent(&terminal);
+    sh.forget_watchdog(&terminal);
     Ok(json!({
         "name": terminal,
         "was_live": removed.was_live,
@@ -3230,5 +3362,130 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("kiro-cli"), "{text}");
+    }
+
+    fn watchdog_policy(dir: &std::path::Path, watchdog: Value) -> LaunchPolicy {
+        let bin = fake_kiro(dir).to_string_lossy().into_owned();
+        let text = json!({
+            "profiles": [
+                {"name": "kiro", "argv": ["kiro-cli", "chat"], "cwds": [dir],
+                 "watchdog": watchdog}
+            ]
+        });
+        LaunchPolicy::from_json(&text.to_string())
+            .unwrap()
+            .with_env_lookup(move |key| (key == "PATH").then(|| bin.clone()))
+    }
+
+    /// A Shepherd over a runnable `fake`, with the fake able to see the pane
+    /// locks, and the `kiro` watchdog profile of `watchdog_policy` started as
+    /// pane `work`, finished at turn 3.
+    fn watched_pane(
+        watchdog: Value,
+        tag: &str,
+    ) -> (Shepherd, FakeBackend, crate::testutil::TempDir) {
+        let dir = crate::testutil::TempDir::new(tag);
+        let fake = FakeBackend::new(true);
+        fake.state.lock().unwrap().runnable = true;
+        let sh = Shepherd::with_policy(fake.clone(), watchdog_policy(dir.path(), watchdog));
+        fake.state.lock().unwrap().locks = Some(Arc::clone(sh.pane_locks()));
+        call(
+            &sh,
+            "start_pane",
+            &args(json!({"profile": "kiro", "name": "work"})),
+        )
+        .unwrap();
+        let mut state = fake.state.lock().unwrap();
+        state.panes[0].status = Some(ProgramStatus {
+            state: State::Done,
+            kind: None,
+        });
+        state.panes[0].turn = Some(3);
+        drop(state);
+        (sh, fake, dir)
+    }
+
+    #[test]
+    fn the_watchdog_nudges_a_stalled_profile_pane() {
+        let (sh, fake, _dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "cooldown_secs": 10,
+                   "nudge_text": "check your todo and continue"}),
+            "tools-watchdog-nudge",
+        );
+        let t0 = Instant::now();
+        // The first pass only starts the idle clock.
+        sh.watchdog_tick(t0);
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+        sh.watchdog_tick(t0 + Duration::from_secs(11));
+        assert_eq!(
+            fake.state.lock().unwrap().sent,
+            [("check your todo and continue".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn the_watchdog_never_nudges_a_blocked_pane() {
+        let (sh, fake, _dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
+            "tools-watchdog-blocked",
+        );
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.panes[0].status = Some(ProgramStatus {
+                state: State::Blocked,
+                kind: Some("permission".to_string()),
+            });
+        }
+        let t0 = Instant::now();
+        sh.watchdog_tick(t0);
+        sh.watchdog_tick(t0 + Duration::from_secs(3600));
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn the_watchdog_nudges_only_while_the_todo_file_has_work_left() {
+        let (sh, fake, dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "nudge_text": "continue",
+                   "todo_file": "TODO.md"}),
+            "tools-watchdog-todo",
+        );
+        // The pane runs in the canonical directory the profile resolved to.
+        let todo = std::fs::canonicalize(dir.path()).unwrap().join("TODO.md");
+        std::fs::write(&todo, "- [x] everything is done\n").unwrap();
+        let t0 = Instant::now();
+        sh.watchdog_tick(t0);
+        sh.watchdog_tick(t0 + Duration::from_secs(60));
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+        // Work appears in the file: the same stalled pane is nudged.
+        std::fs::write(&todo, "- [x] done\n- [ ] one more thing\n").unwrap();
+        sh.watchdog_tick(t0 + Duration::from_secs(61));
+        assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
+    }
+
+    #[test]
+    fn a_pane_from_a_profile_without_a_watchdog_is_not_watched() {
+        let dir = crate::testutil::TempDir::new("tools-watchdog-unwatched");
+        let fake = FakeBackend::new(true);
+        fake.state.lock().unwrap().runnable = true;
+        let sh = Shepherd::with_policy(fake.clone(), kiro_policy(dir.path(), false));
+        fake.state.lock().unwrap().locks = Some(Arc::clone(sh.pane_locks()));
+        call(
+            &sh,
+            "start_pane",
+            &args(json!({"profile": "plain", "name": "work"})),
+        )
+        .unwrap();
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.panes[0].status = Some(ProgramStatus {
+                state: State::Done,
+                kind: None,
+            });
+            state.panes[0].turn = Some(3);
+        }
+        let t0 = Instant::now();
+        sh.watchdog_tick(t0);
+        sh.watchdog_tick(t0 + Duration::from_secs(3600));
+        assert!(fake.state.lock().unwrap().sent.is_empty());
     }
 }
