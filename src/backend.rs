@@ -534,3 +534,17 @@ pub trait TerminalBackend: Send + Sync {
         grace: Option<Duration>,
     ) -> Result<RemoveResult, BackendError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::dialog_kind;
+
+    #[test]
+    fn known_dialog_kinds_pass_through() {
+        for kind in ["permission", "question", "auth"] {
+            assert_eq!(dialog_kind(kind), kind);
+        }
+        assert_eq!(dialog_kind(""), "other");
+        assert_eq!(dialog_kind("Permission"), "other");
+    }
+}

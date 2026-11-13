@@ -2,6 +2,8 @@
 //! initializer, and a fake terminal backend. Compiled only for `cargo test`.
 //! The fake herdr-core socket is in `hc/fake.rs`.
 
+pub mod scripted;
+
 use crate::backend::{
     BackendError, Capabilities, ErrorKind, InputGuard, InterruptResult, Key, KeysResult,
     ProgramStatus, RemoveResult, RunSpec, ScreenText, SendResult, State, StopHow, TerminalBackend,
