@@ -769,6 +769,26 @@ host installs the pinned version on first use. To move to a newer Rust, change `
 in `rust-toolchain.toml` and the `FROM rust:<version>-bookworm` line in the `Dockerfile`
 in the same commit, then fix any new clippy or rustfmt findings.
 
+### Stress workflow (advisory)
+
+`.github/workflows/stress.yml` runs the `native::tests::` module repeatedly while one
+`yes > /dev/null` per core keeps the runner busy, to surface tests that fail only under CPU
+load. It runs on `ubuntu-latest` and `macos-latest`, only on `workflow_dispatch` and a weekly
+schedule (Wednesday 03:17 UTC), never on pull requests. It is advisory: not a required check,
+no retries, no secrets, 40-minute timeout.
+
+```sh
+gh workflow run stress.yml -f loops=20            # both thread settings
+gh workflow run stress.yml -f loops=50 -f threads=1
+```
+
+Each OS runs `cargo test --locked --lib native::tests::` `loops` times with
+`--test-threads=1` and `loops` times with the default thread count. The job summary shows
+runs and failed runs per thread setting, then a table of failing tests with the number of
+failed runs for each. The same text is printed in the job log. A run that fails without
+naming a test (build error, panic outside a test) appears as `<no test name parsed> (exit N)`.
+The job fails if any run failed. The logic is in `.github/scripts/stress-native.sh`.
+
 ## Build offload
 
 The laptop never runs `cargo` or `rustc`. Sync the crate to the build host with
