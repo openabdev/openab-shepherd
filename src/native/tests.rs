@@ -269,11 +269,11 @@ fn osc_status_turns_and_guards_follow_the_program() {
     };
     let err = b.keys(&t, &[Key::Enter], &stale).unwrap_err();
     assert_eq!(err.kind, ErrorKind::StatusMismatch);
-    // No sleep and no "got:" negative here: the program prints nothing
-    // before it reads, so a negative could pass on an empty screen. A leaked
-    // Enter would advance the turn, and the guarded Enter below would then be
-    // refused with StatusMismatch, so the flow after this point proves it.
+    // Left as is: the program prints nothing before it reads, so there is no
+    // marker to wait for, and this negative can pass on an empty screen.
+    thread::sleep(Duration::from_millis(300));
     assert!(state_is(&b.get(&t).unwrap(), State::Blocked));
+    assert!(!screen(&b, &info).contains("got:"));
 
     // The right turn goes through: the program reads Enter and moves on.
     let current = InputGuard {
@@ -1114,19 +1114,23 @@ fn keys_if_screen_checks_the_cells_then_writes() {
     assert_nothing_written_before_marker(&b, &t);
 
     let seen = std::sync::Mutex::new(None);
-    b.keys_if_screen(&t, &[Key::Enter], &guard, &|screen| {
+    b.keys_if_screen(&t, &[Key::Up], &guard, &|screen| {
         *seen.lock().unwrap() = Some(screen.rows.len());
         Ok(())
     })
     .unwrap();
     assert_eq!(*seen.lock().unwrap(), Some(usize::from(term::ROWS)));
+    // The accepted Up arrow is the only write that echoes as an arrow
+    // sequence, so a call that never wrote cannot pass.
+    let up_echoed = |raw: &[u8]| {
+        let raw = String::from_utf8_lossy(raw);
+        raw.contains("^[[A") || raw.contains("\x1b[A")
+    };
     let end = Instant::now() + LONG;
-    // The accepted Enter is echoed as a line break after the marker's echo.
-    let enter_echoed = |raw: &[u8]| String::from_utf8_lossy(raw).contains("\r\n");
-    while !enter_echoed(&b.raw_output(&t).unwrap()) && Instant::now() < end {
+    while !up_echoed(&b.raw_output(&t).unwrap()) && Instant::now() < end {
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(enter_echoed(&b.raw_output(&t).unwrap()));
+    assert!(up_echoed(&b.raw_output(&t).unwrap()));
 }
 
 // (i)
@@ -1214,6 +1218,9 @@ fn bounds_and_spawn_errors() {
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Unsupported(_)));
     assert_nothing_written_before_marker(&b, &cat.reference());
+    // The screen holds only the marker's echo, nothing from the refused keys.
+    let text = wait_for_screen(&b, &cat, "BARRIER");
+    assert_eq!(text.replace("BARRIER", "").trim(), "", "{text:?}");
 }
 
 // (j)
