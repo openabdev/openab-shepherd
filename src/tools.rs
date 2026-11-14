@@ -521,7 +521,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "send_input",
-            "description": "Type text into a pane and press Enter. Sendable when the pane is idle or done (kiro-cli stays in done after a turn). Input is trimmed and limited to 4096 bytes. Control characters (except TAB) are refused, not removed. While the program is blocked on a dialog, nothing is typed and the error code is pane_blocked, with kind saying which dialog (for example permission). Read the screen, then use answer_dialog. This tool never forces input.",
+            "description": "Type text into a pane and press Enter. Sendable when the pane is idle or done (kiro-cli stays in done after a turn). Input is trimmed and limited to 4096 bytes. Control characters (except TAB) are refused, not removed. While the program is blocked on a dialog, nothing is typed and the error code is pane_blocked, with kind saying which dialog (for example permission). Read the screen, then use answer_dialog. This tool never forces input. A pane reporting idle or done while its permission dialog is still on the screen is refused (refused).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -975,6 +975,31 @@ fn send_text_within(
         )
         .with("terminal", terminal));
     }
+    // A program controls the bytes it prints, so it can report idle or done
+    // (OSC 7501) while its permission dialog is still on the screen. Where the
+    // pane's dialect is known, a status that says idle or done is cross-checked
+    // against the screen; a recognized dialog there refuses the send.
+    if let Some(agent) = sh.agent_of(terminal) {
+        if now
+            .status
+            .as_ref()
+            .is_some_and(|s| matches!(s.state, State::Idle | State::Done))
+        {
+            // A backend that cannot read the screen cannot be cross-checked.
+            if let Ok(screen) = read_screen(sh, &pane, terminal) {
+                if screen_shows_permission_dialog(agent, &screen) {
+                    return Err(ToolError::new(
+                        "refused",
+                        format!(
+                            "{terminal} reports idle or done, but its screen still shows a permission dialog, so the status may be forged; nothing was typed. Read the screen with read_output; interrupt_pane can stop the program"
+                        ),
+                    )
+                    .with("terminal", terminal)
+                    .with("status", status_json(now.status.as_ref())));
+                }
+            }
+        }
+    }
     // Idle and done are both sendable; a blocked program is never typed into.
     let guard = match extra_guard {
         Some(extra) => InputGuard {
@@ -1047,6 +1072,14 @@ fn send_text_within(
             Err(pane_blocked(terminal, blocked_kind, detail))
         }
         Err(err) => Err(backend_failure(Some(terminal), err)),
+    }
+}
+
+/// Whether `screen` shows a permission dialog the agent's parser recognizes.
+fn screen_shows_permission_dialog(agent: Agent, screen: &str) -> bool {
+    match agent {
+        Agent::OpenCode => opencode_dialog::parse(screen).is_ok(),
+        Agent::Kiro | Agent::Devin => agent.parse_dialog(screen).is_ok(),
     }
 }
 
@@ -2306,6 +2339,84 @@ mod tests {
         assert!(fake.state.lock().unwrap().sent.is_empty());
     }
 
+    /// Issue #62: a status of idle or done is cross-checked against the screen
+    /// with the pane's own dialect; a recognized permission dialog refuses.
+    fn send_over_screen(
+        agent: Agent,
+        state: State,
+        screen: Option<String>,
+    ) -> (Result<Value, ToolError>, Vec<(String, bool)>) {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", state, None);
+        fake.state.lock().unwrap().screen = screen;
+        let sh = shepherd(&fake);
+        sh.assume_agent("work", agent);
+        let out = call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "work", "text": "next"})),
+        );
+        let sent = fake.state.lock().unwrap().sent.clone();
+        (out, sent)
+    }
+
+    #[test]
+    fn idle_or_done_over_each_agents_permission_dialog_refuses_send_input() {
+        let screens = [
+            (Agent::Kiro, crate::dialog::fixtures::dialog_on_allow()),
+            (
+                Agent::Devin,
+                crate::devin_dialog::fixtures::dialog_with_cursor_on(0),
+            ),
+            (
+                Agent::OpenCode,
+                crate::opencode_dialog::fixtures::shell_dialog(),
+            ),
+        ];
+        for (agent, screen) in screens {
+            for state in [State::Idle, State::Done] {
+                let (out, sent) = send_over_screen(agent, state.clone(), Some(screen.clone()));
+                let err = out.unwrap_err();
+                assert_eq!(err.data["error"], "refused", "{agent:?} {state:?}");
+                assert_eq!(err.data["terminal"], "work");
+                assert!(sent.is_empty(), "{agent:?} {state:?}: {sent:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn idle_or_done_with_no_dialog_on_the_screen_still_sends() {
+        for agent in [Agent::Kiro, Agent::Devin, Agent::OpenCode] {
+            for state in [State::Idle, State::Done] {
+                let (out, sent) = send_over_screen(agent, state, Some("> ready\n".to_string()));
+                out.unwrap();
+                assert_eq!(sent.len(), 1, "{agent:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_backend_that_cannot_read_the_screen_is_not_cross_checked() {
+        let (out, sent) = send_over_screen(Agent::Kiro, State::Idle, None);
+        out.unwrap();
+        assert_eq!(sent.len(), 1);
+    }
+
+    #[test]
+    fn a_pane_with_no_dialect_is_not_cross_checked() {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", State::Idle, None);
+        fake.state.lock().unwrap().screen = Some(crate::dialog::fixtures::dialog_on_allow());
+        let sh = shepherd(&fake);
+        call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "work", "text": "next"})),
+        )
+        .unwrap();
+        assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
+    }
+
     #[test]
     fn panes_are_reached_only_by_their_name() {
         let fake = FakeBackend::new(false);
@@ -3041,6 +3152,8 @@ mod tests {
             state: State::Idle,
             kind: None,
         });
+        // The denied dialog is gone from the screen.
+        fake.state.lock().unwrap().screen = Some("> ready\n".to_string());
         let sent = call(
             &sh,
             "send_input",
