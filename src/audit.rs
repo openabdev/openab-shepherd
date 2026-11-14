@@ -1385,3 +1385,86 @@ mod tests {
         assert!(open(&dir, &project).is_err());
     }
 }
+
+/// Issue #4, PR 1: the file sink as an operator meets it across restarts.
+/// Run with `cargo test issue4_pr1`.
+#[cfg(test)]
+mod issue4_pr1_audit {
+    use super::testing::fixed_clock;
+    use super::*;
+    use crate::testutil::TempDir;
+
+    fn private_dir(tag: &str) -> TempDir {
+        let dir = TempDir::new(tag);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    fn args() -> Args {
+        json!({"terminal": "w", "text": "x"})
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_numbers_and_the_modes_survive_a_restart_and_a_torn_tail() {
+        let dir = private_dir("i4-audit-restart");
+        let project = TempDir::new("i4-audit-restart-project");
+        let path = dir.path().join("audit.jsonl");
+        {
+            let audit = Audit::open_file(&path, project.path(), fixed_clock(10)).unwrap();
+            for _ in 0..2 {
+                audit.before("a", "send_input", &args()).unwrap();
+            }
+        }
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(dir.path()), 0o700);
+        // A crash in the middle of the third record, inside a multi-byte char.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"seq\":3,\"note\":\"\xe2\x82");
+        fs::write(&path, &bytes).unwrap();
+        let audit = Audit::open_file(&path, project.path(), fixed_clock(11)).unwrap();
+        audit.before("a", "send_input", &args()).unwrap();
+        audit.before("a", "send_input", &args()).unwrap();
+        drop(audit);
+        let bytes = fs::read(&path).unwrap();
+        let lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
+        // Two clean records, the torn line, two new records, and the final newline.
+        assert_eq!(lines.len(), 6, "{}", String::from_utf8_lossy(&bytes));
+        assert!(lines[5].is_empty(), "the file ends with a newline");
+        assert!(serde_json::from_slice::<Value>(lines[2]).is_err());
+        let third: Value = serde_json::from_slice(lines[3]).unwrap();
+        let fourth: Value = serde_json::from_slice(lines[4]).unwrap();
+        assert_eq!(
+            third["seq"], 3,
+            "numbering continues from the last whole record"
+        );
+        assert_eq!(third["recovered"], true);
+        assert_eq!(fourth["seq"], 4);
+        assert!(fourth.get("recovered").is_none());
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn a_file_of_the_wrong_mode_is_refused_and_not_changed() {
+        let dir = private_dir("i4-audit-mode");
+        let project = TempDir::new("i4-audit-mode-project");
+        let path = dir.path().join("audit.jsonl");
+        for loose in [0o644, 0o640, 0o602] {
+            fs::write(&path, "").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(loose)).unwrap();
+            let err = Audit::open_file(&path, project.path(), fixed_clock(1)).unwrap_err();
+            assert!(err.0.contains("chmod 600"), "{loose:o}: {err}");
+            assert_eq!(
+                mode(&path),
+                loose,
+                "the file is left as the operator set it"
+            );
+        }
+    }
+}
