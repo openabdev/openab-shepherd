@@ -1,0 +1,37 @@
+
+          ⣀⣤⣤⣶⣶⣤⣤⣄⡀
+        ⢠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣄
+        ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄
+       ⢸⣿⣿⣿⣿⣿⣿⠁⢹⣿⠁⢹⣿⣿⣧        Welcome to Kiro CLI V3
+       ⢸⣿⣿⣿⣿⣿⣿⣄⣼⣿⣄⣼⣿⣿⣿        Learn more: https://kiro.dev/docs/cli/v3/
+       ⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+      ⢰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿        kiro-cli --v2   Launch the previous experience instead
+      ⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃
+        ⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁
+         ⠙⠛⠛⠛⠋⠁⠙⠛⠛⠉
+
+
+▸ What's new
+  Approve for me, cloud sessions, memory, local sandbox and specs.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Do these in order using the matching dedicated tools, not shell: 1) use the web fetch tool on https://example.com and give its
+  title; 2) use the todo tool to create a todo list with one item called x; 3) use the web search tool to search for kiro cli. Do
+  nothing else.
+
+• Thought for 1s...
+    ╰ I notice there's no dedicated todo tool available, so I'll skip that part and just handle the fetch and search directly
+      rather than delegating—these are simple, explicit tool calls the user asked for, so I can likely run the fetch and search in
+      parallel.
+↓ WebFetch example.com
+    ╰ mode=truncated
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Fetch URL requires approval
+ web_fetch → example.com
+
+ ❯ Allow once
+   Deny once
+   Create allow rule to approve future similar actions
+   Create deny rule to block future similar actions
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ esc to close · ↑↓ to navigate · ↵ to select · Tab to edit

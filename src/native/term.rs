@@ -709,3 +709,58 @@ mod tests {
         assert_eq!(text.lines().count(), 200);
     }
 }
+
+#[cfg(test)]
+mod dialog_fixture_tests {
+    use super::Emulator;
+    use crate::dialog;
+
+    /// The measured kiro-cli 3.3.0 screens, fed through the vt100 emulator that
+    /// Shepherd's native backend reads, then parsed from `screen_text`.
+    fn through_vt100(screen: &str) -> String {
+        let mut emu = Emulator::new();
+        emu.process(screen.replace('\n', "\r\n").as_bytes());
+        emu.screen_text()
+    }
+
+    #[test]
+    fn measured_dialogs_parse_the_same_through_the_vt100_screen() {
+        let cases = [
+            (
+                include_str!("../../tests/fixtures/kiro-3.3.0/fs_write-1.screen.txt"),
+                "fs_write",
+                0,
+            ),
+            (
+                include_str!("../../tests/fixtures/kiro-3.3.0/fs_write-2.screen.txt"),
+                "fs_write",
+                1,
+            ),
+            (
+                include_str!("../../tests/fixtures/kiro-3.3.0/mcp-1.screen.txt"),
+                "mcp",
+                0,
+            ),
+            (
+                include_str!("../../tests/fixtures/kiro-3.3.0/web_fetch-1.screen.txt"),
+                "web_fetch",
+                0,
+            ),
+        ];
+        for (plain, tool, cursor) in cases {
+            let dialog = dialog::parse(&through_vt100(plain)).unwrap();
+            assert_eq!(dialog.tool, tool);
+            assert_eq!(dialog.cursor, cursor);
+            assert_eq!(dialog, dialog::parse(plain).unwrap());
+        }
+    }
+
+    #[test]
+    fn refused_dialogs_still_refuse_through_the_vt100_screen() {
+        let web = include_str!("../../tests/fixtures/kiro-3.3.0/web_search-1.screen.txt");
+        assert!(dialog::parse(&through_vt100(web)).is_err());
+        let wrapped = include_str!("../../tests/fixtures/kiro-3.3.0/shell_wrapped80-1.screen.txt");
+        let err = dialog::parse(&through_vt100(wrapped)).unwrap_err();
+        assert!(err.contains("wrapped command"), "{err}");
+    }
+}

@@ -1,0 +1,42 @@
+
+          ⣀⣤⣤⣶⣶⣤⣤⣄⡀
+        ⢠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣄
+        ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄
+       ⢸⣿⣿⣿⣿⣿⣿⠁⢹⣿⠁⢹⣿⣿⣧        Welcome to Kiro CLI V3
+       ⢸⣿⣿⣿⣿⣿⣿⣄⣼⣿⣄⣼⣿⣿⣿        Learn more: https://kiro.dev/docs/cli/v3/
+       ⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+      ⢰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿        kiro-cli --v2   Launch the previous experience instead
+      ⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃
+        ⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁
+         ⠙⠛⠛⠛⠋⠁⠙⠛⠛⠉
+
+
+▸ What's new
+  Approve for me, cloud sessions, memory, local sandbox and specs.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Call the probe_ping tool from the probe_mcp MCP server once with text hi. Do nothing else.
+
+• Thought for 1s...
+    ╰ The user wants me to call probe_ping, which is listed in the catalogue, but I need to load it first with load_resource
+      before I can use tool_call on it.
+• Tool Load
+    ╰ id=tool::probe_mcp::probe_ping
+    ╰ {
+        "message": "{
+        \"loaded\": [
+          {
+            \"tool_id\": \"tool::probe_mcp::probe_ping\",
+      ...+23 lines
+    (ctrl+o to toggle)
+↓ probe_ping
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ probe_ping requires approval
+ mcp → probe_mcp/probe_ping
+
+ ❯ Allow once
+   Deny once
+   Create allow rule to approve future similar actions
+   Create deny rule to block future similar actions
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ esc to close · ↑↓ to navigate · ↵ to select · Tab to edit

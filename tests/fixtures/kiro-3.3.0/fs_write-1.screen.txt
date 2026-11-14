@@ -1,0 +1,41 @@
+
+          ⣀⣤⣤⣶⣶⣤⣤⣄⡀
+        ⢠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣄
+        ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄
+       ⢸⣿⣿⣿⣿⣿⣿⠁⢹⣿⠁⢹⣿⣿⣧        Welcome to Kiro CLI V3
+       ⢸⣿⣿⣿⣿⣿⣿⣄⣼⣿⣄⣼⣿⣿⣿        Learn more: https://kiro.dev/docs/cli/v3/
+       ⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+      ⢰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿        kiro-cli --v2   Launch the previous experience instead
+      ⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃
+        ⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁
+         ⠙⠛⠛⠛⠋⠁⠙⠛⠛⠉
+
+
+▸ What's new
+  Approve for me, cloud sessions, memory, local sandbox and specs.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  First use the read tool to read note.txt, then use the edit tool (not shell) to replace the word hello with goodbye in note.txt.
+  Do nothing else.
+
+• Thought for 1s...
+    ╰ I need to read note.txt in the workspace root first to see its exact contents before making the edit the user requested.
+      Since this is a small, mechanical edit explicitly specified by the user, I can go ahead and handle it directly rather than
+      delegating.
+• Read note.txt
+    ╰    1  hello world
+         2  second line
+↓ Write /private/tmp/kiro-7-1/note.txt
+    added 1 line, removed 1 line in note.txt
+     1-  hello world
+     1+  goodbye world
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Replace in File requires approval
+ fs_write → note.txt
+
+ ❯ Allow once
+   Deny once
+   Create allow rule to approve future similar actions
+   Create deny rule to block future similar actions
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ esc to close · ↑↓ to navigate · ↵ to select · Tab to edit
