@@ -17,6 +17,7 @@
 
 use crate::agent::{unmeasured, Agent, ParsedDialog};
 use crate::ansi::strip_terminal_escapes;
+use crate::audit::{self, Audit};
 use crate::backend::{
     dialog_kind, status_json, BackendError, ErrorKind, InputGuard, Key, KeysResult, RunSpec, State,
     StopHow, StyledScreen, TerminalBackend, TerminalInfo, TerminalRef, WaitReason, WaitResult,
@@ -94,6 +95,9 @@ pub struct Shepherd {
     /// How long the watchdog waits for a pane's lock before it skips the
     /// pane for this tick (see [`watchdog::LOCK_WAIT`]); tests shorten it.
     watchdog_lock_wait: Duration,
+    /// Where calls are recorded, when the operator set an audit file. `None`
+    /// records nothing.
+    audit: Option<Arc<Audit>>,
 }
 
 /// What this process knows about a pane a profile started, keyed by pane name.
@@ -129,7 +133,20 @@ impl Shepherd {
             panes: Arc::new(Mutex::new(HashMap::new())),
             watchdog: Arc::new(Mutex::new(HashMap::new())),
             watchdog_lock_wait: watchdog::LOCK_WAIT,
+            audit: None,
         }
+    }
+
+    /// Record calls to `audit`. Set before the watchdog starts, so its
+    /// nudges are recorded too.
+    pub fn with_audit(mut self, audit: Arc<Audit>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// The audit recorder, when one is configured.
+    pub fn audit(&self) -> Option<&Arc<Audit>> {
+        self.audit.as_ref()
     }
 
     #[cfg(test)]
@@ -384,6 +401,7 @@ impl Shepherd {
                     Some(guard),
                     Some(&pane_id),
                     Some(self.watchdog_lock_wait),
+                    Some(audit::WATCHDOG_ACTOR),
                 ) {
                     Ok(_) => {
                         // The send just returned: stamp it with a fresh
@@ -938,12 +956,25 @@ fn send_text_guarded(
     extra_guard: Option<InputGuard>,
     expected_pane_id: Option<&str>,
 ) -> Result<Value, ToolError> {
-    send_text_within(sh, terminal, text, extra_guard, expected_pane_id, None)
+    send_text_within(
+        sh,
+        terminal,
+        text,
+        extra_guard,
+        expected_pane_id,
+        None,
+        None,
+    )
 }
 
 /// `send_text_guarded` with an optional bound on the wait for the pane lock:
 /// a lock still held when `lock_wait` runs out is a `pane_busy` refusal and
 /// nothing is sent. `None` waits as every other tool does.
+///
+/// `audit_actor` is set by a caller that does not come through `mcp::call_tool`
+/// (the watchdog), which records MCP calls itself: the send is then recorded
+/// as a `send_input` by that actor, before it, and is refused when the record
+/// cannot be written. This adds no behaviour to the send itself.
 fn send_text_within(
     sh: &Shepherd,
     terminal: &str,
@@ -951,7 +982,16 @@ fn send_text_within(
     extra_guard: Option<InputGuard>,
     expected_pane_id: Option<&str>,
     lock_wait: Option<Duration>,
+    audit_actor: Option<&str>,
 ) -> Result<Value, ToolError> {
+    if let (Some(actor), Some(audit)) = (audit_actor, sh.audit()) {
+        let mut args = Args::new();
+        args.insert("terminal".into(), json!(terminal));
+        args.insert("text".into(), json!(text));
+        audit
+            .before(actor, "send_input", &args)
+            .map_err(|unavailable| unavailable.to_tool_error())?;
+    }
     let (_guard, pane, now) = lock_pane_within(sh, terminal, lock_wait)?;
     // A caller that observed a specific pane (the watchdog) can pin the
     // send to that pane's id: if the name was reused while waiting for
