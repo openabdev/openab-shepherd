@@ -2,7 +2,8 @@
 
 This is the operator reference: how to run the server, its environment variables,
 launch profiles, the tools, the backends, the Host check and the token rules. For
-the overview, see the [README](../README.md).
+the overview, see the [README](../README.md). For what Shepherd does and does not defend
+against, see the [trust model](adr/trust-model.md).
 
 Shepherd is an MCP server that exposes terminal panes as MCP tools. It listens on
 loopback only and requires a bearer token. The panes are run by a terminal backend
@@ -403,19 +404,8 @@ uses the status read before the send only if that read fails). A
 backend without it would get the check from Shepherd: the status read inside the pane lock
 must not be `blocked`, then the text is sent, still inside the lock.
 
-**A forged status.** A program controls the bytes it prints, so a pane can print an OSC 7501
-status itself (inside other output, split over reads, ended by any escape sequence, even on the
-alternate screen), and Shepherd cannot tell it from the real one. A forged `blocked` makes
-`send_input` refuse (the operator can still use `interrupt_pane`, and the next real status ends
-it). A forged `idle` or `done` over a permission dialog that is still on the screen would let
-`send_input` type into the dialog, so for a pane started from a launch profile `send_input`
-also reads the screen when the status is `idle` or `done`, and refuses with `refused` when the
-pane's own dialect recognizes a permission dialog there. This check is best effort: it is not
-atomic with the write, it does not cover `working`, a pane with no profile, a backend that cannot
-read the screen, or a dialog hidden behind the alternate screen, and `wait_status` still reports
-the forged state (a forged `done` reads as a finished turn). A pane has no rate limit on status
-changes. `answer_dialog` is not affected: it needs `blocked` with kind `permission` and a parsed
-dialog before it sends any key. See `src/native/tests_forged.rs`.
+**A forged status.** A pane can print its own status marker. Shepherd does not treat status
+forgery as a security boundary under its [trust model](adr/trust-model.md): pane programs are trusted.
 
 ### answer_dialog
 
@@ -946,17 +936,11 @@ Use the same `printf %s`, not `echo`, so no newline is hashed.
   file can edit it.
 - Shepherd does not do TLS, mTLS, or trust identity headers from a front end.
 
-### Later phases (not in this release)
+### Non-goals
 
-Tracked in issue #4. None of these exist yet:
-
-- Pane ownership per client (`own` or `all`), `list_panes` filtered by owner, and a
-  `max_live_panes` limit per client.
-- A `dialog:deny` setting.
-- Reloading the clients file when its modification time changes, without a restart.
-- A `token` command (create, revoke, rotate) and an `audit` command (tail, verify).
-- A hash chain in the audit log (the `prev` field), rotation, and per-client rate
-  and concurrency limits.
+Pane ownership per client, a `dialog:deny` setting, a clients-file reload, `token` and
+`audit` commands, an audit hash chain, rotation and per-client rate limits (the phases once
+tracked in issue #4) are non-goals. See the [trust model](adr/trust-model.md).
 
 ## Tests
 
@@ -1241,10 +1225,6 @@ try to update itself at run time).
   called these tools in manual sessions. No automated test covers that client.
 - **Stateless HTTP.** No SSE stream and no session ids. Clients that expect server
   push or sessions will not get them.
-- **Token file check-then-read.** The mode and location are checked, then the file
-  is read. Someone who can replace files in the token's folder could swap the file
-  between the two steps. The 0600 mode and a folder outside the repository are the
-  defense.
 - **One backend.** The native core is the only backend and was verified against
   kiro-cli 3.1.0. openab-pty is not a backend.
 - **Integration.** The native backend's real-program tests run in `cargo test` and

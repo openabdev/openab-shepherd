@@ -210,6 +210,8 @@ Shepherd is an MVP (version 0.4.0). The native backend was verified against
 kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 [MVP-REPORT.md](MVP-REPORT.md) (a dated record, not a current status), and the native core's design is in
 [docs/adr/native-core.md](docs/adr/native-core.md).
+The trust model (one account, pane programs trusted) and the non-goals are in
+[docs/adr/trust-model.md](docs/adr/trust-model.md).
 
 - **No multi-client authorization.** Anyone holding the token controls every pane.
 - **Two dialog choices only.** `answer_dialog` answers `allow_once` or `deny_once`
