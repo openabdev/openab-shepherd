@@ -1,0 +1,54 @@
+name: Stress (advisory)
+
+# Advisory only: runs the native PTY tests repeatedly under CPU load to surface
+# flaky tests (issue #55). Not a required check, no retries, no PR trigger.
+on:
+  workflow_dispatch:
+    inputs:
+      loops:
+        description: Runs per thread setting
+        type: number
+        default: 20
+      threads:
+        description: Test threads setting
+        type: choice
+        options: [both, "1", default]
+        default: both
+  schedule:
+    - cron: "17 3 * * 3" # Wednesdays 03:17 UTC, off-peak
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stress-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stress:
+    name: stress (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+      - name: Build tests once
+        run: cargo test --no-run --locked
+      - name: Stress native tests under CPU load
+        env:
+          LOOPS: ${{ inputs.loops || '20' }}
+          THREADS: ${{ inputs.threads || 'both' }}
+        run: .github/scripts/stress-native.sh "$LOOPS" "$THREADS"
+      - name: Stop busy workers
+        if: always()
+        run: pkill -x yes || true
