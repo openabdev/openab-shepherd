@@ -891,6 +891,10 @@ settings, "Manage Actions access", with the Write role. When this workflow was a
 packages API showed no `repository` on the package, so it is not linked. Until a maintainer
 adds the repository there (https://github.com/orgs/openabdev/packages/container/openab-shepherd/settings),
 the first real tag run fails at the push step, before any tag exists in the registry.
+The image now carries the `org.opencontainers.image.source` label, so the first image pushed
+with it is expected to link the package to this repository. After the first release run,
+check with `gh api /orgs/openabdev/packages/container/openab-shepherd --jq .repository`; if it
+still prints `null`, use the setting above.
 
 **Manual fallback** (used for 0.2.0 and 0.3.0, and valid if the workflow cannot publish).
 After steps 1 and 2, push the annotated tag, create the release with

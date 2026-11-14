@@ -17,6 +17,11 @@ RUN cargo build --release --locked
 # --- Runtime stage ---
 FROM debian:trixie-slim
 
+# Links the GHCR package to this repository when the image is pushed.
+LABEL org.opencontainers.image.source="https://github.com/openabdev/openab-shepherd" \
+      org.opencontainers.image.description="Bearer-protected MCP server that lets an MCP client start and drive coding CLIs in terminal panes." \
+      org.opencontainers.image.licenses="MIT"
+
 # git: the server runs `git rev-parse` at startup and refuses to start if git cannot run.
 # tini: PID 1 reaps orphaned pane processes, which otherwise stay as zombies.
 # ripgrep, procps: the same tools the openab kiro image gives kiro-cli.
