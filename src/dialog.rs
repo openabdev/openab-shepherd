@@ -132,28 +132,20 @@ fn parse_block(lines: &[&str], title_index: usize) -> Result<Dialog, String> {
         ));
     }
 
-    // Exactly one blank line separates the tool line from the options. Any other
-    // line there is a continuation of a wrapped command, which was not measured.
-    let gap = lines.get(title_index + 2).map(|line| line.trim());
-    match gap {
-        Some("") => {}
-        Some(line) if line.strip_prefix(CURSOR).unwrap_or(line).trim() == OPTION_ALLOW_ONCE => {
+    // Blank lines before the options are skipped, as before. A non-blank line
+    // that is not the first option is a continuation of a wrapped command, which
+    // was not measured.
+    let mut next = title_index + 2;
+    while lines.get(next).is_some_and(|line| line.trim().is_empty()) {
+        next += 1;
+    }
+    if let Some(line) = lines.get(next).map(|line| line.trim()) {
+        if line.strip_prefix(CURSOR).unwrap_or(line).trim() != OPTION_ALLOW_ONCE {
             return Err(format!(
-                "no blank line between {command:?} and the options; refusing an unmeasured layout"
-            ));
-        }
-        other => {
-            return Err(format!(
-                "wrapped command: the line after {command:?} is {other:?}, not a single blank line; \
+                "wrapped command: the line after {command:?} is {line:?}, not the options; \
                  a command that wraps is refused"
             ));
         }
-    }
-    let next = title_index + 3;
-    if lines.get(next).is_some_and(|line| line.trim().is_empty()) {
-        return Err(format!(
-            "expected a single blank line after {command:?}, found more than one"
-        ));
     }
     let block: Vec<&str> = lines.iter().skip(next).take(4).copied().collect();
     if block.len() < 4 {
@@ -392,12 +384,10 @@ mod measured_tests {
     }
 
     #[test]
-    fn refuses_missing_or_extra_blank_line_before_options() {
+    fn still_accepts_zero_or_extra_blank_lines_before_options() {
         let none = FS_WRITE_1.replace("fs_write → note.txt\n\n", "fs_write → note.txt\n");
-        let err = parse(&none).unwrap_err();
-        assert!(err.contains("no blank line"), "{err}");
+        assert!(parse(&none).is_ok());
         let two = FS_WRITE_1.replace("fs_write → note.txt\n\n", "fs_write → note.txt\n\n\n");
-        let err = parse(&two).unwrap_err();
-        assert!(err.contains("single blank line"), "{err}");
+        assert!(parse(&two).is_ok());
     }
 }
