@@ -800,7 +800,7 @@ machine that has kiro-cli (it takes only `--keep-dir` and opens no listener).
 
 ## Container image
 
-`Dockerfile` builds a linux/amd64 image: a Rust build stage, then a Debian trixie-slim
+`Dockerfile` builds a linux/amd64 or linux/arm64 image: a Rust build stage, then a Debian trixie-slim
 runtime with kiro-cli, git and tini, running as uid 1000. kiro-cli is pinned to
 3.1.0 (`KIRO_CLI_VERSION`) and its download is checked against a SHA-256 for amd64
 and for arm64. The image holds no token and
@@ -828,6 +828,84 @@ docker run --rm --platform linux/amd64 \
 
 To print the usage text without starting a server, run the binary by name:
 `docker run --rm --platform linux/amd64 <registry>/openab-shepherd:<version> openab-shepherd --help`.
+
+### Release
+
+A release is a git tag `vX.Y.Z` on the merge commit of a release PR. Pushing the tag runs
+`.github/workflows/release.yml`, which publishes the multi-arch image and creates the
+GitHub release.
+
+1. Open a release PR titled `chore(release): X.Y.Z` that bumps `version` in `Cargo.toml`
+   and the package entry in `Cargo.lock`, and adds a `## X.Y.Z` section to `CHANGELOG.md`.
+2. Merge it (squash).
+3. Push an annotated tag on the merge commit:
+   ```sh
+   git fetch origin
+   git tag -a vX.Y.Z -m "openab-shepherd vX.Y.Z" <merge-commit>
+   git push origin vX.Y.Z
+   ```
+4. Watch the run (`gh run watch`) and verify:
+   ```sh
+   docker buildx imagetools inspect ghcr.io/openabdev/openab-shepherd:vX.Y.Z   # amd64 and arm64
+   docker run --rm ghcr.io/openabdev/openab-shepherd:vX.Y.Z openab-shepherd --help
+   gh release view vX.Y.Z --repo openabdev/openab-shepherd
+   ```
+
+The workflow runs only for a pushed tag matching `v[0-9]+.[0-9]+.[0-9]+`:
+
+- `verify` checks that `Cargo.toml` has version X.Y.Z and `CHANGELOG.md` has a `## X.Y.Z`
+  section (`.github/scripts/release-check.sh`), then runs `cargo fmt --check`, clippy and
+  the tests.
+- `image` builds `linux/amd64` and `linux/arm64` (QEMU) with default build arguments, so
+  the image has no Devin CLI, and pushes `ghcr.io/openabdev/openab-shepherd:vX.Y.Z` and
+  `:sha-<7 chars>`. It fails first if `:vX.Y.Z` already exists in the registry. It never
+  pushes `latest`.
+- `release` creates the GitHub release with the `## X.Y.Z` section as notes
+  (`.github/scripts/release-notes.sh`; it fails on a missing or empty section). If a release
+  for the tag exists already, it reports that and succeeds.
+
+Permissions: the workflow has none by default. `verify` has `contents: read`, `image` has
+`contents: read` and `packages: write`, `release` has `contents: write`. The only secret is
+the automatic `GITHUB_TOKEN`.
+
+**Security.** Anyone with write access to the repository can push a matching tag and so
+publish an image under this name and create a release. Restrict who can push tags
+(Settings, Rules, tag ruleset for `v*`) if that is too wide. The workflow does not use
+`pull_request_target` and builds only the tagged commit.
+
+**Dry run.** `workflow_dispatch` never publishes, whatever its inputs: it does not log in
+to a registry, push or create a release. It runs `verify` for the given version, builds
+amd64 (loaded locally, runs `openab-shepherd --help`) and arm64 (built, discarded):
+
+```sh
+gh workflow run release.yml -f dry_run=true -f version=0.3.0
+```
+
+Use a version that matches `Cargo.toml` on the ref you run it on. GitHub only accepts a
+dispatch for a workflow file that exists on the default branch.
+
+**GHCR package access (setting a maintainer must change).** The package
+`ghcr.io/openabdev/openab-shepherd` was created by manual pushes. `GITHUB_TOKEN` can push to
+it only if the package is linked to this repository or lists this repository under Package
+settings, "Manage Actions access", with the Write role. When this workflow was added, the
+packages API showed no `repository` on the package, so it is not linked. Until a maintainer
+adds the repository there (https://github.com/orgs/openabdev/packages/container/openab-shepherd/settings),
+the first real tag run fails at the push step, before any tag exists in the registry.
+
+**Manual fallback** (used for 0.2.0 and 0.3.0, and valid if the workflow cannot publish).
+After steps 1 and 2, push the annotated tag, create the release with
+`gh release create vX.Y.Z --verify-tag --title vX.Y.Z --notes-file notes.md`, then build
+each architecture on a host of that architecture (or emulated) and join them:
+
+```sh
+docker build --platform linux/arm64 -t ghcr.io/openabdev/openab-shepherd:vX.Y.Z-arm64 . && docker push ghcr.io/openabdev/openab-shepherd:vX.Y.Z-arm64
+docker build --platform linux/amd64 -t ghcr.io/openabdev/openab-shepherd:vX.Y.Z-amd64 . && docker push ghcr.io/openabdev/openab-shepherd:vX.Y.Z-amd64
+docker buildx imagetools create -t ghcr.io/openabdev/openab-shepherd:vX.Y.Z \
+  ghcr.io/openabdev/openab-shepherd:vX.Y.Z-amd64 ghcr.io/openabdev/openab-shepherd:vX.Y.Z-arm64
+```
+
+Do not create `latest`, and never move or overwrite an existing version tag. If the
+workflow was started for a tag, do not also publish by hand.
 
 ### Optional: Devin CLI (`INSTALL_DEVIN`)
 
