@@ -632,6 +632,16 @@ fn child_env_validates_extra_variables() {
 // (e)
 #[test]
 fn children_inherit_only_stdio_even_when_spawned_together() {
+    // Descriptors the test process itself received without close-on-exec
+    // (CI runners pass some down). Shepherd does not own them, so a child
+    // inheriting them is not a Shepherd leak.
+    let baseline: BTreeSet<u32> = (3..1024u32)
+        .filter(|&fd| {
+            // SAFETY: F_GETFD only reads the flags of a descriptor number.
+            let flags = unsafe { libc::fcntl(fd as libc::c_int, libc::F_GETFD) };
+            flags != -1 && flags & libc::FD_CLOEXEC == 0
+        })
+        .collect();
     let dir = TempDir::new("native-fds");
     let b = backend();
     let handles: Vec<_> = (0..8)
@@ -659,7 +669,10 @@ fn children_inherit_only_stdio_even_when_spawned_together() {
             [0, 1, 2].iter().all(|fd| fds.contains(fd)),
             "stdio missing: {text}"
         );
-        let above = fds.iter().filter(|&&fd| fd > 2).count();
+        let above = fds
+            .iter()
+            .filter(|&&fd| fd > 2 && !baseline.contains(&fd))
+            .count();
         assert!(above <= 2, "inherited descriptors: {text}");
     }
 }
