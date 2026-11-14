@@ -42,6 +42,7 @@ impl Agent {
             Self::Kiro => dialog::parse(screen).map(|found| ParsedDialog {
                 title: found.title,
                 command: found.command,
+                tool: Some(found.tool),
                 options: found.options,
                 cursor: found.cursor,
             }),
@@ -76,6 +77,8 @@ pub fn unmeasured(agent: Agent) -> String {
 pub struct ParsedDialog {
     pub title: String,
     pub command: String,
+    /// The tool name, where the agent's dialog names one (Kiro).
+    pub tool: Option<String>,
     pub options: Vec<String>,
     /// Index of the option the highlight is on.
     pub cursor: usize,
