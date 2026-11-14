@@ -399,6 +399,20 @@ uses the status read before the send only if that read fails). A
 backend without it would get the check from Shepherd: the status read inside the pane lock
 must not be `blocked`, then the text is sent, still inside the lock.
 
+**A forged status.** A program controls the bytes it prints, so a pane can print an OSC 7501
+status itself (inside other output, split over reads, ended by any escape sequence, even on the
+alternate screen), and Shepherd cannot tell it from the real one. A forged `blocked` makes
+`send_input` refuse (the operator can still use `interrupt_pane`, and the next real status ends
+it). A forged `idle` or `done` over a permission dialog that is still on the screen would let
+`send_input` type into the dialog, so for a pane started from a launch profile `send_input`
+also reads the screen when the status is `idle` or `done`, and refuses with `refused` when the
+pane's own dialect recognizes a permission dialog there. This check is best effort: it is not
+atomic with the write, it does not cover `working`, a pane with no profile, a backend that cannot
+read the screen, or a dialog hidden behind the alternate screen, and `wait_status` still reports
+the forged state (a forged `done` reads as a finished turn). A pane has no rate limit on status
+changes. `answer_dialog` is not affected: it needs `blocked` with kind `permission` and a parsed
+dialog before it sends any key. See `src/native/tests_forged.rs`.
+
 ### answer_dialog
 
 1. Take the pane lock, then `get`: refuse unless `status.state` is `blocked` and
