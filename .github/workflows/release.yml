@@ -1,0 +1,188 @@
+name: Release
+
+# Publishes ghcr.io/openabdev/openab-shepherd:vX.Y.Z (linux/amd64 + linux/arm64) and the
+# GitHub release for a pushed vX.Y.Z tag. workflow_dispatch is a dry run only: it builds
+# but never logs in to a registry, pushes an image or creates a release.
+# Anyone with write access can push a tag and so trigger a publish; see docs/operations.md.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build only (a dispatch never publishes, whatever this says)
+        type: boolean
+        default: true
+      version:
+        description: Version to check and name the local image with, e.g. 0.3.0
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/openabdev/openab-shepherd
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve version
+        id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ]; then
+            version="${REF_NAME#v}"
+          else
+            version="$INPUT_VERSION"
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "error: version '$version' is not X.Y.Z" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Cargo.toml and CHANGELOG.md match the version
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: .github/scripts/release-check.sh "$VERSION"
+      - name: Install Rust (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --no-fail-fast
+
+  image:
+    name: image
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # True only for a tag push. A workflow_dispatch (even one started on a tag ref) is never a publish.
+      PUBLISH: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # ---- tag push: publish ----
+      - name: Log in to ghcr.io
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to overwrite an existing tag
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: |
+          set +e
+          out=$(docker buildx imagetools inspect "$IMAGE:v$VERSION" 2>&1)
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "error: $IMAGE:v$VERSION already exists; never overwrite a published tag" >&2
+            exit 1
+          fi
+          if ! grep -qiE 'not found|manifest unknown|MANIFEST_UNKNOWN|name unknown|404' <<<"$out"; then
+            echo "error: could not tell whether $IMAGE:v$VERSION exists:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
+          echo "$IMAGE:v$VERSION does not exist yet"
+      - name: Image tags
+        id: tags
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: |
+          echo "list=$IMAGE:v$VERSION,$IMAGE:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - name: Build and push (linux/amd64, linux/arm64)
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+      - name: Check both platforms are in the pushed image
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: |
+          out=$(docker buildx imagetools inspect "$IMAGE:v$VERSION")
+          echo "$out"
+          grep -q 'linux/amd64' <<<"$out"
+          grep -q 'linux/arm64' <<<"$out"
+
+      # ---- workflow_dispatch: dry run, builds only, no login, no push ----
+      - name: Dry run, build linux/amd64 and smoke test
+        if: github.event_name != 'push' || github.ref_type != 'tag'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: openab-shepherd:dryrun-${{ needs.verify.outputs.version }}
+      - name: Dry run, image prints usage
+        if: github.event_name != 'push' || github.ref_type != 'tag'
+        run: docker run --rm --platform linux/amd64 "openab-shepherd:dryrun-$VERSION" openab-shepherd --help
+      - name: Dry run, build linux/arm64 (QEMU, not loaded, not pushed)
+        if: github.event_name != 'push' || github.ref_type != 'tag'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+
+  release:
+    name: release
+    needs: image
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "A release for $GITHUB_REF_NAME already exists; leaving it alone."
+            exit 0
+          fi
+          .github/scripts/release-notes.sh "$version" notes.md
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md
