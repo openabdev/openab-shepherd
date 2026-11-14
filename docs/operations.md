@@ -403,7 +403,7 @@ must not be `blocked`, then the text is sent, still inside the lock.
 
 1. Take the pane lock, then `get`: refuse unless `status.state` is `blocked` and
    `status.kind` is `permission`. Record the `turn` number.
-2. `read` (screen): parse the dialog. kiro-cli 3.1.0 (V3) reports
+2. `read` (screen): parse the dialog. kiro-cli 3.1.0 and 3.3.0 (V3) report
    `blocked`/`permission` before it has drawn the dialog, so the tool re-reads the
    screen every 200 ms (`RENDER_POLL_INTERVAL`) for up to 3 s (`RENDER_WAIT`, 16
    reads) until the dialog parses. Before each re-read it calls `get` and
@@ -944,10 +944,20 @@ try to update itself at run time).
 - **No multi-client authorization.** Any holder of the token has full control of every
   pane.
 - **Permission dialogs: text parsing, two layouts.** `answer_dialog` parses the dialog
-  from screen text, for the pane's agent. Kiro is tested only against kiro-cli 3.1.0
-  (V3 engine) shell permission dialogs, using the screen captured by the probe. Devin
+  from screen text, for the pane's agent. Kiro dialogs were measured on kiro-cli 3.3.0
+  (V3 engine); shell dialogs were also measured on 3.1.0. Devin
   is tested against the layouts measured on Devin CLI 3000.12.43 and 3000.12.57 for shell commands.
-  Other tools (fs_write, MCP), other programs, other versions, and `kind` values
+  Kiro on 3.3.0, parsed (tool name before the arrow must be `shell`, `fs_write`, `mcp` or
+  `web_fetch`; `answer_dialog` returns it as `tool`): `shell`, edit of an existing file
+  (`fs_write`), MCP tool call, web fetch. Refused on purpose: web search (no `<tool> → <command>`
+  line) and a command that wraps onto continuation lines (reason "wrapped command"), because
+  only one wrapped sample at 80 columns was captured and Enter and Down were not tried on it.
+  Not measured, so refused: new-file write, reads outside the workspace, `use_aws`,
+  subagent, `knowledge`, `thinking`, `todo`, any other tool name, and Down or Esc on web
+  fetch and web search. The OSC 7501 `kind` is `permission` for every tool, so it never
+  selects a parsing rule. The MCP dialog shows no arguments and the web fetch dialog shows
+  only the host; whether those may stay approvable remotely is an open design question,
+  not decided by the parser. Other programs, other versions, and `kind` values
   `question` or `auth` are untested or refused. `force` is never sent.
 - **Native: no restart survival.** Native panes are Shepherd's children; they end
   when Shepherd exits.

@@ -1,8 +1,10 @@
 //! Text parser for the kiro-cli permission dialog.
 //!
 //! The backend reports only `blocked`/`permission`; the dialog itself exists only
-//! as screen text. The layout below was measured on kiro-cli 3.1.0 (V3 engine)
-//! for a shell tool call. Anything else is refused rather than guessed.
+//! as screen text. The layout below was measured on kiro-cli 3.1.0 and 3.3.0 (V3
+//! engine) for a shell tool call; 3.3.0 also for `fs_write`, `mcp` and `web_fetch`,
+//! which share it. Anything else is refused rather than guessed. The OSC 7501
+//! `kind` is `permission` for every tool, so it never selects a rule here.
 //!
 //! ```text
 //!  Create an empty marker file requires approval
@@ -18,6 +20,10 @@
 pub const TITLE_SUFFIX: &str = "requires approval";
 pub const COMMAND_ARROW: &str = " → ";
 pub const CURSOR: char = '❯';
+
+/// Tool names (the text before the arrow) whose dialog layout was measured.
+/// Any other name is refused.
+pub const TOOLS: [&str; 4] = ["shell", "fs_write", "mcp", "web_fetch"];
 
 /// The four options, in screen order. Only the first two can be chosen.
 pub const OPTION_ALLOW_ONCE: &str = "Allow once";
@@ -71,6 +77,8 @@ pub struct Dialog {
     pub title: String,
     /// The `<tool> → <command>` line, trimmed.
     pub command: String,
+    /// The tool name before the arrow, one of [`TOOLS`].
+    pub tool: String,
     /// The four option labels, cursor removed.
     pub options: Vec<String>,
     /// Index of the option under `❯`.
@@ -114,9 +122,38 @@ fn parse_block(lines: &[&str], title_index: usize) -> Result<Dialog, String> {
         ));
     }
 
-    let mut next = title_index + 2;
-    while lines.get(next).is_some_and(|line| line.trim().is_empty()) {
-        next += 1;
+    let tool = command
+        .split_once(COMMAND_ARROW)
+        .map(|(tool, _)| tool.trim())
+        .unwrap_or_default();
+    if !TOOLS.contains(&tool) {
+        return Err(format!(
+            "unsupported tool {tool:?} in {command:?}; measured tools are {TOOLS:?}"
+        ));
+    }
+
+    // Exactly one blank line separates the tool line from the options. Any other
+    // line there is a continuation of a wrapped command, which was not measured.
+    let gap = lines.get(title_index + 2).map(|line| line.trim());
+    match gap {
+        Some("") => {}
+        Some(line) if line.strip_prefix(CURSOR).unwrap_or(line).trim() == OPTION_ALLOW_ONCE => {
+            return Err(format!(
+                "no blank line between {command:?} and the options; refusing an unmeasured layout"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "wrapped command: the line after {command:?} is {other:?}, not a single blank line; \
+                 a command that wraps is refused"
+            ));
+        }
+    }
+    let next = title_index + 3;
+    if lines.get(next).is_some_and(|line| line.trim().is_empty()) {
+        return Err(format!(
+            "expected a single blank line after {command:?}, found more than one"
+        ));
     }
     let block: Vec<&str> = lines.iter().skip(next).take(4).copied().collect();
     if block.len() < 4 {
@@ -165,6 +202,7 @@ fn parse_block(lines: &[&str], title_index: usize) -> Result<Dialog, String> {
     Ok(Dialog {
         title,
         command: command.to_string(),
+        tool: tool.to_string(),
         options,
         cursor,
     })
@@ -293,5 +331,73 @@ mod tests {
         ] {
             assert_eq!(Choice::parse(other), None, "{other}");
         }
+    }
+}
+
+#[cfg(test)]
+mod measured_tests {
+    use super::*;
+
+    const FS_WRITE_1: &str = include_str!("../tests/fixtures/kiro-3.3.0/fs_write-1.screen.txt");
+    const FS_WRITE_2: &str = include_str!("../tests/fixtures/kiro-3.3.0/fs_write-2.screen.txt");
+    const MCP_1: &str = include_str!("../tests/fixtures/kiro-3.3.0/mcp-1.screen.txt");
+    const WEB_FETCH_1: &str = include_str!("../tests/fixtures/kiro-3.3.0/web_fetch-1.screen.txt");
+    const WEB_SEARCH_1: &str = include_str!("../tests/fixtures/kiro-3.3.0/web_search-1.screen.txt");
+    const WRAPPED_1: &str =
+        include_str!("../tests/fixtures/kiro-3.3.0/shell_wrapped80-1.screen.txt");
+
+    /// (fixture, tool, cursor) for the measured accepted dialogs.
+    fn accepted() -> [(&'static str, &'static str, usize); 4] {
+        [
+            (FS_WRITE_1, "fs_write", 0),
+            (FS_WRITE_2, "fs_write", 1),
+            (MCP_1, "mcp", 0),
+            (WEB_FETCH_1, "web_fetch", 0),
+        ]
+    }
+
+    #[test]
+    fn accepts_measured_3_3_0_dialogs_and_records_the_tool() {
+        for (screen, tool, cursor) in accepted() {
+            let dialog = parse(screen).unwrap();
+            assert_eq!(dialog.tool, tool);
+            assert_eq!(dialog.cursor, cursor);
+            assert!(dialog.command.starts_with(&format!("{tool} → ")));
+        }
+    }
+
+    #[test]
+    fn records_shell_tool() {
+        assert_eq!(parse(&fixtures::dialog_on_allow()).unwrap().tool, "shell");
+    }
+
+    #[test]
+    fn refuses_web_search_without_arrow() {
+        let err = parse(WEB_SEARCH_1).unwrap_err();
+        assert!(err.contains("web_search requires approval"), "{err}");
+        assert!(err.contains("not \"<tool> → <command>\""), "{err}");
+    }
+
+    #[test]
+    fn refuses_wrapped_shell_command_explicitly() {
+        let err = parse(WRAPPED_1).unwrap_err();
+        assert!(err.contains("wrapped command"), "{err}");
+    }
+
+    #[test]
+    fn refuses_unknown_tool_naming_it() {
+        let screen = FS_WRITE_1.replace("fs_write → note.txt", "use_aws → s3 ls");
+        let err = parse(&screen).unwrap_err();
+        assert!(err.contains("unsupported tool \"use_aws\""), "{err}");
+    }
+
+    #[test]
+    fn refuses_missing_or_extra_blank_line_before_options() {
+        let none = FS_WRITE_1.replace("fs_write → note.txt\n\n", "fs_write → note.txt\n");
+        let err = parse(&none).unwrap_err();
+        assert!(err.contains("no blank line"), "{err}");
+        let two = FS_WRITE_1.replace("fs_write → note.txt\n\n", "fs_write → note.txt\n\n\n");
+        let err = parse(&two).unwrap_err();
+        assert!(err.contains("single blank line"), "{err}");
     }
 }

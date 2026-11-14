@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Kiro permission dialogs: the tool name before the arrow must now be `shell`, `fs_write`, `mcp`
+  or `web_fetch` (the set that was accepted by accident before); any other name is refused with a
+  reason naming it. A command that wraps onto continuation lines is refused with a "wrapped
+  command" reason instead of an options mismatch. The accepted set is unchanged. `answer_dialog`
+  returns the Kiro tool name as `tool`. Measured on kiro-cli 3.3.0 (fixtures in
+  `tests/fixtures/kiro-3.3.0/`). Refs #7.
+
 ## 0.4.0
 
 ### Breaking changes
