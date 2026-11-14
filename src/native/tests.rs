@@ -66,6 +66,28 @@ fn wait_for_screen(b: &NativeBackend, info: &TerminalInfo, needle: &str) -> Stri
     }
 }
 
+/// Barrier for "nothing was written" checks on a `cat` pane: a marker typed
+/// afterwards is echoed by the terminal in write order, so once the marker
+/// shows in the raw output, every earlier write has shown there too. Asserts
+/// that nothing but the marker's own paste brackets came before it. Unlike a
+/// sleep followed by an emptiness check, it cannot pass on output that has
+/// not arrived yet.
+fn assert_nothing_written_before_marker(b: &NativeBackend, t: &TerminalRef) {
+    b.send(t, "BARRIER", &InputGuard::default()).unwrap();
+    let end = Instant::now() + LONG;
+    let raw = loop {
+        let raw = String::from_utf8_lossy(&b.raw_output(t).unwrap()).into_owned();
+        if raw.contains("BARRIER") {
+            break raw;
+        }
+        assert!(Instant::now() < end, "the marker never echoed: {raw:?}");
+        thread::sleep(Duration::from_millis(20));
+    };
+    let before = &raw[..raw.find("BARRIER").unwrap()];
+    let stray = before.replace("^[[200~", "").replace("\x1b[200~", "");
+    assert!(stray.is_empty(), "bytes written before the marker: {raw:?}");
+}
+
 /// Poll `get` until `pred` holds.
 fn wait_for(
     b: &NativeBackend,
@@ -247,6 +269,8 @@ fn osc_status_turns_and_guards_follow_the_program() {
     };
     let err = b.keys(&t, &[Key::Enter], &stale).unwrap_err();
     assert_eq!(err.kind, ErrorKind::StatusMismatch);
+    // Left as is: the program prints nothing before it reads, so there is no
+    // marker to wait for, and this negative can pass on an empty screen.
     thread::sleep(Duration::from_millis(300));
     assert!(state_is(&b.get(&t).unwrap(), State::Blocked));
     assert!(!screen(&b, &info).contains("got:"));
@@ -361,6 +385,58 @@ fn child_env_passes_no_credential_by_name() {
         .map(|(k, _)| k.to_string_lossy().into_owned())
         .collect();
     assert_eq!(names, ["PATH", "LANG", "TERM"]);
+}
+
+/// A full parent environment: the result is exactly the whitelist by name,
+/// and a profile's explicit extras are the only additions.
+#[test]
+fn child_env_for_a_full_parent_is_exactly_the_whitelist() {
+    let parent: HashMap<&'static str, &'static str> = HashMap::from([
+        ("HOME", "/home/u"),
+        ("PATH", "/opt/bin:/usr/bin"),
+        ("USER", "u"),
+        ("LANG", "C.UTF-8"),
+        ("TERM", "dumb"),
+        ("SHEPHERD_SECRET", "s1"),
+        ("AWS_SECRET_ACCESS_KEY", "s2"),
+        ("HC_SOCKET", "/tmp/hc.sock"),
+        ("OPENAB_SHEPHERD_TOKEN_FILE", "/tmp/token"),
+        ("LD_PRELOAD", "/tmp/evil.so"),
+        ("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib"),
+        ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+    ]);
+    let lookup = |key: &str| parent.get(key).map(OsString::from);
+    let names = |env: &[(OsString, OsString)]| -> Vec<String> {
+        let mut names: Vec<String> = env
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let env = pty::child_env(lookup, &[]).unwrap();
+    assert_eq!(names(&env), ["HOME", "LANG", "PATH", "TERM", "USER"]);
+    let value = |env: &[(OsString, OsString)], key: &str| {
+        env.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+    };
+    assert_eq!(value(&env, "HOME").as_deref(), Some("/home/u"));
+    assert_eq!(value(&env, "PATH").as_deref(), Some("/opt/bin:/usr/bin"));
+    assert_eq!(value(&env, "USER").as_deref(), Some("u"));
+    assert_eq!(value(&env, "LANG").as_deref(), Some("C.UTF-8"));
+    // The parent's TERM never passes: the child always gets xterm-256color.
+    assert_eq!(value(&env, "TERM").as_deref(), Some("xterm-256color"));
+
+    let pair = |k: &str, v: &str| (OsString::from(k), OsString::from(v));
+    let extra = [pair("PROBE_TOKEN", "t")];
+    let env = pty::child_env(lookup, &extra).unwrap();
+    assert_eq!(
+        names(&env),
+        ["HOME", "LANG", "PATH", "PROBE_TOKEN", "TERM", "USER"]
+    );
+    assert_eq!(value(&env, "PROBE_TOKEN").as_deref(), Some("t"));
 }
 
 /// An executable shell script at `path` that prints `marker` and its env.
@@ -1009,8 +1085,7 @@ fn a_refused_multi_key_call_writes_no_key() {
         .keys(&cat.reference(), &[Key::Up, Key::Down, Key::Enter], &guard)
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::StatusMismatch);
-    thread::sleep(Duration::from_millis(300));
-    assert!(b.raw_output(&cat.reference()).unwrap().is_empty());
+    assert_nothing_written_before_marker(&b, &cat.reference());
 }
 
 /// The screen check runs in the same step as the write: a refusal writes
@@ -1036,21 +1111,26 @@ fn keys_if_screen_checks_the_cells_then_writes() {
         .keys_if_screen(&t, &[Key::Enter], &bad_guard, &|_| Ok(()))
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::StatusMismatch);
-    thread::sleep(Duration::from_millis(300));
-    assert!(b.raw_output(&t).unwrap().is_empty());
+    assert_nothing_written_before_marker(&b, &t);
 
     let seen = std::sync::Mutex::new(None);
-    b.keys_if_screen(&t, &[Key::Enter], &guard, &|screen| {
+    b.keys_if_screen(&t, &[Key::Up], &guard, &|screen| {
         *seen.lock().unwrap() = Some(screen.rows.len());
         Ok(())
     })
     .unwrap();
     assert_eq!(*seen.lock().unwrap(), Some(usize::from(term::ROWS)));
+    // The accepted Up arrow is the only write that echoes as an arrow
+    // sequence, so a call that never wrote cannot pass.
+    let up_echoed = |raw: &[u8]| {
+        let raw = String::from_utf8_lossy(raw);
+        raw.contains("^[[A") || raw.contains("\x1b[A")
+    };
     let end = Instant::now() + LONG;
-    while b.raw_output(&t).unwrap().is_empty() && Instant::now() < end {
+    while !up_echoed(&b.raw_output(&t).unwrap()) && Instant::now() < end {
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(!b.raw_output(&t).unwrap().is_empty());
+    assert!(up_echoed(&b.raw_output(&t).unwrap()));
 }
 
 // (i)
@@ -1137,9 +1217,10 @@ fn bounds_and_spawn_errors() {
         )
         .unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Unsupported(_)));
-    thread::sleep(Duration::from_millis(300));
-    assert_eq!(screen(&b, &cat), "");
-    assert!(b.raw_output(&cat.reference()).unwrap().is_empty());
+    assert_nothing_written_before_marker(&b, &cat.reference());
+    // The screen holds only the marker's echo, nothing from the refused keys.
+    let text = wait_for_screen(&b, &cat, "BARRIER");
+    assert_eq!(text.replace("BARRIER", "").trim(), "", "{text:?}");
 }
 
 // (j)
@@ -1277,15 +1358,16 @@ fn a_killed_program_that_keeps_writing_is_reaped_with_its_signal_code() {
     assert!(!process_alive(pid), "leader {pid} was not reaped");
 }
 
-/// A program that writes a lot of output when it gets the hangup signal, as
-/// a TUI does when it restores the terminal: it exits within the grace,
-/// because the output is still drained while it stops. The payload is far
-/// larger than the pty and pipe buffers (so the program blocks on a full pty
-/// unless the reader drains it) but small enough that a debug build parses it
-/// well inside the grace, also on a slow Linux host (400000 bytes took 2.1 s+
-/// of terminal parsing in debug on one, and the grace killed the program).
+/// A program that keeps writing after the hangup signal, as a TUI does when
+/// it restores the terminal, is allowed to finish when its output is drained:
+/// it exits with its own code from its own trap, and no SIGKILL is needed.
+/// The payload is far larger than the pty and pipe buffers, so the program
+/// blocks on a full pty unless the reader drains it. This does not measure
+/// the 2 s production grace: how long a debug build needs to parse the
+/// payload depends on the host's load, so the bound is a safety net against
+/// a real wedge only (issue #52).
 #[test]
-fn a_program_that_writes_on_hangup_exits_within_the_grace() {
+fn a_program_that_writes_on_hangup_exits_when_its_output_is_drained() {
     let dir = TempDir::new("native-flood-exit");
     let b = backend();
     let info = b
@@ -1298,9 +1380,34 @@ fn a_program_that_writes_on_hangup_exits_within_the_grace() {
         .unwrap();
     let pid = pane_of(&b, &info).pid;
     wait_for_screen(&b, &info, "ready");
-    let out = b.remove(&info.reference(), None).unwrap();
+    let out = b
+        .remove(&info.reference(), Some(Duration::from_secs(30)))
+        .unwrap();
     assert_eq!(out.stopped, Some(StopHow::Exited), "{out:?}");
     assert_eq!(out.exit_code, Some(7), "{out:?}");
+    assert!(!process_alive(pid), "leader {pid} was not reaped");
+}
+
+/// With the default grace, a program that ignores the hangup and terminate
+/// signals and never exits is killed. The bound is far above the 2 s grace:
+/// it only catches a removal that hangs.
+#[test]
+fn remove_with_the_default_grace_kills_a_program_that_ignores_the_signals() {
+    let dir = TempDir::new("native-default-grace-kill");
+    let b = backend();
+    let info = b
+        .run(&spec_line(
+            "stubborn",
+            "trap '' HUP TERM; echo ready; while :; do sleep 1; done",
+            &dir,
+        ))
+        .unwrap();
+    let pid = pane_of(&b, &info).pid;
+    wait_for_screen(&b, &info, "ready");
+    let started = Instant::now();
+    let out = b.remove(&info.reference(), None).unwrap();
+    assert_eq!(out.stopped, Some(StopHow::Killed), "{out:?}");
+    assert!(started.elapsed() < Duration::from_secs(30), "{out:?}");
     assert!(!process_alive(pid), "leader {pid} was not reaped");
 }
 
