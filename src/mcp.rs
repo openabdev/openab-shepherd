@@ -3,6 +3,7 @@
 //! The server is stateless: each POST carries one message and gets one JSON reply,
 //! or 202 for a notification. There is no SSE stream and no session id.
 
+use crate::clients::{self, Caller};
 use crate::tools::{self, Shepherd};
 use serde_json::{json, Map, Value};
 
@@ -15,8 +16,11 @@ const CODE_INVALID_REQUEST: i64 = -32600;
 const CODE_METHOD_NOT_FOUND: i64 = -32601;
 const CODE_INVALID_PARAMS: i64 = -32602;
 
-/// Handle one parsed JSON-RPC message. Returns `None` when no reply is due.
-pub fn handle_message(sh: &Shepherd, message: &Value) -> Option<Value> {
+/// Handle one parsed JSON-RPC message for an authenticated `caller`. Returns
+/// `None` when no reply is due. This is the only entry production code uses,
+/// so no tool call runs without a caller and the scope check. A batch is
+/// refused outright; nothing else reaches `tools::call` except `tools/call`.
+pub fn handle_message_as(sh: &Shepherd, caller: &Caller, message: &Value) -> Option<Value> {
     if message.is_array() {
         return Some(rpc_error(
             Value::Null,
@@ -47,20 +51,52 @@ pub fn handle_message(sh: &Shepherd, message: &Value) -> Option<Value> {
         // A notification, such as notifications/initialized: no reply.
         return None;
     };
-    Some(match dispatch(sh, method, object.get("params")) {
+    Some(match dispatch(sh, caller, method, object.get("params")) {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err((code, text)) => rpc_error(id, code, &text),
     })
 }
 
-fn dispatch(sh: &Shepherd, method: &str, params: Option<&Value>) -> Result<Value, (i64, String)> {
+/// [`handle_message_as`] for a caller holding every scope, so the tests of the
+/// tools themselves run unchanged. Not compiled into the server.
+#[cfg(test)]
+pub fn handle_message(sh: &Shepherd, message: &Value) -> Option<Value> {
+    handle_message_as(sh, &Caller::legacy(), message)
+}
+
+fn dispatch(
+    sh: &Shepherd,
+    caller: &Caller,
+    method: &str,
+    params: Option<&Value>,
+) -> Result<Value, (i64, String)> {
     match method {
         "initialize" => Ok(initialize(params)),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools::definitions()})),
-        "tools/call" => call_tool(sh, params),
+        "tools/list" => Ok(json!({"tools": visible_tools(caller)})),
+        "tools/call" => call_tool(sh, caller, params),
         other => Err((CODE_METHOD_NOT_FOUND, format!("method not found: {other}"))),
     }
+}
+
+/// The tool definitions the caller may use at all. A convenience for the
+/// client's model: `authorize` in [`call_tool`] is the check.
+fn visible_tools(caller: &Caller) -> Value {
+    let all = tools::definitions();
+    let shown: Vec<Value> = all
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| caller.may_list(name))
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Array(shown)
 }
 
 fn initialize(params: Option<&Value>) -> Value {
@@ -78,7 +114,11 @@ fn initialize(params: Option<&Value>) -> Value {
     })
 }
 
-fn call_tool(sh: &Shepherd, params: Option<&Value>) -> Result<Value, (i64, String)> {
+fn call_tool(
+    sh: &Shepherd,
+    caller: &Caller,
+    params: Option<&Value>,
+) -> Result<Value, (i64, String)> {
     let params = params.and_then(Value::as_object).ok_or((
         CODE_INVALID_PARAMS,
         "tools/call needs an object of params".to_string(),
@@ -100,7 +140,25 @@ fn call_tool(sh: &Shepherd, params: Option<&Value>) -> Result<Value, (i64, Strin
             ))
         }
     };
-    Ok(tool_result(tools::call(sh, name, &args)))
+    let audit = sh.audit();
+    if let Err(denied) = clients::authorize(caller, name, &args) {
+        if let Some(audit) = audit {
+            audit.denied(caller.client(), name, &args, &denied.reason);
+        }
+        return Ok(tool_result(Err(denied.to_tool_error())));
+    }
+    let pending = match audit {
+        Some(audit) => match audit.before(caller.client(), name, &args) {
+            Ok(pending) => Some(pending),
+            Err(unavailable) => return Ok(tool_result(Err(unavailable.to_tool_error()))),
+        },
+        None => None,
+    };
+    let outcome = tools::call(sh, name, &args);
+    if let (Some(audit), Some(pending)) = (audit, pending) {
+        audit.after(caller.client(), name, &args, pending, &outcome);
+    }
+    Ok(tool_result(outcome))
 }
 
 /// Tool failures are results with `isError: true`, not JSON-RPC errors, so the
@@ -365,5 +423,33 @@ mod tests {
         assert_eq!(data["terminal"], "missing");
         assert_eq!(data["backend_detail"], "fake: no such pane");
         assert!(!text_of(&out).contains("fake:"), "{}", text_of(&out));
+    }
+
+    #[test]
+    fn handle_message_as_filters_the_list_and_denies_without_the_scope() {
+        use crate::clients::{ProfileAccess, Scope};
+        let (client, fake) = fake_client();
+        let caller = Caller::new("watcher", [Scope::Observe], ProfileAccess::Only(Vec::new()));
+        let list = handle_message_as(
+            &client,
+            &caller,
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        )
+        .unwrap();
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["get_status", "wait_status", "list_panes"]);
+        let out = tool_out(handle_message_as(
+            &client,
+            &caller,
+            &call_msg("send_input", json!({"terminal": "work", "text": "ls"})),
+        ));
+        assert_eq!(out["isError"], true);
+        assert_eq!(out["structuredContent"]["error"], "forbidden");
+        assert!(fake.calls().is_empty());
     }
 }

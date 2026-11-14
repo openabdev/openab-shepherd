@@ -6,6 +6,7 @@
 //! to the MCP layer. Nothing is logged from request bodies, because they can carry
 //! text typed into panes.
 
+use crate::clients::{unix_now, Clients};
 use crate::config::AllowedHost;
 use crate::mcp;
 use crate::tools::Shepherd;
@@ -22,7 +23,8 @@ pub const MCP_PATH: &str = "/mcp";
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 pub struct AppState {
-    pub token: String,
+    /// Who may call: the clients file, or the single legacy token.
+    pub clients: Clients,
     /// Extra Host values from `OPENAB_SHEPHERD_ALLOWED_HOSTS`; empty by default.
     pub allowed_hosts: Vec<AllowedHost>,
     pub shepherd: Shepherd,
@@ -79,13 +81,22 @@ fn route(request: &mut Request, state: &AppState, body: Result<Vec<u8>, u16>) ->
     }
 
     let authorization = header_value(request, "Authorization");
-    if !bearer_matches(authorization.as_deref(), &state.token) {
-        return json_reply(
-            401,
-            json!({"error": "unauthorized", "message": "missing or invalid bearer token"}),
-            Some("Bearer"),
-        );
-    }
+    let caller = match state
+        .clients
+        .authenticate(authorization.as_deref(), unix_now())
+    {
+        Ok(caller) => caller,
+        Err(failure) => {
+            if let Some(audit) = state.shepherd.audit() {
+                audit.auth_failure(&failure.id_prefix, failure.reason);
+            }
+            return json_reply(
+                401,
+                json!({"error": "unauthorized", "message": "missing or invalid bearer token"}),
+                Some("Bearer"),
+            );
+        }
+    };
 
     let path = request
         .url()
@@ -133,7 +144,7 @@ fn route(request: &mut Request, state: &AppState, body: Result<Vec<u8>, u16>) ->
             )
         }
     };
-    match mcp::handle_message(&state.shepherd, &message) {
+    match mcp::handle_message_as(&state.shepherd, &caller, &message) {
         Some(reply) => json_reply(200, reply, None),
         None => empty_reply(202),
     }
@@ -209,22 +220,12 @@ pub fn is_allowed_host(value: &str, allowed: &[AllowedHost]) -> bool {
     })
 }
 
-/// Compare `Authorization` against `Bearer <token>` without an early exit on the
-/// first differing byte.
-pub fn bearer_matches(header: Option<&str>, token: &str) -> bool {
-    let Some(supplied) = header else {
-        return false;
-    };
-    let expected = format!("Bearer {token}");
-    constant_time_eq(supplied.as_bytes(), expected.as_bytes())
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+/// Compare two SHA-256 digests without an early exit on the first differing
+/// byte. Digests only: both are 32 bytes, so no length leaks. Tokens are never
+/// compared directly; `Clients::authenticate` hashes the supplied token first.
+pub fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
-    diff == 0
+    std::hint::black_box(diff) == 0
 }
 
 fn header(name: &str, value: &str) -> Header {
@@ -334,14 +335,26 @@ mod tests {
 
     #[test]
     fn bearer_must_match_exactly() {
-        assert!(bearer_matches(Some(&format!("Bearer {TOKEN}")), TOKEN));
-        assert!(!bearer_matches(None, TOKEN));
-        assert!(!bearer_matches(Some(TOKEN), TOKEN), "scheme is required");
-        assert!(!bearer_matches(
-            Some("Bearer wrong-token-0000000000"),
-            TOKEN
-        ));
-        assert!(!bearer_matches(Some(&format!("Bearer {TOKEN}x")), TOKEN));
+        let clients = Clients::legacy_only(TOKEN);
+        let ok = |header: Option<&str>| clients.authenticate(header, 0).is_ok();
+        assert!(ok(Some(&format!("Bearer {TOKEN}"))));
+        assert!(!ok(None));
+        assert!(!ok(Some(TOKEN)), "scheme is required");
+        assert!(!ok(Some("Bearer wrong-token-0000000000")));
+        assert!(!ok(Some(&format!("Bearer {TOKEN}x"))));
+        let caller = clients
+            .authenticate(Some(&format!("Bearer {TOKEN}")), 0)
+            .unwrap();
+        assert_eq!(caller.client(), "legacy");
+    }
+
+    #[test]
+    fn digest_compare_is_exact() {
+        let a = [7u8; 32];
+        let mut b = a;
+        assert!(constant_time_eq(&a, &b));
+        b[31] ^= 1;
+        assert!(!constant_time_eq(&a, &b));
     }
 
     /// Send one raw HTTP/1.1 request and return (status, body).
@@ -385,7 +398,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(AppState {
-            token: TOKEN.to_string(),
+            clients: Clients::legacy_only(TOKEN),
             allowed_hosts,
             shepherd: Shepherd::new(crate::testutil::FakeBackend::new(true)),
         });
@@ -400,7 +413,7 @@ mod tests {
         let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = held.local_addr().unwrap();
         let state = Arc::new(AppState {
-            token: TOKEN.to_string(),
+            clients: Clients::legacy_only(TOKEN),
             allowed_hosts: Vec::new(),
             shepherd: Shepherd::new(crate::testutil::FakeBackend::new(true)),
         });
