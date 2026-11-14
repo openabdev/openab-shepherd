@@ -753,6 +753,8 @@ The unit tests need no external daemon. The backend-neutral tool tests use an in
 The native integration tests (`native::tests`) run real programs on a PTY, so the
 build host needs `sh`, `cat`, `printf`, `env` and `ls`.
 
+The tool contract is pinned by `tests/tool_schema_snapshot.rs`. It compares the tool names and input schemas that `tools/list` reports with `tests/snapshots/tool_schemas.json`. A change to a tool name, argument, type, bound or argument description fails the test until the snapshot is regenerated with `UPDATE_SNAPSHOTS=1 cargo test --test tool_schema_snapshot` and committed in the same PR, so the contract change shows in review. The variable is ignored when `CI` is set. Result fields are not snapshotted: they are documented only as prose in [Tools](#tools), not in a machine-readable form.
+
 The operator end-to-end runbook, which drives real Devin and OpenCode panes through the MCP tools, is in [`docs/operator-e2e/`](operator-e2e/README.md).
 
 ## CI

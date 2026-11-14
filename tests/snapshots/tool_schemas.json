@@ -1,0 +1,189 @@
+{
+  "tools": [
+    {
+      "inputSchema": {
+        "properties": {
+          "choice": {
+            "enum": [
+              "allow_once",
+              "deny_once"
+            ],
+            "type": "string"
+          },
+          "terminal": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal",
+          "choice"
+        ],
+        "type": "object"
+      },
+      "name": "answer_dialog"
+    },
+    {
+      "inputSchema": {
+        "properties": {
+          "terminal": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal"
+        ],
+        "type": "object"
+      },
+      "name": "get_status"
+    },
+    {
+      "inputSchema": {
+        "properties": {
+          "terminal": {
+            "type": "string"
+          },
+          "timeout": {
+            "maximum": 60.0,
+            "minimum": 1.0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "terminal"
+        ],
+        "type": "object"
+      },
+      "name": "interrupt_pane"
+    },
+    {
+      "inputSchema": {
+        "properties": {
+          "all": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "list_panes"
+    },
+    {
+      "inputSchema": {
+        "properties": {
+          "lines": {
+            "default": 0,
+            "maximum": 10000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "terminal": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal"
+        ],
+        "type": "object"
+      },
+      "name": "read_output"
+    },
+    {
+      "inputSchema": {
+        "properties": {
+          "terminal": {
+            "description": "Pane name, as start_pane or list_panes returned it.",
+            "type": "string"
+          },
+          "timeout": {
+            "default": 2.0,
+            "maximum": 60.0,
+            "minimum": 0.0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "terminal"
+        ],
+        "type": "object"
+      },
+      "name": "remove_pane"
+    },
+    {
+      "inputSchema": {
+        "properties": {
+          "terminal": {
+            "description": "Pane name, as start_pane or list_panes returned it.",
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal",
+          "text"
+        ],
+        "type": "object"
+      },
+      "name": "send_input"
+    },
+    {
+      "inputSchema": {
+        "properties": {
+          "argv": {
+            "description": "Program and arguments; non-empty. Only when arbitrary commands are allowed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cwd": {
+            "description": "Working directory (absolute).",
+            "type": "string"
+          },
+          "env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra environment variables for an argv or line pane only (refused with profile): at most 32, names [A-Z_][A-Z0-9_]*, values under the same input rules (empty allowed; leading and trailing whitespace is trimmed). A backend may refuse protected names (the native backend refuses HOME, PATH, USER, LANG, TERM and DYLD_*/LD_*); a backend without per-run environments returns unsupported.",
+            "type": "object"
+          },
+          "line": {
+            "description": "Shell line run by sh -c. Only when arbitrary commands are allowed.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Pane name: 1-32 of a-z, 0-9, '-', '_', '.'. Optional; Shepherd picks one when it is missing.",
+            "type": "string"
+          },
+          "profile": {
+            "description": "Launch profile name, as list_panes shows it.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "start_pane"
+    },
+    {
+      "inputSchema": {
+        "properties": {
+          "terminal": {
+            "type": "string"
+          },
+          "timeout": {
+            "default": 30.0,
+            "maximum": 1800.0,
+            "minimum": 1.0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "terminal"
+        ],
+        "type": "object"
+      },
+      "name": "wait_status"
+    }
+  ]
+}
