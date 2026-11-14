@@ -16,6 +16,8 @@ pub(crate) mod status;
 pub(crate) mod term;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_output;
 
 pub use keys::KeyboardMode;
 pub(crate) use pty::{default_signals_on_exec, effective_uid, SPAWN_LOCK};
@@ -141,7 +143,9 @@ struct Pane {
     stopping: AtomicBool,
     /// Stops the reader. Set only once the leader is reaped, because a
     /// process exiting with output still queued on the terminal waits
-    /// (on macOS forever) for someone to read it.
+    /// (on macOS forever) for someone to read it. The parent's copy of the
+    /// slave stays open until the leader exits (issue #54), so macOS cannot
+    /// lose a quick program's output; the reaper closes it at the exit.
     shutdown: AtomicBool,
     reader: Mutex<Option<JoinHandle<()>>>,
 }
@@ -277,7 +281,11 @@ impl NativeBackend {
         cwd: String,
         spawned: pty::Spawned,
     ) -> Result<Arc<Pane>, BackendError> {
-        let pty::Spawned { master, mut child } = spawned;
+        let pty::Spawned {
+            master,
+            slave,
+            mut child,
+        } = spawned;
         let pid = child.id() as i32;
         #[cfg(test)]
         tests::LAST_SPAWN_PID.with(|last| last.set(pid));
@@ -358,7 +366,7 @@ impl NativeBackend {
                     .unwrap_or_else(PoisonError::into_inner)
                     .take();
                 if let Some(child) = child {
-                    reap(pane, child);
+                    reap(pane, child, slave);
                 }
             })
         };
@@ -1072,7 +1080,7 @@ fn read_loop(pane: Arc<Pane>) {
 /// to the group and descendants, up to 2 s, and `release`; during a removal
 /// or shutdown, it waits for that to `release`. Then it reaps the leader,
 /// under the tree lock, so no look for descendants runs on a freed pid.
-fn reap(pane: Arc<Pane>, mut child: Child) {
+fn reap(pane: Arc<Pane>, mut child: Child, slave: OwnedFd) {
     let (code, reaped) = match pty::wait_exited(pane.pid) {
         Ok(code) => (Some(code), false),
         Err(err) => {
@@ -1093,6 +1101,8 @@ fn reap(pane: Arc<Pane>, mut child: Child) {
             (code, true)
         }
     };
+    // The leader has exited: the parent's slave copy is no longer needed.
+    drop(slave);
     let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
     st.exited = true;
     pane.changed.notify_all();
