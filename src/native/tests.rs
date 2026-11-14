@@ -661,7 +661,9 @@ fn check_non_cloexec_descriptors_do_not_leak() {
         }
         result.unwrap()
     };
-    let pty::Spawned { master, mut child } = spawned;
+    let pty::Spawned {
+        master, mut child, ..
+    } = spawned;
     let started = Instant::now();
     let mut text = Vec::new();
     loop {

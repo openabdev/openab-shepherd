@@ -120,9 +120,13 @@ fn invalid(detail: impl Into<String>) -> BackendError {
 }
 
 /// A started child: the PTY master (non-blocking, close-on-exec) and the
-/// process, which is its own session and group leader (pgid = pid).
+/// process, which is its own session and group leader (pgid = pid). The
+/// parent's slave copy stays open in `slave` until the reaper sees the leader
+/// exit (issue #54: on macOS, closing it right after spawn can lose the
+/// output of a program that prints and exits at once).
 pub(crate) struct Spawned {
     pub master: OwnedFd,
+    pub slave: OwnedFd,
     pub child: Child,
 }
 
@@ -193,9 +197,10 @@ pub(crate) fn spawn_locked(
         command.pre_exec(move || child_setup(&plan));
     }
     let spawned = command.spawn();
-    // The Command holds the parent's copies of the slave until dropped.
+    // The Command holds the parent's copies of the slave until dropped. The
+    // original `slave` is kept (see `Spawned`); on a spawn error it drops
+    // with the early return below.
     drop(command);
-    drop(slave);
     let child = spawned.map_err(|err| {
         let kind = if err.kind() == io::ErrorKind::NotFound {
             ErrorKind::NotFound
@@ -204,7 +209,11 @@ pub(crate) fn spawn_locked(
         };
         fail(kind, format!("native: spawn {argv0} failed: {err}"), &err)
     })?;
-    Ok(Spawned { master, child })
+    Ok(Spawned {
+        master,
+        slave,
+        child,
+    })
 }
 
 /// Make `command`'s child start with default dispositions for the signals
