@@ -122,6 +122,7 @@ fn parse_block(lines: &[&str], title_index: usize) -> Result<ParsedDialog, Strin
     Ok(ParsedDialog {
         title: TITLE.to_string(),
         command: command.trim().to_string(),
+        tool: None,
         options,
         cursor,
     })

@@ -96,6 +96,10 @@ arbitrary commands, so `start_pane` starts nothing (see
   stderr.
 - Token variables: `OPENAB_SHEPHERD_TOKEN_FILE` (preferred) or `OPENAB_SHEPHERD_TOKEN`.
   Use one of them, not both.
+- `OPENAB_SHEPHERD_CLIENTS` (clients file) and `OPENAB_SHEPHERD_AUDIT_FILE` (audit
+  log): see [Clients, scopes and the audit log](#clients-scopes-and-the-audit-log).
+  A clients file without an audit file, or beside `OPENAB_SHEPHERD_TOKEN`, exits with
+  status 2.
 - A launch profiles file that is unreadable, inside a git repository, or invalid
   also exits with status 2.
 - An invalid `OPENAB_SHEPHERD_ALLOWED_HOSTS` entry also exits with status 2 (see
@@ -399,11 +403,25 @@ uses the status read before the send only if that read fails). A
 backend without it would get the check from Shepherd: the status read inside the pane lock
 must not be `blocked`, then the text is sent, still inside the lock.
 
+**A forged status.** A program controls the bytes it prints, so a pane can print an OSC 7501
+status itself (inside other output, split over reads, ended by any escape sequence, even on the
+alternate screen), and Shepherd cannot tell it from the real one. A forged `blocked` makes
+`send_input` refuse (the operator can still use `interrupt_pane`, and the next real status ends
+it). A forged `idle` or `done` over a permission dialog that is still on the screen would let
+`send_input` type into the dialog, so for a pane started from a launch profile `send_input`
+also reads the screen when the status is `idle` or `done`, and refuses with `refused` when the
+pane's own dialect recognizes a permission dialog there. This check is best effort: it is not
+atomic with the write, it does not cover `working`, a pane with no profile, a backend that cannot
+read the screen, or a dialog hidden behind the alternate screen, and `wait_status` still reports
+the forged state (a forged `done` reads as a finished turn). A pane has no rate limit on status
+changes. `answer_dialog` is not affected: it needs `blocked` with kind `permission` and a parsed
+dialog before it sends any key. See `src/native/tests_forged.rs`.
+
 ### answer_dialog
 
 1. Take the pane lock, then `get`: refuse unless `status.state` is `blocked` and
    `status.kind` is `permission`. Record the `turn` number.
-2. `read` (screen): parse the dialog. kiro-cli 3.1.0 (V3) reports
+2. `read` (screen): parse the dialog. kiro-cli 3.1.0 and 3.3.0 (V3) report
    `blocked`/`permission` before it has drawn the dialog, so the tool re-reads the
    screen every 200 ms (`RENDER_POLL_INTERVAL`) for up to 3 s (`RENDER_WAIT`, 16
    reads) until the dialog parses. Before each re-read it calls `get` and
@@ -682,7 +700,9 @@ text removes the rest of the text. Newlines and tabs are kept.
   match an entry in `OPENAB_SHEPHERD_ALLOWED_HOSTS` (empty by default, see
   [Behind tailscale serve](#behind-tailscale-serve)). Any other value gets HTTP 403,
   with no token check.
-- Bearer token: compared in constant time. A missing or wrong token gets HTTP 401.
+- Bearer token: compared in constant time. A missing, wrong or expired token gets
+  HTTP 401. With a clients file, each client has its own token and scopes (see
+  [Clients, scopes and the audit log](#clients-scopes-and-the-audit-log)).
 - Only `POST /mcp` is served. `GET` gets 405. Notifications get 202.
 - The listener binds the validated loopback address only. The server does not run
   `tailscale serve`, Funnel, or any other public listener.
@@ -723,6 +743,221 @@ Keep Funnel off for this port (`tailscale funnel` must not be enabled): Funnel
 publishes the listener to the internet, and only the bearer token would stand
 between it and the panes.
 
+## Clients, scopes and the audit log
+
+Without a clients file, Shepherd works as before: one token, full control (see
+[Migration](#migration-from-the-single-token)). A clients file gives each caller its
+own token, limits it to a list of scopes, and makes every state-changing call
+traceable in an audit log.
+
+### Clients file
+
+`OPENAB_SHEPHERD_CLIENTS` names a JSON file:
+
+```json
+{
+  "version": 1,
+  "allow_legacy_token": false,
+  "clients": [
+    {
+      "id": "ci-1",
+      "token_sha256": "<64 hex characters>",
+      "scopes": ["observe", "read", "start", "remove"],
+      "profiles": ["ci"],
+      "expires": 1798761600
+    }
+  ]
+}
+```
+
+- `version` must be `1`. `allow_legacy_token` is optional (default `false`).
+- `id`: 1 to 32 characters of `a-z`, `0-9` and `-`. It must be unique. `legacy` is
+  reserved.
+- `token_sha256`: the SHA-256 of the client's token, as 64 hex characters. The file
+  never holds a token. At most 256 clients.
+- `scopes`: a non-empty list of the scopes below, each at most once.
+- `profiles`: the launch profile names this client may start. Optional; missing or
+  empty means none. There is no "all profiles" entry.
+- `expires`: optional, Unix seconds. From that second on, the token is refused.
+- Unknown fields anywhere in the file are an error. The whole file is validated
+  before any of it is used; one bad entry stops startup with exit status 2.
+- File rules: the path is canonicalized, must be a regular file owned by the user
+  running Shepherd, with no group or other bits (mode 0600 or stricter; this is
+  stricter than the profiles file because it holds hashes), at most 1 MiB, and
+  outside the project folder and every git repository (same check as the token
+  file).
+- `OPENAB_SHEPHERD_AUDIT_FILE` is required when a clients file is set. Startup
+  refuses without it.
+
+A token looks like `osh_<id>_<64 hex characters>`, where `<id>` is the client's
+`id`. Shepherd picks the record by the id in the token, hashes the whole token with
+SHA-256 and compares the two 32-byte digests in constant time. An unknown id is
+compared against a fixed dummy digest, so response time does not show whether an id
+exists. The client name used for authorization and audit comes only from the matched
+record, never from a header. A bad, unknown or expired token gets HTTP 401, as
+before.
+
+### Scopes
+
+Scopes are an explicit list. No scope implies another and there is no wildcard.
+Everything not allowed is denied, and a tool with no scope mapping is denied.
+
+| Scope | Tools it allows |
+|---|---|
+| `observe` | `list_panes`, `get_status`, `wait_status` (metadata only) |
+| `read` | `read_output` |
+| `control` | `send_input`, `interrupt_pane` |
+| `start` | `start_pane` with a `profile` that is on the client's `profiles` list |
+| `start:arbitrary` | `start_pane` with `argv` or `line` |
+| `dialog` | `answer_dialog` |
+| `remove` | `remove_pane` |
+
+- A `start_pane` call that names a `profile` needs `start` and the profile on the
+  list. A call with `argv` or `line` (the key present counts, even as `null`) needs
+  `start:arbitrary`. `start:arbitrary` does not turn on `allow_arbitrary_command`:
+  the server setting is a separate ceiling, and both must allow it.
+- A client's scopes only narrow what the server and the profile already allow. They
+  never add a bypass mode, an environment variable or a directory.
+- A denied call is an MCP tool result with the error code `forbidden` (not an HTTP
+  403), and names the missing scope. `tools/list` shows a client only the tools it
+  has a scope for; this is a convenience, the check runs on every call.
+- `dialog` is kept apart on purpose: approving a permission dialog lets the agent
+  run what it asked for.
+
+### Audit log
+
+`OPENAB_SHEPHERD_AUDIT_FILE` is the path of a JSON Lines file. Without it nothing
+is recorded (only allowed when no clients file is set).
+
+- The file's directory must exist, be owned by the user running Shepherd, and have
+  no group or other bits (`mkdir -m 700`). The file is created with mode 0600, or an
+  existing one must be a regular file of that user with no group or other bits. The
+  path must be outside the project folder and every git repository. A symlink as the
+  last path part is refused.
+- The file is opened append-only. Each record is one `write`, under a mutex.
+  Records are numbered in order (`seq`), continuing from the last record already in
+  the file.
+- Fields of every record: `v` (format version, `1`), `seq`, `ts` (Unix seconds),
+  `ts_ms` (Unix milliseconds), `client` (the client id, or `system:watchdog` for the
+  watchdog's nudges), `tool`, `phase`, `prev` (reserved for a later hash chain, always
+  `null` now), and `recovered: true` on the first record after a torn tail.
+- `phase` is `intent` or `outcome` (`answer_dialog` and `start_pane` write both, and
+  the outcome has `intent_seq`), `call` (`send_input`, `remove_pane`,
+  `interrupt_pane`, written before the call), `outcome` only (the read tools, written
+  after), `denied` (the scope check refused it; `outcome` is `denied` and `reason`
+  says why), or `auth` (a failed authentication, with `reason` and `id_prefix`).
+- `outcome` is `ok`, `denied`, or `error:<code>` using the tool's error code.
+- Per-tool fields come from an allowlist; anything else is dropped:
+  - `start_pane`: `profile`, `cwd`, `pane` (name), `env_names` (variable names only),
+    and for `argv`: `program` (the file name of the first element), `argc` and
+    `argv_sha256`; for `line`: `line_len` and `line_sha256`.
+  - `send_input`: `pane`, `text_len`, `text_sha256`.
+  - `read_output`: `pane`, `lines`; the outcome adds `returned_lines` and
+    `returned_bytes`.
+  - `get_status`, `wait_status`, `interrupt_pane`, `remove_pane`: `pane`, and
+    `timeout` where the call has one. `list_panes`: `all`.
+  - `answer_dialog`: `pane`, `choice`; the outcome adds `highlight_len` and
+    `highlight_sha256` (the option that was highlighted), `moves`, `status_after`, and
+    on a refusal `screen_len` and `screen_sha256` (the screen the decision was based
+    on).
+  - Failed authentications: `id_prefix`, at most 16 characters of `a-z0-9-` from
+    the id the token claimed, never the secret. At most 20 are written per second;
+    the next record carries a `suppressed` count for the rest.
+- Never recorded: tokens, token hashes, the `Authorization` header, environment
+  values, request bodies, typed text, screen text, file contents. Typed text, `line`,
+  `argv` and screens appear only as a length and a SHA-256 digest.
+
+**Fail closed and fail open.** If the record that must come first cannot be written
+(disk full, I/O error; a file that was unlinked or renamed while Shepherd runs is not detected, because writes keep going to the old file), these tools are refused with the error code
+`audit_unavailable` and nothing is done: `start_pane`, `send_input`, `answer_dialog`
+and `remove_pane`. The watchdog's nudges follow the same rule. `interrupt_pane` and
+the read tools (`list_panes`, `get_status`, `wait_status`, `read_output`) go ahead.
+`interrupt_pane` stays open because it is how a person stops a runaway agent; it is
+still recorded when the write works. Failed writes are counted and reported on
+stderr at most once a minute. A full disk therefore stops state changes but not
+reading, interrupting, or answering a dialog in the terminal. A write failure after
+a call has run (an outcome line) cannot undo the call; it is counted only.
+
+**Torn tail.** A crash can leave the last line unfinished. At startup Shepherd
+notices that the file does not end in a newline, starts the next record on a new
+line, and marks it `recovered: true`. Readers should skip a line that is not valid
+JSON. Only the last 1 MiB of the file is read at startup to find the last `seq`.
+
+Audit space is availability: failed authentications (up to 20 a second) and read
+calls are written too, so a full disk stops the four state-changing tools. Put the
+file on a volume with room, and rotate it only by restarting Shepherd. Records are
+not fsynced, and `seq` restarts at 0 if the last 1 MiB holds no parsable `seq`.
+Digests of typed text are unsalted SHA-256, so short text can be guessed offline:
+treat the audit file as sensitive as the secrets typed into panes.
+
+There is no tool to read the log; read it on the host (`tail -f`, `jq`). The log is
+not rotated by Shepherd.
+
+### Migration from the single token
+
+- No clients file: nothing changes. The token from `OPENAB_SHEPHERD_TOKEN_FILE` (or
+  `OPENAB_SHEPHERD_TOKEN`) becomes the client `legacy`, with every scope and every
+  profile. It is audited only if `OPENAB_SHEPHERD_AUDIT_FILE` is set.
+- With a clients file, `OPENAB_SHEPHERD_TOKEN` (the token in the environment) is
+  refused at startup. `OPENAB_SHEPHERD_TOKEN_FILE` is also refused, unless the
+  clients file sets `"allow_legacy_token": true`. With that flag the old token keeps
+  working as `legacy` with every scope, and Shepherd prints a warning at startup.
+  Leaving the legacy token on beside scoped tokens cancels their limits, so use the
+  flag only while moving clients over, then remove the token file and the flag.
+- A clients file alone, with no token file, is valid: only the listed clients can
+  authenticate.
+
+### Operator recipe: a token and its hash
+
+```sh
+id=ci-1                                   # a-z, 0-9, '-'; the client's id
+secret=$(openssl rand -hex 32)            # 64 hex characters
+token="osh_${id}_${secret}"
+printf %s "$token" | shasum -a 256        # first field is token_sha256
+```
+
+Put the 64-character hash in the clients file, and give the token (not the hash) to
+the client, for example as the `Authorization: Bearer <token>` header of its MCP
+configuration. Do not leave the token in shell history or a file inside a repository.
+Use the same `printf %s`, not `echo`, so no newline is hashed.
+
+### Limits
+
+- **No pane ownership yet.** Every client with `control` or `remove` can act on
+  every pane, including panes another client started. `list_panes` shows every pane
+  to every client with `observe`. A client's `profiles` list limits what it can
+  start, not what it can touch.
+- **`control` is code execution within the pane's rights.** `send_input` types into
+  a coding agent, which can run commands as Shepherd's user, with the credentials
+  of that pane's profile. Give `control` only to clients you would trust with that.
+- **`read` can expose credentials.** A screen shows whatever the program printed,
+  including keys or tokens it echoed. `get_status` and `start_pane` results can
+  include `cwd` and the command line.
+- **`dialog` approves what the agent asked to do.**
+- **Revocation is restart-only.** The clients file is read once at startup. To
+  remove a client, edit the file and restart Shepherd. **A restart ends every pane**
+  (native panes are Shepherd's children). `SIGHUP` is not a reload: it is an exit
+  signal and ends every pane like `SIGINT` and `SIGTERM`. Use `expires` to bound a
+  token's life in the meantime.
+- The file holds hashes, so a leaked file does not reveal tokens, but a stolen live
+  token works until it expires or the server restarts.
+- A same-user local process can read the token and the files, and is out of scope.
+  The audit log is for accountability, not tamper-proofing: anyone who can write the
+  file can edit it.
+- Shepherd does not do TLS, mTLS, or trust identity headers from a front end.
+
+### Later phases (not in this release)
+
+Tracked in issue #4. None of these exist yet:
+
+- Pane ownership per client (`own` or `all`), `list_panes` filtered by owner, and a
+  `max_live_panes` limit per client.
+- A `dialog:deny` setting.
+- Reloading the clients file when its modification time changes, without a restart.
+- A `token` command (create, revoke, rotate) and an `audit` command (tail, verify).
+- A hash chain in the audit log (the `prev` field), rotation, and per-client rate
+  and concurrency limits.
+
 ## Tests
 
 On the remote build host:
@@ -738,6 +973,8 @@ The unit tests need no external daemon. The backend-neutral tool tests use an in
 `FakeBackend`, and the config tests run `git init` in a scratch directory, so `git` must be installed.
 The native integration tests (`native::tests`) run real programs on a PTY, so the
 build host needs `sh`, `cat`, `printf`, `env` and `ls`.
+
+The tool contract is pinned by `tests/tool_schema_snapshot.rs`. It compares the tool names and input schemas that `tools/list` reports with `tests/snapshots/tool_schemas.json`. A change to a tool name, argument, type, bound or argument description fails the test until the snapshot is regenerated with `UPDATE_SNAPSHOTS=1 cargo test --test tool_schema_snapshot` and committed in the same PR, so the contract change shows in review. The variable is ignored when `CI` is set. Result fields are not snapshotted: they are documented only as prose in [Tools](#tools), not in a machine-readable form.
 
 The operator end-to-end runbook, which drives real Devin and OpenCode panes through the MCP tools, is in [`docs/operator-e2e/`](operator-e2e/README.md).
 
@@ -941,13 +1178,25 @@ try to update itself at run time).
 
 ## Known limits (MVP scope)
 
-- **No multi-client authorization.** Any holder of the token has full control of every
-  pane.
+- **No per-pane ownership.** With the single token, any holder has full control of
+  every pane. With a clients file, scopes limit what a client may do, but a client
+  with `control` or `remove` can still act on every pane (see
+  [Clients, scopes and the audit log](#clients-scopes-and-the-audit-log)).
 - **Permission dialogs: text parsing, two layouts.** `answer_dialog` parses the dialog
-  from screen text, for the pane's agent. Kiro is tested only against kiro-cli 3.1.0
-  (V3 engine) shell permission dialogs, using the screen captured by the probe. Devin
+  from screen text, for the pane's agent. Kiro dialogs were measured on kiro-cli 3.3.0
+  (V3 engine); shell dialogs were also measured on 3.1.0. Devin
   is tested against the layouts measured on Devin CLI 3000.12.43 and 3000.12.57 for shell commands.
-  Other tools (fs_write, MCP), other programs, other versions, and `kind` values
+  Kiro on 3.3.0, parsed (tool name before the arrow must be `shell`, `fs_write`, `mcp` or
+  `web_fetch`; `answer_dialog` returns it as `tool`): `shell`, edit of an existing file
+  (`fs_write`), MCP tool call, web fetch. Refused on purpose: web search (no `<tool> → <command>`
+  line) and a command that wraps onto continuation lines (reason "wrapped command"), because
+  only one wrapped sample at 80 columns was captured and Enter and Down were not tried on it.
+  Not measured, so refused: new-file write, reads outside the workspace, `use_aws`,
+  subagent, `knowledge`, `thinking`, `todo`, any other tool name, and Down or Esc on web
+  fetch and web search. The OSC 7501 `kind` is `permission` for every tool, so it never
+  selects a parsing rule. The MCP dialog shows no arguments and the web fetch dialog shows
+  only the host; whether those may stay approvable remotely is an open design question,
+  not decided by the parser. Other programs, other versions, and `kind` values
   `question` or `auth` are untested or refused. `force` is never sent.
 - **Native: no restart survival.** Native panes are Shepherd's children; they end
   when Shepherd exits.

@@ -66,6 +66,11 @@ All panes act as one account. They share that account's quota. Revoking access m
 logging in again as the operator and replacing the Secret. Shepherd cannot revoke or
 rotate the credential for one pane.
 
+This is about the credential the coding CLI uses. Who may call Shepherd is a separate
+question: with a clients file, each caller has its own token, limited scopes and an
+audit trail, and `dialog` and `read` are separate scopes (see
+[operations.md](operations.md#clients-scopes-and-the-audit-log)).
+
 ## What Shepherd does and does not do
 
 Shepherd does:

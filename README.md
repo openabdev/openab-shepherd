@@ -122,6 +122,13 @@ Point the MCP client at `http://<loopback-address>:8765/mcp` with the header
 put it behind `tailscale serve` and allow that name, for example
 `OPENAB_SHEPHERD_ALLOWED_HOSTS=<mcp-host>.example-tailnet.ts.net:8445`.
 
+Two optional variables add named clients with limited scopes and an audit log:
+`OPENAB_SHEPHERD_CLIENTS` (path of the clients file, JSON, mode 0600, outside any git
+repository) and `OPENAB_SHEPHERD_AUDIT_FILE` (path of the audit log, JSON Lines, in a
+mode 0700 directory; required when a clients file is set). Without them, the single
+token keeps full control. See
+[Clients, scopes and the audit log](docs/operations.md#clients-scopes-and-the-audit-log).
+
 Every variable, profile field, tool argument, error code and bound is described in
 [docs/operations.md](docs/operations.md).
 
@@ -208,7 +215,7 @@ kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 - **Two dialog choices only.** `answer_dialog` answers `allow_once` or `deny_once`
   and nothing else. Other dialog kinds (`question`, `auth`) are not answered.
 - **Text-based dialog parsing.** The dialog is parsed from screen text. Measured
-  agents: kiro-cli 3.1.0 (V3 shell permission dialogs), Devin CLI 3000.12.43 and 3000.12.57
+  agents: kiro-cli 3.3.0 (V3 shell, edit, MCP and web fetch permission dialogs; web search and wrapped commands are refused; see docs/operations.md for the measured and not-measured kinds), Devin CLI 3000.12.43 and 3000.12.57
   (shell commands) and OpenCode v2.2.7 (shell and edit dialogs, see below). For OpenCode,
   `deny_once` is answered with Esc; `allow_once` presses Enter only when the styled
   screen cells show `Allow once` with a background that differs from the other two options, which match each other.

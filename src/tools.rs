@@ -17,6 +17,7 @@
 
 use crate::agent::{unmeasured, Agent, ParsedDialog};
 use crate::ansi::strip_terminal_escapes;
+use crate::audit::{self, Audit};
 use crate::backend::{
     dialog_kind, status_json, BackendError, ErrorKind, InputGuard, Key, KeysResult, RunSpec, State,
     StopHow, StyledScreen, TerminalBackend, TerminalInfo, TerminalRef, WaitReason, WaitResult,
@@ -94,6 +95,9 @@ pub struct Shepherd {
     /// How long the watchdog waits for a pane's lock before it skips the
     /// pane for this tick (see [`watchdog::LOCK_WAIT`]); tests shorten it.
     watchdog_lock_wait: Duration,
+    /// Where calls are recorded, when the operator set an audit file. `None`
+    /// records nothing.
+    audit: Option<Arc<Audit>>,
 }
 
 /// What this process knows about a pane a profile started, keyed by pane name.
@@ -129,7 +133,20 @@ impl Shepherd {
             panes: Arc::new(Mutex::new(HashMap::new())),
             watchdog: Arc::new(Mutex::new(HashMap::new())),
             watchdog_lock_wait: watchdog::LOCK_WAIT,
+            audit: None,
         }
+    }
+
+    /// Record calls to `audit`. Set before the watchdog starts, so its
+    /// nudges are recorded too.
+    pub fn with_audit(mut self, audit: Arc<Audit>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// The audit recorder, when one is configured.
+    pub fn audit(&self) -> Option<&Arc<Audit>> {
+        self.audit.as_ref()
     }
 
     #[cfg(test)]
@@ -384,6 +401,7 @@ impl Shepherd {
                     Some(guard),
                     Some(&pane_id),
                     Some(self.watchdog_lock_wait),
+                    Some(audit::WATCHDOG_ACTOR),
                 ) {
                     Ok(_) => {
                         // The send just returned: stamp it with a fresh
@@ -521,7 +539,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "send_input",
-            "description": "Type text into a pane and press Enter. Sendable when the pane is idle or done (kiro-cli stays in done after a turn). Input is trimmed and limited to 4096 bytes. Control characters (except TAB) are refused, not removed. While the program is blocked on a dialog, nothing is typed and the error code is pane_blocked, with kind saying which dialog (for example permission). Read the screen, then use answer_dialog. This tool never forces input.",
+            "description": "Type text into a pane and press Enter. Sendable when the pane is idle or done (kiro-cli stays in done after a turn). Input is trimmed and limited to 4096 bytes. Control characters (except TAB) are refused, not removed. While the program is blocked on a dialog, nothing is typed and the error code is pane_blocked, with kind saying which dialog (for example permission). Read the screen, then use answer_dialog. This tool never forces input. A pane reporting idle or done while its permission dialog is still on the screen is refused (refused).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -586,7 +604,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "answer_dialog",
-            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (tested on kiro-cli 3.1.0 V3 shell permission dialogs) or devin (Devin CLI 3000.12.43 and 3000.12.57 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses); opencode (OpenCode v2.2.7): deny_once sends Esc, which cancels like Reject, after the pane is blocked with kind permission and the screen shows the whole expected dialog; allow_once presses Enter only when the styled screen, read in the same step as the key, shows Allow once with a background that differs from both other options while those two share one background, compared as palette-or-truecolor values so it works with either (otherwise it is refused with no keys sent), and Always allow is never selected. A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
+            "description": "Answer a permission dialog in a pane that is blocked with kind permission: allow_once or deny_once. Rule-creating options are not offered. The tool reads the screen, waiting up to 3 s (re-reading every 200 ms) for the dialog to render, because kiro-cli reports blocked before it draws the dialog; between reads it checks the pane is still blocked with kind permission in the same turn, and if the dialog never renders it refuses without sending anything. It then moves the cursor with up/down keys, reads the screen again until the cursor is confirmed on the chosen option, checks again that the pane is still blocked with kind permission in the same turn, and only then presses Enter. On any mismatch it sends nothing more and returns what it saw. Other Shepherd calls that type into the same pane wait until it finishes. A person at the terminal or another client of the terminal backend can still act between the last check and Enter when the terminal backend has no conditional key press; the native backend checks the status and presses Enter in one step. The dialog is parsed from screen text. The dialect is the pane's agent, set by the launch profile that started it: kiro (measured on kiro-cli 3.3.0 V3 for shell, fs_write, mcp and web_fetch permission dialogs; shell also on 3.1.0) or devin (Devin CLI 3000.12.43 and 3000.12.57 shell command dialogs; Devin never selects Bypass mode, and a highlight that does not land on the choice sends Esc, which cancels, then refuses); opencode (OpenCode v2.2.7): deny_once sends Esc, which cancels like Reject, after the pane is blocked with kind permission and the screen shows the whole expected dialog; allow_once presses Enter only when the styled screen, read in the same step as the key, shows Allow once with a background that differs from both other options while those two share one background, compared as palette-or-truecolor values so it works with either (otherwise it is refused with no keys sent), and Always allow is never selected. A pane not started from a profile by this server is refused with no keys sent. Follow with wait_status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -938,12 +956,25 @@ fn send_text_guarded(
     extra_guard: Option<InputGuard>,
     expected_pane_id: Option<&str>,
 ) -> Result<Value, ToolError> {
-    send_text_within(sh, terminal, text, extra_guard, expected_pane_id, None)
+    send_text_within(
+        sh,
+        terminal,
+        text,
+        extra_guard,
+        expected_pane_id,
+        None,
+        None,
+    )
 }
 
 /// `send_text_guarded` with an optional bound on the wait for the pane lock:
 /// a lock still held when `lock_wait` runs out is a `pane_busy` refusal and
 /// nothing is sent. `None` waits as every other tool does.
+///
+/// `audit_actor` is set by a caller that does not come through `mcp::call_tool`
+/// (the watchdog), which records MCP calls itself: the send is then recorded
+/// as a `send_input` by that actor, before it, and is refused when the record
+/// cannot be written. This adds no behaviour to the send itself.
 fn send_text_within(
     sh: &Shepherd,
     terminal: &str,
@@ -951,7 +982,16 @@ fn send_text_within(
     extra_guard: Option<InputGuard>,
     expected_pane_id: Option<&str>,
     lock_wait: Option<Duration>,
+    audit_actor: Option<&str>,
 ) -> Result<Value, ToolError> {
+    if let (Some(actor), Some(audit)) = (audit_actor, sh.audit()) {
+        let mut args = Args::new();
+        args.insert("terminal".into(), json!(terminal));
+        args.insert("text".into(), json!(text));
+        audit
+            .before(actor, "send_input", &args)
+            .map_err(|unavailable| unavailable.to_tool_error())?;
+    }
     let (_guard, pane, now) = lock_pane_within(sh, terminal, lock_wait)?;
     // A caller that observed a specific pane (the watchdog) can pin the
     // send to that pane's id: if the name was reused while waiting for
@@ -974,6 +1014,31 @@ fn send_text_within(
             "refused by the Devin mode-switch rule: /yolo can switch Devin into Bypass mode, which Shepherd never allows; nothing was sent",
         )
         .with("terminal", terminal));
+    }
+    // A program controls the bytes it prints, so it can report idle or done
+    // (OSC 7501) while its permission dialog is still on the screen. Where the
+    // pane's dialect is known, a status that says idle or done is cross-checked
+    // against the screen; a recognized dialog there refuses the send.
+    if let Some(agent) = sh.agent_of(terminal) {
+        if now
+            .status
+            .as_ref()
+            .is_some_and(|s| matches!(s.state, State::Idle | State::Done))
+        {
+            // A backend that cannot read the screen cannot be cross-checked.
+            if let Ok(screen) = read_screen(sh, &pane, terminal) {
+                if screen_shows_permission_dialog(agent, &screen) {
+                    return Err(ToolError::new(
+                        "refused",
+                        format!(
+                            "{terminal} reports idle or done, but its screen still shows a permission dialog, so the status may be forged; nothing was typed. Read the screen with read_output; interrupt_pane can stop the program"
+                        ),
+                    )
+                    .with("terminal", terminal)
+                    .with("status", status_json(now.status.as_ref())));
+                }
+            }
+        }
     }
     // Idle and done are both sendable; a blocked program is never typed into.
     let guard = match extra_guard {
@@ -1047,6 +1112,14 @@ fn send_text_within(
             Err(pane_blocked(terminal, blocked_kind, detail))
         }
         Err(err) => Err(backend_failure(Some(terminal), err)),
+    }
+}
+
+/// Whether `screen` shows a permission dialog the agent's parser recognizes.
+fn screen_shows_permission_dialog(agent: Agent, screen: &str) -> bool {
+    match agent {
+        Agent::OpenCode => opencode_dialog::parse(screen).is_ok(),
+        Agent::Kiro | Agent::Devin => agent.parse_dialog(screen).is_ok(),
     }
 }
 
@@ -1665,7 +1738,7 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     if agent == Agent::Devin {
         sh.mark_answered(&terminal);
     }
-    Ok(json!({
+    let mut answer = json!({
         "terminal": terminal,
         "agent": agent.as_str(),
         "choice": choice.as_str(),
@@ -1675,7 +1748,11 @@ fn answer_dialog(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         "options": first.options,
         "moves": moves,
         "keys_result": result.to_json(),
-    }))
+    });
+    if let Some(tool) = &first.tool {
+        answer["tool"] = json!(tool);
+    }
+    Ok(answer)
 }
 
 /// OpenCode (v2.2.7). `deny_once` sends Esc, which cancels exactly like Reject
@@ -2304,6 +2381,84 @@ mod tests {
         assert_eq!(err.data["kind"], "permission");
         assert_eq!(fake.calls(), ["get", "get"]);
         assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    /// Issue #62: a status of idle or done is cross-checked against the screen
+    /// with the pane's own dialect; a recognized permission dialog refuses.
+    fn send_over_screen(
+        agent: Agent,
+        state: State,
+        screen: Option<String>,
+    ) -> (Result<Value, ToolError>, Vec<(String, bool)>) {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", state, None);
+        fake.state.lock().unwrap().screen = screen;
+        let sh = shepherd(&fake);
+        sh.assume_agent("work", agent);
+        let out = call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "work", "text": "next"})),
+        );
+        let sent = fake.state.lock().unwrap().sent.clone();
+        (out, sent)
+    }
+
+    #[test]
+    fn idle_or_done_over_each_agents_permission_dialog_refuses_send_input() {
+        let screens = [
+            (Agent::Kiro, crate::dialog::fixtures::dialog_on_allow()),
+            (
+                Agent::Devin,
+                crate::devin_dialog::fixtures::dialog_with_cursor_on(0),
+            ),
+            (
+                Agent::OpenCode,
+                crate::opencode_dialog::fixtures::shell_dialog(),
+            ),
+        ];
+        for (agent, screen) in screens {
+            for state in [State::Idle, State::Done] {
+                let (out, sent) = send_over_screen(agent, state.clone(), Some(screen.clone()));
+                let err = out.unwrap_err();
+                assert_eq!(err.data["error"], "refused", "{agent:?} {state:?}");
+                assert_eq!(err.data["terminal"], "work");
+                assert!(sent.is_empty(), "{agent:?} {state:?}: {sent:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn idle_or_done_with_no_dialog_on_the_screen_still_sends() {
+        for agent in [Agent::Kiro, Agent::Devin, Agent::OpenCode] {
+            for state in [State::Idle, State::Done] {
+                let (out, sent) = send_over_screen(agent, state, Some("> ready\n".to_string()));
+                out.unwrap();
+                assert_eq!(sent.len(), 1, "{agent:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_backend_that_cannot_read_the_screen_is_not_cross_checked() {
+        let (out, sent) = send_over_screen(Agent::Kiro, State::Idle, None);
+        out.unwrap();
+        assert_eq!(sent.len(), 1);
+    }
+
+    #[test]
+    fn a_pane_with_no_dialect_is_not_cross_checked() {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", State::Idle, None);
+        fake.state.lock().unwrap().screen = Some(crate::dialog::fixtures::dialog_on_allow());
+        let sh = shepherd(&fake);
+        call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "work", "text": "next"})),
+        )
+        .unwrap();
+        assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
     }
 
     #[test]
@@ -3041,6 +3196,8 @@ mod tests {
             state: State::Idle,
             kind: None,
         });
+        // The denied dialog is gone from the screen.
+        fake.state.lock().unwrap().screen = Some("> ready\n".to_string());
         let sent = call(
             &sh,
             "send_input",

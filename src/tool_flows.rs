@@ -140,6 +140,8 @@ fn send_input_passes_the_text_with_a_blocked_guard() {
     let backend = scripted(vec![
         get_at("t1"),
         get_at("t1"),
+        // The idle or done status is cross-checked against the screen (issue 62).
+        read_ok(plain_screen("> ready\n")),
         send_ok(SendResult {
             turn: Some(3),
             started: Some(true),
@@ -153,9 +155,9 @@ fn send_input_passes_the_text_with_a_blocked_guard() {
     );
     let log = backend.finish();
     assert_eq!(out["isError"], false);
-    assert_eq!(methods(&log), ["get", "get", "send"]);
+    assert_eq!(methods(&log), ["get", "get", "read", "send"]);
     assert_eq!(
-        log[2],
+        log[3],
         Call::Send {
             id: "t1".to_string(),
             text: "echo hi".to_string(),
@@ -427,6 +429,8 @@ fn send_input_is_sent_when_pane_is_done() {
     let backend = scripted(vec![
         get_at("t8"),
         get_at("t8"),
+        // The idle or done status is cross-checked against the screen (issue 62).
+        read_ok(plain_screen("> ready\n")),
         send_ok(SendResult {
             turn: Some(2),
             started: Some(true),
@@ -442,13 +446,37 @@ fn send_input_is_sent_when_pane_is_done() {
     assert_eq!(out["isError"], false);
     assert_eq!(out["structuredContent"]["status"], "done");
     assert_eq!(
-        log[2],
+        log[3],
         Call::Send {
             id: "t8".to_string(),
             text: "Please retry".to_string(),
             guard: guard_blocked(),
         }
     );
+}
+
+/// Issue #62: the pane says done, the screen shows its permission dialog. No
+/// send reaches the backend, and the refusal is in Shepherd's words.
+#[test]
+fn send_input_refuses_a_done_pane_whose_screen_shows_the_dialog() {
+    let allow = dialog_on_allow();
+    let backend = scripted(vec![get_at("t8"), get_at("t8"), screen(&allow)]);
+    let out = run_tool(
+        &shepherd(&backend),
+        "send_input",
+        json!({"terminal": "work", "text": "Please retry"}),
+    );
+    let log = backend.finish();
+    assert_eq!(methods(&log), ["get", "get", "read"]);
+    assert_eq!(out["isError"], true);
+    let data = &out["structuredContent"];
+    assert_eq!(data["error"], "refused");
+    assert_eq!(data["terminal"], "work");
+    assert!(data["message"]
+        .as_str()
+        .unwrap()
+        .contains("screen still shows a permission dialog"));
+    assert_no_vendor_strings(&out);
 }
 
 #[test]
@@ -767,6 +795,8 @@ fn backend_ids_do_not_reach_panes_through_mcp() {
         get_at("t8"),
         get_at("t8"),
         get_at("t8"),
+        // The idle or done status is cross-checked against the screen (issue 62).
+        read_ok(plain_screen("> ready\n")),
         send_ok(SendResult {
             turn: Some(2),
             started: Some(true),
@@ -903,6 +933,8 @@ fn send_input_refused_while_blocked_reports_pane_blocked_in_shepherd_words() {
     let backend = scripted(vec![
         get_at("t8"),
         get_at("t8"),
+        // The idle or done status is cross-checked against the screen (issue 62).
+        read_ok(plain_screen("> ready\n")),
         fail("send", ErrorKind::Blocked { kind: None }, hint),
         blocked_get("permission"),
     ]);
@@ -913,8 +945,8 @@ fn send_input_refused_while_blocked_reports_pane_blocked_in_shepherd_words() {
     );
     let log = backend.finish();
     // The refusal does not name the dialog, so a get after it asks for the kind.
-    assert_eq!(methods(&log), ["get", "get", "send", "get"]);
-    assert!(matches!(&log[2], Call::Send { id, guard, .. }
+    assert_eq!(methods(&log), ["get", "get", "read", "send", "get"]);
+    assert!(matches!(&log[3], Call::Send { id, guard, .. }
         if id == "t8" && *guard == guard_blocked()));
     assert_eq!(out["isError"], true);
     let data = &out["structuredContent"];
@@ -989,6 +1021,8 @@ fn every_backend_error_kind_reaches_mcp_as_a_shepherd_code() {
     let backend = scripted(vec![
         get_at("t8"),
         get_at("t8"),
+        // The idle or done status is cross-checked against the screen (issue 62).
+        read_ok(plain_screen("> ready\n")),
         fail("send", ErrorKind::Blocked { kind: None }, DETAIL),
         blocked_get("permission"),
     ]);
@@ -1026,7 +1060,8 @@ fn every_backend_error_kind_reaches_mcp_as_a_shepherd_code() {
             "send",
             "send_input",
             json!({"terminal": "work", "text": "hi"}),
-            lock_gets(),
+            // The idle or done status is cross-checked against the screen.
+            [lock_gets(), vec![read_ok(plain_screen("> ready\n"))]].concat(),
         ),
         (
             "interrupt",
@@ -1155,6 +1190,8 @@ fn tool_definitions_and_results_carry_no_backend_vocabulary() {
         // send_input, sent
         get_at("t8"),
         get_at("t8"),
+        // The idle or done status is cross-checked against the screen (issue 62).
+        read_ok(plain_screen("> ready\n")),
         send_ok(SendResult {
             turn: Some(2),
             started: Some(true),
@@ -1294,6 +1331,8 @@ fn unknown_backend_words_reach_mcp_as_other() {
         // send_input: status
         get_at("t8"),
         get_at("t8"),
+        // The idle or done status is cross-checked against the screen (issue 62).
+        read_ok(plain_screen("> ready\n")),
         send_ok(SendResult {
             turn: Some(2),
             started: Some(true),
@@ -1359,6 +1398,8 @@ fn unknown_backend_dialog_kinds_reach_mcp_as_other() {
         // send_input refused by the backend; the kind comes from the get after it
         get_at("t8"),
         get_at("t8"),
+        // The idle or done status is cross-checked against the screen (issue 62).
+        read_ok(plain_screen("> ready\n")),
         fail("send", ErrorKind::Blocked { kind: None }, "blocked"),
         odd_blocked(),
     ]);
