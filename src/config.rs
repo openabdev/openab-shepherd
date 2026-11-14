@@ -213,6 +213,11 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let audit_file = non_empty(lookup(AUDIT_FILE_ENV)).map(PathBuf::from);
+    if lookup(CLIENTS_ENV).is_some_and(|v| v.is_empty()) {
+        return Err(ConfigError(format!(
+            "{CLIENTS_ENV} is set but empty: unset it to use the single token, or give the clients file path"
+        )));
+    }
     let Some(clients_path) = non_empty(lookup(CLIENTS_ENV)) else {
         let token = load_token(lookup, project_dir)?;
         let clients = Clients::legacy_only(&token);
@@ -832,6 +837,18 @@ mod issue4_pr1_loader {
         ];
         pairs.extend_from_slice(extra);
         load_config(env_from(&pairs), "127.0.0.1", 8765, project)
+    }
+
+    #[test]
+    fn an_empty_clients_variable_is_refused() {
+        let project = TempDir::new("i4-empty-clients");
+        let err = load(
+            "",
+            project.path(),
+            &[(TOKEN_ENV, "test-token-0123456789abcdef")],
+        )
+        .unwrap_err();
+        assert!(err.0.contains("empty"), "{err}");
     }
 
     #[test]

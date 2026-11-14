@@ -38,6 +38,9 @@ pub const TOKEN_PREFIX: &str = "osh_";
 const SECRET_HEX_LEN: usize = 64;
 const MAX_ID_LEN: usize = 32;
 const MAX_TOKEN_LEN: usize = TOKEN_PREFIX.len() + MAX_ID_LEN + 1 + SECRET_HEX_LEN;
+/// Longest bearer value hashed at all. A legacy token may be longer than an
+/// `osh_` token (the legacy loader only sets a minimum), so this is generous.
+const MAX_BEARER_LEN: usize = 4096;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_CLIENTS: usize = 256;
 const MAX_PROFILES: usize = 64;
@@ -373,6 +376,7 @@ impl Clients {
         }
         let root: Value = serde_json::from_str(text)
             .map_err(|e| err(&format!("clients file is not valid JSON: {e}")))?;
+        reject_duplicate_keys(text)?;
         let root = root
             .as_object()
             .ok_or_else(|| err("clients file must be a JSON object"))?;
@@ -427,11 +431,17 @@ impl Clients {
         let Some(token) = header.strip_prefix("Bearer ") else {
             return (Err(fail("malformed", String::new())), 0);
         };
-        if token.is_empty() || token.len() > MAX_TOKEN_LEN {
+        if token.is_empty() || token.len() > MAX_BEARER_LEN {
             return (Err(fail("malformed", String::new())), 0);
         }
         let digest = sha256(token.as_bytes());
-        let claimed = parse_token(token);
+        // Only an `osh_` token has a bounded shape; a longer value can still be
+        // the legacy token, so it skips the id lookup instead of failing here.
+        let claimed = if token.len() > MAX_TOKEN_LEN {
+            None
+        } else {
+            parse_token(token)
+        };
         let id_prefix = claimed.map(id_prefix).unwrap_or_default();
         let record = claimed.and_then(|id| self.clients.iter().find(|c| c.id == id));
         let expected = record.map_or(&DUMMY_DIGEST, |c| &c.token_sha256);
@@ -457,6 +467,54 @@ impl Clients {
         };
         (Err(fail(reason, id_prefix)), compares)
     }
+}
+
+/// Fail on a key repeated inside one JSON object (serde_json keeps the last).
+/// The text has already parsed as JSON, so this only tracks nesting and strings.
+fn reject_duplicate_keys(text: &str) -> Result<(), ConfigError> {
+    // One entry per open container: Some(keys seen, next string is a key) for an object.
+    let mut stack: Vec<Option<(BTreeSet<String>, bool)>> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => stack.push(Some((BTreeSet::new(), true))),
+            b'[' => stack.push(None),
+            b'}' | b']' => {
+                stack.pop();
+            }
+            b',' => {
+                if let Some(Some((_, expect_key))) = stack.last_mut() {
+                    *expect_key = true;
+                }
+            }
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if let Some(Some((keys, expect_key))) = stack.last_mut() {
+                    if *expect_key {
+                        *expect_key = false;
+                        let key: String = serde_json::from_str(
+                            &text[start..=i.min(bytes.len() - 1)],
+                        )
+                        .map_err(|e| err(&format!("clients file is not valid JSON: {e}")))?;
+                        if !keys.insert(key.clone()) {
+                            return Err(err(&format!("clients file: duplicate key {key:?}")));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 fn legacy_client(token: &str) -> Client {
@@ -909,8 +967,10 @@ mod tests {
             (wrong.reason, wrong.id_prefix.as_str()),
             ("bad_secret", "alice")
         );
-        let long = "x".repeat(MAX_TOKEN_LEN + 1);
+        let long = "x".repeat(MAX_BEARER_LEN + 1);
         assert_eq!(fail(Some(&bearer(&long))).reason, "malformed");
+        let medium = "x".repeat(MAX_TOKEN_LEN + 1);
+        assert_eq!(fail(Some(&bearer(&medium))).reason, "malformed");
     }
 
     #[test]
@@ -971,6 +1031,16 @@ mod tests {
     }
 
     #[test]
+    fn a_long_legacy_token_still_authenticates() {
+        let long = "L".repeat(200);
+        let t = Clients::legacy_only(&long);
+        let caller = t.authenticate(Some(&bearer(&long)), 0).unwrap();
+        assert_eq!(caller, Caller::legacy());
+        let wrong = "L".repeat(199);
+        assert!(t.authenticate(Some(&bearer(&wrong)), 0).is_err());
+    }
+
+    #[test]
     fn legacy_token_authenticates_as_legacy_with_every_scope() {
         let t = Clients::legacy_only("a-long-legacy-token-value-0123456789");
         let caller = t
@@ -1020,6 +1090,17 @@ mod tests {
         let mut bad = good.clone();
         bad["token"] = json!("osh_x");
         assert!(parse_err(&file_text(json!([bad]))).contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_duplicate_json_keys() {
+        let dup_top = r#"{"version":1,"version":1,"clients":[]}"#;
+        assert!(parse_err(dup_top).contains("duplicate key"));
+        let dup_scopes = r#"{"version":1,"clients":[{"id":"a","token_sha256":"x","scopes":["read"],"scopes":["remove"]}]}"#;
+        assert!(parse_err(dup_scopes).contains("duplicate key"));
+        // The same key in two sibling objects, and a key text inside a value, are fine.
+        let ok = r#"{"version":1,"clients":[{"id":"a, \"id\""},{"id":"b"}]}"#;
+        assert!(!parse_err(ok).contains("duplicate key"));
     }
 
     #[test]

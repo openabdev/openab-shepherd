@@ -854,7 +854,7 @@ is recorded (only allowed when no clients file is set).
   `argv` and screens appear only as a length and a SHA-256 digest.
 
 **Fail closed and fail open.** If the record that must come first cannot be written
-(disk full, file removed, I/O error), these tools are refused with the error code
+(disk full, I/O error; a file that was unlinked or renamed while Shepherd runs is not detected, because writes keep going to the old file), these tools are refused with the error code
 `audit_unavailable` and nothing is done: `start_pane`, `send_input`, `answer_dialog`
 and `remove_pane`. The watchdog's nudges follow the same rule. `interrupt_pane` and
 the read tools (`list_panes`, `get_status`, `wait_status`, `read_output`) go ahead.
@@ -868,6 +868,13 @@ a call has run (an outcome line) cannot undo the call; it is counted only.
 notices that the file does not end in a newline, starts the next record on a new
 line, and marks it `recovered: true`. Readers should skip a line that is not valid
 JSON. Only the last 1 MiB of the file is read at startup to find the last `seq`.
+
+Audit space is availability: failed authentications (up to 20 a second) and read
+calls are written too, so a full disk stops the four state-changing tools. Put the
+file on a volume with room, and rotate it only by restarting Shepherd. Records are
+not fsynced, and `seq` restarts at 0 if the last 1 MiB holds no parsable `seq`.
+Digests of typed text are unsalted SHA-256, so short text can be guessed offline:
+treat the audit file as sensitive as the secrets typed into panes.
 
 There is no tool to read the log; read it on the host (`tail -f`, `jq`). The log is
 not rotated by Shepherd.
