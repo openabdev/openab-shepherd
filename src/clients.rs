@@ -295,7 +295,7 @@ pub fn authorize(caller: &Caller, tool: &str, args: &Args) -> Result<(), Denied>
 }
 
 /// Why a request was not authenticated. The HTTP layer answers 401 for all of
-/// them; the audit file keeps the reason and a short piece of the claimed id.
+/// them; stderr gets the reason and a short piece of the claimed id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthFailure {
     pub reason: &'static str,
