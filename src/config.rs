@@ -3,6 +3,8 @@
 //! Every check runs before the server opens a listening socket. A failed check
 //! makes the binary exit with status 2 and print the reason on stderr.
 
+use crate::audit::AUDIT_FILE_ENV;
+use crate::clients::{Clients, CLIENTS_ENV};
 use std::fmt;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -71,7 +73,13 @@ impl fmt::Display for AllowedHost {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// The legacy bearer token; empty when a clients file is set without one.
     pub token: String,
+    /// Who may call: the clients file, or the legacy token as client `legacy`.
+    pub clients: Clients,
+    /// `OPENAB_SHEPHERD_AUDIT_FILE`; the binary opens it. Always set when a
+    /// clients file is.
+    pub audit_file: Option<PathBuf>,
     pub backend: BackendChoice,
     pub bind: SocketAddr,
     pub allowed_hosts: Vec<AllowedHost>,
@@ -94,10 +102,12 @@ where
         return Err(ConfigError("port 0 is not allowed".to_string()));
     }
     let backend = load_backend(&lookup)?;
-    let token = load_token(&lookup, project_dir)?;
+    let (token, clients, audit_file) = load_identity(&lookup, project_dir)?;
     let allowed_hosts = parse_allowed_hosts(lookup(ALLOWED_HOSTS_ENV).as_deref().unwrap_or(""))?;
     Ok(Config {
         token,
+        clients,
+        audit_file,
         backend,
         bind: SocketAddr::new(ip, port),
         allowed_hosts,
@@ -189,6 +199,42 @@ pub fn check_bind_host(host: &str) -> Result<IpAddr, ConfigError> {
 
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
+}
+
+/// The token(s), the clients and the audit path. Without a clients file this is
+/// today's single token, as client `legacy`. With one, the audit path is
+/// required, `OPENAB_SHEPHERD_TOKEN` is refused, and a legacy token file is
+/// refused unless the clients file sets `allow_legacy_token`.
+fn load_identity<F>(
+    lookup: &F,
+    project_dir: &Path,
+) -> Result<(String, Clients, Option<PathBuf>), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let audit_file = non_empty(lookup(AUDIT_FILE_ENV)).map(PathBuf::from);
+    let Some(clients_path) = non_empty(lookup(CLIENTS_ENV)) else {
+        let token = load_token(lookup, project_dir)?;
+        let clients = Clients::legacy_only(&token);
+        return Ok((token, clients, audit_file));
+    };
+    if non_empty(lookup(TOKEN_ENV)).is_some() {
+        return Err(ConfigError(format!(
+            "{TOKEN_ENV} cannot be used beside {CLIENTS_ENV}: put the token in the clients file, or use {TOKEN_FILE_ENV} with \"allow_legacy_token\": true"
+        )));
+    }
+    if audit_file.is_none() {
+        return Err(ConfigError(format!(
+            "{AUDIT_FILE_ENV} is required when {CLIENTS_ENV} is set"
+        )));
+    }
+    let clients = Clients::load(Path::new(&clients_path), project_dir)?;
+    if non_empty(lookup(TOKEN_FILE_ENV)).is_none() {
+        return Ok((String::new(), clients, audit_file));
+    }
+    let token = load_token(lookup, project_dir)?;
+    let clients = clients.with_legacy_token(&token)?;
+    Ok((token, clients, audit_file))
 }
 
 fn load_token<F>(lookup: &F, project_dir: &Path) -> Result<String, ConfigError>
@@ -682,6 +728,249 @@ mod tests {
                     .starts_with("OPENAB_SHEPHERD_ALLOWED_HOSTS: invalid entry"),
                 "{value}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn without_a_clients_file_the_token_is_client_legacy() {
+        let dir = TempDir::new("legacy-clients");
+        let config = load_config(
+            env_from(&[(TOKEN_ENV, GOOD_TOKEN)]),
+            "127.0.0.1",
+            8765,
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(config.clients, Clients::legacy_only(GOOD_TOKEN));
+        assert_eq!(config.audit_file, None);
+    }
+
+    #[test]
+    fn a_clients_file_needs_the_audit_file_and_refuses_the_token_env() {
+        let dir = TempDir::new("clients-conflicts");
+        let outside = TempDir::new("clients-outside");
+        let file = outside.path().join("clients.json");
+        fs::write(&file, r#"{"version":1,"clients":[]}"#).unwrap();
+        fs::set_permissions(&file, Permissions::from_mode(0o600)).unwrap();
+        let file = file.to_string_lossy().to_string();
+        let audit = outside
+            .path()
+            .join("audit.jsonl")
+            .to_string_lossy()
+            .to_string();
+        let load =
+            |pairs: &[(&str, &str)]| load_config(env_from(pairs), "127.0.0.1", 8765, dir.path());
+
+        let err = load(&[(CLIENTS_ENV, file.as_str())]).unwrap_err();
+        assert!(err.0.contains(AUDIT_FILE_ENV), "{err}");
+        let err = load(&[
+            (CLIENTS_ENV, file.as_str()),
+            (AUDIT_FILE_ENV, audit.as_str()),
+            (TOKEN_ENV, GOOD_TOKEN),
+        ])
+        .unwrap_err();
+        assert!(err.0.contains(TOKEN_ENV), "{err}");
+        let config = load(&[
+            (CLIENTS_ENV, file.as_str()),
+            (AUDIT_FILE_ENV, audit.as_str()),
+        ])
+        .unwrap();
+        assert!(config.token.is_empty());
+        assert!(!config.clients.has_legacy());
+    }
+}
+
+/// Issue #4, PR 1: the startup checks for the clients file, the audit path and
+/// the legacy token beside it. Run with `cargo test issue4_pr1`.
+#[cfg(test)]
+mod issue4_pr1_loader {
+    use super::*;
+    use crate::clients::{sha256_hex, Scope};
+    use crate::testutil::{git_init, TempDir};
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::fs::Permissions;
+
+    const LEGACY: &str = "legacy-token-0123456789abcdef";
+    const SECRET: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+
+    fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key: &str| map.get(key).cloned()
+    }
+
+    fn client(id: &str) -> Value {
+        json!({"id": id,
+               "token_sha256": sha256_hex(format!("osh_{id}_{SECRET}").as_bytes()),
+               "scopes": ["observe"]})
+    }
+
+    fn write(dir: &Path, name: &str, text: &str, mode: u32) -> String {
+        let path = dir.join(name);
+        fs::write(&path, text).unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(mode)).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    fn file(clients: Value) -> String {
+        json!({"version": 1, "clients": clients}).to_string()
+    }
+
+    /// Load with a clients file and an audit path set, plus `extra` variables.
+    fn load(
+        clients_path: &str,
+        project: &Path,
+        extra: &[(&str, &str)],
+    ) -> Result<Config, ConfigError> {
+        let audit = project.join("audit.jsonl").to_string_lossy().to_string();
+        let mut pairs = vec![
+            (CLIENTS_ENV, clients_path),
+            (AUDIT_FILE_ENV, audit.as_str()),
+        ];
+        pairs.extend_from_slice(extra);
+        load_config(env_from(&pairs), "127.0.0.1", 8765, project)
+    }
+
+    #[test]
+    fn a_strict_clients_file_loads_and_names_its_clients() {
+        let dir = TempDir::new("i4-loader-ok");
+        let project = TempDir::new("i4-loader-project");
+        let path = write(dir.path(), "c.json", &file(json!([client("alice")])), 0o600);
+        let config = load(&path, project.path(), &[]).unwrap();
+        assert_eq!(config.clients.clients().len(), 1);
+        assert_eq!(config.clients.clients()[0].id, "alice");
+        assert!(config.clients.clients()[0].scopes.contains(&Scope::Observe));
+        assert!(config.token.is_empty());
+        assert!(config.audit_file.is_some());
+    }
+
+    #[test]
+    fn a_loose_clients_file_is_refused_for_any_group_or_other_bit() {
+        let dir = TempDir::new("i4-loader-mode");
+        let project = TempDir::new("i4-loader-project");
+        for mode in [0o640, 0o604, 0o620, 0o644, 0o666, 0o601] {
+            let path = write(dir.path(), "c.json", &file(json!([])), mode);
+            let err = load(&path, project.path(), &[]).unwrap_err();
+            assert!(err.0.contains("chmod 600"), "{mode:o}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_clients_file_inside_a_git_repo_is_refused() {
+        let repo = TempDir::new("i4-loader-repo");
+        git_init(repo.path());
+        let project = TempDir::new("i4-loader-project");
+        let path = write(repo.path(), "c.json", &file(json!([])), 0o600);
+        let err = load(&path, project.path(), &[]).unwrap_err();
+        assert!(err.0.contains("outside the git repository"), "{err}");
+    }
+
+    #[test]
+    fn unknown_fields_and_duplicate_ids_are_refused_and_no_hash_is_echoed() {
+        let dir = TempDir::new("i4-loader-bad");
+        let project = TempDir::new("i4-loader-project");
+        let mut extra = client("alice");
+        extra["role"] = json!("admin");
+        let mut top = json!({"version": 1, "clients": [client("a")]});
+        top["admin"] = json!(true);
+        for (text, needle) in [
+            (file(json!([extra])), "unknown field"),
+            (top.to_string(), "unknown field"),
+            (file(json!([client("a"), client("a")])), "duplicate"),
+        ] {
+            let path = write(dir.path(), "c.json", &text, 0o600);
+            let err = load(&path, project.path(), &[]).unwrap_err();
+            assert!(err.0.contains(needle), "{needle}: {err}");
+            assert!(!err
+                .0
+                .contains(&sha256_hex(format!("osh_a_{SECRET}").as_bytes())));
+        }
+    }
+
+    #[test]
+    fn a_legacy_token_file_beside_a_clients_file_needs_the_flag() {
+        let dir = TempDir::new("i4-loader-legacy");
+        let project = TempDir::new("i4-loader-project");
+        let token = write(dir.path(), "token", &format!("{LEGACY}\n"), 0o600);
+        let plain = write(dir.path(), "c.json", &file(json!([client("a")])), 0o600);
+        let err = load(&plain, project.path(), &[(TOKEN_FILE_ENV, token.as_str())]).unwrap_err();
+        assert!(err.0.contains("allow_legacy_token"), "{err}");
+        let flagged = write(
+            dir.path(),
+            "f.json",
+            &json!({"version": 1, "allow_legacy_token": true, "clients": [client("a")]})
+                .to_string(),
+            0o600,
+        );
+        let config = load(
+            &flagged,
+            project.path(),
+            &[(TOKEN_FILE_ENV, token.as_str())],
+        )
+        .unwrap();
+        assert!(config.clients.has_legacy());
+        let header = format!("Bearer {LEGACY}");
+        let caller = config.clients.authenticate(Some(&header), 0).unwrap();
+        assert_eq!(caller.client(), "legacy");
+        // The flag without a token file adds no legacy token.
+        let config = load(&flagged, project.path(), &[]).unwrap();
+        assert!(!config.clients.has_legacy());
+        assert!(config.clients.authenticate(Some(&header), 0).is_err());
+    }
+
+    #[test]
+    fn the_token_in_the_environment_is_refused_beside_a_clients_file_even_with_the_flag() {
+        let dir = TempDir::new("i4-loader-env");
+        let project = TempDir::new("i4-loader-project");
+        let flagged = write(
+            dir.path(),
+            "f.json",
+            &json!({"version": 1, "allow_legacy_token": true, "clients": [client("a")]})
+                .to_string(),
+            0o600,
+        );
+        let err = load(&flagged, project.path(), &[(TOKEN_ENV, LEGACY)]).unwrap_err();
+        assert!(err.0.contains(TOKEN_ENV), "{err}");
+        assert!(!err.0.contains(LEGACY), "the token is not echoed: {err}");
+    }
+
+    #[test]
+    fn a_clients_file_without_an_audit_path_is_refused() {
+        let dir = TempDir::new("i4-loader-noaudit");
+        let project = TempDir::new("i4-loader-project");
+        let path = write(dir.path(), "c.json", &file(json!([client("a")])), 0o600);
+        let err = load_config(
+            env_from(&[(CLIENTS_ENV, path.as_str())]),
+            "127.0.0.1",
+            8765,
+            project.path(),
+        )
+        .unwrap_err();
+        assert!(err.0.contains(AUDIT_FILE_ENV), "{err}");
+    }
+
+    #[test]
+    fn a_deployment_without_a_clients_file_is_unchanged() {
+        let dir = TempDir::new("i4-loader-today");
+        let project = TempDir::new("i4-loader-project");
+        let token = write(dir.path(), "token", &format!("{LEGACY}\n"), 0o600);
+        let config = load_config(
+            env_from(&[(TOKEN_FILE_ENV, token.as_str())]),
+            "127.0.0.1",
+            8765,
+            project.path(),
+        )
+        .unwrap();
+        assert_eq!(config.token, LEGACY);
+        assert_eq!(config.audit_file, None);
+        let header = format!("Bearer {LEGACY}");
+        let caller = config.clients.authenticate(Some(&header), 0).unwrap();
+        assert_eq!(caller.client(), "legacy");
+        for scope in Scope::ALL {
+            assert!(caller.has(scope), "{scope}");
         }
     }
 }

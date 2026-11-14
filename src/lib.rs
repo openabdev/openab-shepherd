@@ -7,7 +7,9 @@
 
 pub mod agent;
 pub mod ansi;
+pub mod audit;
 pub mod backend;
+pub mod clients;
 pub mod config;
 pub mod devin_dialog;
 pub mod dialog;
