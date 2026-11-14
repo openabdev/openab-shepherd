@@ -33,17 +33,20 @@ flowchart TD
 
 - **Holder** (`openab-shepherd hold`, child of `tini`). Per pane: spawn, write, resize, signal, kill, reap, a ~1 MiB output tail with a per-pane `seq`, and an opaque `meta` blob (set/get). It streams every output byte to the front and parses nothing. It spawns the front over an anonymous socketpair and respawns it with backoff; it never exits because the front failed. Protocol: length-prefixed frames, one integer `HOLDER_VERSION`, exact match. Ops: `spawn write resize signal kill list meta_set meta_get`; events: `output(pane, seq, bytes)`, `exited(pane, status)`.
 - **Front** (today's process minus PTY ownership). HTTP/MCP, #68 clients/scopes/audit, profiles, VT emulator, OSC 7501 status and turn, dialect parsers, guarded write, `answer_dialog`, watchdog, attach, lease and draft. The only code seam is a `PtyHost` trait: in-process impl for `MODE=single` and tests, holder client for the split. Tools and `TerminalBackend` are unchanged.
-- **Guard stays atomic with no new protocol.** The emulator and the guarded write both stay in the front under the per-pane lock, so no screen digest crosses a process boundary. The unfed-bytes window (output the PTY produced but the emulator has not consumed) exists in-process today and is not made worse.
-- **`meta`** (front writes through on change): labels, agent kind, status, `turn`, `human_draft`. It keeps `turn` monotonic and the draft flag fail-closed across a front restart, and lives and dies with the panes.
+- **Guard stays atomic with no new protocol.** The emulator and the guarded write both stay in the front under the per-pane lock, so no screen digest crosses a process boundary. The holder hop widens the unfed-bytes window (output the PTY produced but the emulator has not consumed); the existing settle check in `write_guarded` covers it, and the replay and `replayed` rules in §3.1 cover the restart case. The holder never blocks PTY reads: if the front is slow or down, the holder keeps filling the tail and drops the stream, and the front catches up from the tail by `seq`.
+- **`meta`** (front writes through on change): labels, agent kind, status, `turn`, `human_draft`. It keeps `turn` monotonic and the draft flag fail-closed across a front restart, and lives and dies with the panes. The front calls `meta_set` for `human_draft` before it forwards the human's byte to the PTY, so a crash between the two leaves the flag set, never missing. It also records `last_seq`, the highest output `seq` fed to the emulator, at most once a second.
 
 ### 3.1 Restart survival
 
-- **Survives:** front crash, front restart, reload (SIGUSR2 to the holder), config, client and profile change. In-place front binary replacement (p1, macmini) keeps panes while `HOLDER_VERSION` is unchanged.
+- **Survives:** front crash, front restart, reload (SIGUSR2 to the holder), config, client and profile change. In-place front binary replacement (p1, macmini) keeps panes while `HOLDER_VERSION` is unchanged. If it changed, the new front exits with a version-mismatch error, the holder logs it and keeps backing off (the bad-config case), and panes live until the holder is restarted.
+- **Service managers:** on p1 and macmini there is no `tini`. A restart of the service must not kill the holder's process group: systemd needs `KillMode=process` (or a separate holder unit), launchd needs `AbandonProcessGroup`. Only a restart of the front alone, via SIGUSR2 to the holder, is guaranteed to keep panes; `docs/operations.md` lists which commands do.
 - **Ends panes:** holder crash, holder upgrade, host reboot, pod rollout (a new image replaces the holder). Stated plainly, as herdr does. In a pod a front upgrade is a new image, so it ends panes too.
-- **Adoption:** the new front reads `list`, replays each tail into a fresh emulator, then resizes the pane by one row and back so TUIs repaint. Until a repaint is observed the pane is `replayed` and guarded writes and `answer_dialog` are refused. A short tail then costs a refusal, never a write against a wrong screen. Measure replay on Claude, Codex, Kiro and OpenCode fixtures before #66 closes; if a mode set before the tail window is missed, the front stores a mode snapshot in `meta`.
+- **Adoption:** the new front reads `list` and `meta`, and replays each tail into a fresh emulator with the emulator's reply output discarded (DA, DSR, XTVERSION and mode queries in the tail must not be answered into the live PTY). The replay starts at the first line start in the tail; a cut escape sequence at the very start can leave one wrong cell, which the next repaint fixes.
+  - **No gap** (tail start `<= meta.last_seq`): the tail holds every byte the old front never saw, so the pane is live at once.
+  - **Gap** (the tail is shorter than the downtime output): the pane is `replayed`, guarded writes and `answer_dialog` are refused, and the front resizes the pane by one row and back once to make a TUI repaint. This adoption nudge is the only resize without a lease, and it runs only for a gap. The pane leaves `replayed` on the first output after the nudge. An idle shell does not repaint, so it stays `replayed` until any output arrives (a human keystroke through attach does it). A short tail then costs a refusal, never a write against a wrong screen. Measure replay on Claude, Codex, Kiro and OpenCode fixtures before #66 closes; if a mode set before the tail window is missed, the front stores a mode snapshot in `meta`.
 - **In flight:** `wait`s die with the front and clients retry. A `send` whose reply was lost has an unknown outcome; the bot rereads the screen. No idempotency receipts.
 - **Bad config:** the holder keeps respawning the front with backoff. Panes are untouched, MCP is down, and the front logs the config error on every attempt. Accepted cost for one user.
-- `tini` stays PID 1. `panes.json` (pid and start time, 0600) drives an orphan sweep after a holder crash.
+- `tini` stays PID 1 in pods and reaps orphans. A holder crash closes the PTY masters, so panes get SIGHUP and end; no orphan sweep and no `panes.json`. Nothing restarts a crashed holder except the pod or service manager.
 
 ## 4. Decision: shared panes
 
@@ -52,13 +55,13 @@ All in the front, in memory. This is correctness, not security.
 1. **Attach.** A first-paint snapshot of the emulator, then the raw byte stream with credit-based flow control (herdr's `terminal.attach`). Any number of read-only observers. Viewer-side terminal reports (DA, DSR, XTVERSION replies) are dropped, because the emulator already answers and a second answer corrupts the pane. Transport follows what openab-pty#97 already speaks (§8, Q1).
 2. **Lease.** One human lease per pane. Human input without a lease is refused. `lease_acquire` waits on the pane input mutex so it never interleaves with a bot paste. Idle expiry 300 s.
 3. **Refuse, never queue.** While a lease is held or `human_draft` is set, bot `send`, `keys`, screen-path `answer_dialog`, watchdog nudge, `interrupt_pane` and `remove_pane` are refused (`pane_human_controlled`, `pane_draft_pending`). The check runs inside `write_guarded`, so it is atomic with the write. A principal with `lease:preempt` may take the lease or run `draft_clear`.
-4. **Draft.** Any human byte sets `human_draft`. It clears only on `draft_clear` or an observed turn advance. No timer clear: a timer would let the bot submit the human's fragment.
+4. **Draft.** Any human byte sets `human_draft`. It clears only on a human Enter through the lease or on `draft_clear`. Not on a turn advance (an agent finishing a bot-started turn says nothing about the fragment in the input) and not on a timer. Bots cannot hold `lease:preempt`, so a stale draft stalls bot input until a human returns or runs `draft_clear`. That is accepted: refusing is the safe side.
 5. **Front restart.** Leases drop and the human re-acquires. The draft flag survives in `meta`, so a fragment is never submitted over.
 6. **Geometry.** 200x120 until an attach. Only the lease holder resizes. Observers never do (§8, Q2).
 
 Scopes added to #68: `attach`, `attach:write`, `lease:preempt`. The clients file gets `kind = human|bot`; bots cannot hold `attach:write` or `lease:preempt`, and the legacy token holds none. This is configuration of who may take a lease, not a security claim.
 
-**Kept from the earlier ADR:** `answer_dialog` is guarded and fails closed (it re-reads the styled screen and refuses unless the dialog and its subject match at write time); the token is never put in pane env; directories 0700, token, profile and `panes.json` files 0600; audit lines carry counts and times, never keystrokes.
+**Kept from the earlier ADR:** `answer_dialog` is guarded and fails closed (it re-reads the styled screen and refuses unless the dialog and its subject match at write time); the token is never put in pane env; directories 0700, token and profile files 0600; audit lines carry counts and times, never keystrokes.
 
 ## 5. Decision: hook approvals leave this ADR
 
@@ -75,7 +78,7 @@ Not designed against, by decision. Each is a same-account attack and Shepherd ha
 - `ptrace`, `pidfd_getfd`, `/proc/<pid>/environ` and `tini`'s environment; `PR_SET_DUMPABLE`, `fs.suid_dumpable`, pair-fd or fd-inheritance windows; `PT_DENY_ATTACH` and other macOS hardening.
 - Socket squatting or a forged holder or front peer.
 - Root-owned binaries or managed policy files; kernel-attested hook channels.
-- A pane reading the token, profiles or `panes.json` beyond 0600/0700 hygiene; a pane calling MCP with a token it found.
+- A pane reading the token or profiles beyond 0600/0700 hygiene; a pane calling MCP with a token it found.
 - A pane or compromised front forging `actor: human`; a trusted-versus-untrusted front.
 - Pane output reaching the viewer's terminal (OSC 52, titles); resource exhaustion by a pane.
 - Holder handover, scrollback on disk, cold restore, surviving holder crash or reboot.
@@ -90,6 +93,7 @@ Not designed against, by decision. Each is a same-account attack and Shepherd ha
 | Idempotency receipts | A lost `send` reply has an unknown outcome; the bot rereads. Rare duplicate on blind retry. |
 | `RemoteBackend` op set (`lease_*`, `approval_*`, events); N-1/N skew rule, `front_incompatible`, exit 3 | Holder is about 8 ops with an exact version match. Front and holder upgrade together. |
 | 0711 binary, `PR_SET_DUMPABLE`, `suid_dumpable`, `pidfd_getfd` and pair-fd tests, token/profile protection and macOS analysis, no-control-socket analysis | None under §1 (non-goals). |
+| `panes.json` orphan sweep | After a holder crash, pane processes end by SIGHUP; a process that ignores it can linger until the pod or host restarts. |
 | `--check-config`, exit-code rules | Bad config is a log loop with MCP down while panes live. |
 | Lease grace, `lease_resume`, the 12-row operation-by-state table | The human re-acquires after a front restart. Five rules replace the table. |
 | Attach output filter (OSC, DCS, APC, CSI) | Pane output reaches the viewer, as in herdr. Only viewer-side terminal reports are dropped. |
