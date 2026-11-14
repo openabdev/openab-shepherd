@@ -34,6 +34,19 @@ type Body = Response<std::io::Cursor<Vec<u8>>>;
 /// thread, so a long `wait_status` does not block other calls.
 pub fn serve(bind: SocketAddr, state: Arc<AppState>) -> Result<(), String> {
     let server = Server::http(bind).map_err(|err| format!("cannot listen on {bind}: {err}"))?;
+    run(server, state)
+}
+
+/// Serve on a listener the caller already holds, so tests never release a port
+/// between picking it and using it.
+#[cfg(test)]
+fn serve_listener(listener: std::net::TcpListener, state: Arc<AppState>) -> Result<(), String> {
+    let server =
+        Server::from_listener(listener, None).map_err(|err| format!("cannot serve: {err}"))?;
+    run(server, state)
+}
+
+fn run(server: Server, state: Arc<AppState>) -> Result<(), String> {
     for request in server.incoming_requests() {
         let state = Arc::clone(&state);
         thread::spawn(move || handle(request, &state));
@@ -331,14 +344,6 @@ mod tests {
         assert!(!bearer_matches(Some(&format!("Bearer {TOKEN}x")), TOKEN));
     }
 
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
     /// Send one raw HTTP/1.1 request and return (status, body).
     fn raw_request(
         port: u16,
@@ -373,25 +378,34 @@ mod tests {
         (status, body)
     }
 
-    /// Start a server on a free loopback port and wait until it accepts connections.
+    /// Start a server on a loopback port it already holds. The listener is bound
+    /// here and handed over, so the port is never free for another test or process
+    /// to take, and it accepts connections as soon as `bind` returns.
     fn start_server(allowed_hosts: Vec<AllowedHost>) -> u16 {
-        let port = free_port();
-        let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         let state = Arc::new(AppState {
             token: TOKEN.to_string(),
             allowed_hosts,
             shepherd: Shepherd::new(crate::testutil::FakeBackend::new(true)),
         });
         thread::spawn(move || {
-            let _ = serve(bind, state);
+            let _ = serve_listener(listener, state);
         });
-        for _ in 0..100 {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                break;
-            }
-            thread::sleep(std::time::Duration::from_millis(20));
-        }
         port
+    }
+
+    #[test]
+    fn a_port_that_is_already_taken_is_reported() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = held.local_addr().unwrap();
+        let state = Arc::new(AppState {
+            token: TOKEN.to_string(),
+            allowed_hosts: Vec::new(),
+            shepherd: Shepherd::new(crate::testutil::FakeBackend::new(true)),
+        });
+        let err = serve(bind, state).unwrap_err();
+        assert!(err.contains("cannot listen on"), "{err}");
     }
 
     const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#;

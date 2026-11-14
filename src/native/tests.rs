@@ -710,7 +710,9 @@ fn children_close_inherited_descriptors_without_close_range() {
 fn interrupt_sends_ctrl_c_to_a_program_without_status() {
     let dir = TempDir::new("native-int");
     let b = backend();
-    let info = b.run(&spec_line("sleeper", "sleep 30", &dir)).unwrap();
+    let info = b
+        .run(&spec_argv("sleeper", &["sleep", "30"], &dir))
+        .unwrap();
     let started = Instant::now();
     let result = b.interrupt(&info.reference(), None).unwrap();
     assert_eq!(result.key, Key::CtrlC);
