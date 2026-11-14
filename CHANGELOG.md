@@ -1,15 +1,55 @@
 # Changelog
 
+## 0.4.0
+
+### Breaking changes
+
+None. The watchdog is off unless a launch profile sets it, and the new fields are optional.
+
+### Added
+
+- Built-in watchdog for stalled panes, contributed by ttmuse (issue #38, #40). A launch profile may
+  set a `watchdog` section. Shepherd then checks that profile's panes every 5 s. When a pane's turn
+  has finished and sits untouched past `idle_timeout_secs` (and, when the profile sets `todo_file`,
+  that file still has an unchecked `- [ ]` item), it types the profile's `nudge_text` through the
+  same path and refusal rules as `send_input`. At most `max_consecutive_nudges` nudges go in
+  without progress the watchdog did not itself cause; `cooldown_secs` spaces them. It is off by
+  default and watches only panes started from a profile that sets it. It never answers a permission
+  dialog and never types into a blocked pane. Each nudge is sent with a guard
+  (`if_state` and `expect_turn`), so a pane that changed state or started a new turn since the
+  check is refused rather than typed into. A `nudge_text` that is a bare confirmation such as `y`,
+  `yes` or `1` is refused when the profiles file is read. Every nudge and give-up is logged to
+  stderr. See `docs/operations.md`. (#40)
+- The same PR adds a bounded wait on the pane lock (a watched pane that another call holds for more
+  than 2 s is skipped for that check) and a stop when a nudge was pasted but its Enter was refused,
+  so the text is not pasted twice. (#40)
+
+### Fixed
+
+- A pane could lose the output of a program that exits immediately on macOS, such as
+  `/usr/bin/env`: the first read from the PTY returned nothing. Shepherd now keeps its copy of the
+  slave side open until the pane's leader exits. Linux was not affected. (#56, issue #54)
+- Two test races: `native::tests::interrupt_sends_ctrl_c_to_a_program_without_status` (the Ctrl-C
+  could reach a starting shell instead of the program) and the `http::tests` port race (a port was
+  released and rebound, so a test could talk to another listener). No product behaviour changed.
+  (#53, issues #46, #51)
+
+### Internal
+
+- Tests: the hangup test is renamed to say what it checks, a test covers `remove` with the default
+  grace on a program that ignores HUP and TERM, a pure test covers the child environment
+  whitelist, and several negative assertions that could pass on an empty screen now wait for a
+  marker first. (#57, issue #52)
+- CI: an advisory stress workflow runs the native tests under CPU load, weekly and on
+  demand. It is advisory, not a required check. (#58)
+- CI: pushing an annotated `vX.Y.Z` tag runs `release.yml`. It checks that `Cargo.toml` and
+  `CHANGELOG.md` match the tag, runs fmt, clippy and tests, builds and pushes a multi-arch
+  `ghcr.io/openabdev/openab-shepherd:vX.Y.Z` and `:sha-<7>` (never `latest`) and creates the GitHub
+  release from this file. Runbook in `docs/operations.md`. (#59)
+- The image carries `org.opencontainers.image.*` source labels, which link the GHCR package to this
+  repository. (#60)
+
 ## 0.3.0
-
-### Changes
-
-- A launch profile may set a `watchdog`: Shepherd checks its panes every 5 s
-  and, when a finished turn sits untouched past `idle_timeout_secs` (with an
-  unchecked item left in the profile's `todo_file`, when one is set), types the
-  profile's `nudge_text` through the `send_input` path. At most
-  `max_consecutive_nudges` nudges go in without progress the watchdog did
-  not itself cause. Off unless a profile sets it (issue #38).
 
 ### Breaking changes
 
