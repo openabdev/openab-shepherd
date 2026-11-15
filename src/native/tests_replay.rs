@@ -11,7 +11,7 @@ use super::replay::replay;
 use super::status::TrackerSnapshot;
 use super::*;
 use crate::testutil::TempDir;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 const LONG: Duration = Duration::from_secs(15);
 
@@ -45,6 +45,33 @@ struct Rec {
     calls: Mutex<Vec<Call>>,
     fail_write: AtomicBool,
     fail_meta: AtomicBool,
+    /// A pane to end right after the next `list`, as if it exited between the
+    /// front's `list` and its table lock.
+    end_after_list: Mutex<Option<String>>,
+    /// How many `exited` events reached the sink, so a test can wait for one.
+    exits_seen: Arc<AtomicUsize>,
+}
+
+/// Forwards to the real sink and counts exits.
+struct CountExits {
+    next: Arc<dyn HostEvents>,
+    seen: Arc<AtomicUsize>,
+}
+
+impl HostEvents for CountExits {
+    fn output(&self, id: &str, seq: u64, bytes: &[u8]) -> bool {
+        self.next.output(id, seq, bytes)
+    }
+    fn idle(&self, id: &str) {
+        self.next.idle(id);
+    }
+    fn exited(&self, id: &str, code: Option<i64>) {
+        self.next.exited(id, code);
+        self.seen.fetch_add(1, Ordering::SeqCst);
+    }
+    fn gap(&self, id: &str, new_start: u64) {
+        self.next.gap(id, new_start);
+    }
 }
 
 impl Rec {
@@ -54,6 +81,8 @@ impl Rec {
             calls: Mutex::new(Vec::new()),
             fail_write: AtomicBool::new(false),
             fail_meta: AtomicBool::new(false),
+            end_after_list: Mutex::new(None),
+            exits_seen: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -88,7 +117,10 @@ impl Drop for Rec {
 
 impl PtyHost for Rec {
     fn set_sink(&self, sink: Arc<dyn HostEvents>) {
-        self.inner.set_sink(sink);
+        self.inner.set_sink(Arc::new(CountExits {
+            next: sink,
+            seen: Arc::clone(&self.exits_seen),
+        }));
     }
     fn spawn(&self, req: SpawnReq) -> Result<Spawned, BackendError> {
         self.inner.spawn(req)
@@ -120,7 +152,18 @@ impl PtyHost for Rec {
         self.inner.fg_pgrp(id)
     }
     fn list(&self) -> Vec<HostPane> {
-        self.inner.list()
+        let listed = self.inner.list();
+        let ending = self.end_after_list.lock().unwrap().take();
+        if let Some(id) = ending {
+            let seen = self.exits_seen.load(Ordering::SeqCst);
+            self.inner.signal(&id, 9).unwrap();
+            // Return only once the exit reached the front's sink, which does
+            // not know the pane yet: the event is dropped there.
+            eventually("the exit to reach the sink", || {
+                (self.exits_seen.load(Ordering::SeqCst) > seen).then_some(())
+            });
+        }
+        listed
     }
     fn forget(&self, id: &str) {
         self.inner.forget(id);
@@ -624,6 +667,25 @@ fn adopting_a_complete_tail_gives_the_pane_back_live_and_event_free() {
     wait_screen(s.b(), &now, "ping");
     // Adopting again picks up nothing new.
     assert_eq!(s.b().adopt().unwrap(), Adoption::default());
+}
+
+#[test]
+fn a_pane_that_exits_between_the_list_and_the_adoption_is_adopted_exited() {
+    let mut s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", &format!("printf '{IDLE}hello\\n'; cat"));
+    wait_screen(s.b(), &info, "hello");
+    s.kill_front();
+    *s.host.end_after_list.lock().unwrap() = Some(info.id.clone());
+    let adoption = s.new_front();
+    assert_eq!(adoption.adopted, vec![info.id.clone()]);
+    let now = s.b().get(&tref(&info)).unwrap();
+    assert!(!now.live, "the exit that came before the table was lost");
+    with_state(s.b(), &info, |st| assert!(st.exit_code.is_some()));
+    // And a waiter is told, instead of waiting on a dead PTY.
+    assert_eq!(
+        kind_of(s.b().keys(&tref(&info), &[Key::Enter], &default_guard())),
+        ErrorKind::Finished
+    );
 }
 
 fn state_is_idle(info: &TerminalInfo) -> bool {

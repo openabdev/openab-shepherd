@@ -315,6 +315,12 @@ impl NativeBackend {
                     ))
                 }
             };
+            // The pane may have exited since the list, and its exit event went
+            // to a table that did not hold it yet. Read the state again now
+            // that the table is locked: from here on the event is not lost.
+            let Some(listed) = host.list().into_iter().find(|p| p.id == listed.id) else {
+                continue;
+            };
             let meta = meta::load(&**host, &listed.id);
             let adopted = replay(
                 &attached.bytes,
