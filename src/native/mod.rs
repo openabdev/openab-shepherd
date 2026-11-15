@@ -10,8 +10,7 @@
 //! [`NativeBackend`] handle ends every pane.
 
 pub(crate) mod keys;
-mod procs;
-mod pty;
+mod host;
 pub(crate) mod status;
 pub(crate) mod term;
 #[cfg(test)]
@@ -22,7 +21,7 @@ mod tests_forged;
 mod tests_output;
 
 pub use keys::KeyboardMode;
-pub(crate) use pty::{default_signals_on_exec, effective_uid, SPAWN_LOCK};
+pub(crate) use host::pty::{default_signals_on_exec, effective_uid, SPAWN_LOCK};
 pub use status::LogEntry as StatusLogEntry;
 
 use crate::backend::{
@@ -32,6 +31,7 @@ use crate::backend::{
     TerminalRef, WaitReason, WaitResult,
 };
 use crate::input::MAX_INPUT_BYTES;
+use host::{procs, pty};
 use keys::encode as encode_key;
 use status::{LogEntry, Report, StatusLog, Tracker};
 use std::collections::VecDeque;

@@ -4,8 +4,8 @@
 //! `unsafe` block of the native core is here, except the process-table reads
 //! in `procs.rs`.
 
-use super::term::{COLS, ROWS};
-use super::MAX_EXTRA_ENV;
+use crate::native::term::{COLS, ROWS};
+use crate::native::MAX_EXTRA_ENV;
 use crate::backend::{BackendError, ErrorKind};
 use std::ffi::{OsStr, OsString};
 use std::io;

@@ -6,7 +6,7 @@
 //! Members are found by parent pid from the leader and from every member
 //! still alive, and by membership of the leader's process group and session
 //! (on macOS: the processes whose controlling terminal is the pane's). The
-//! reader thread refreshes the tree every [`super::TREE_POLL`] while the
+//! reader thread refreshes the tree every `TREE_POLL` while the
 //! leader runs, and the stop path refreshes it again before signalling.
 
 use std::collections::HashMap;
