@@ -36,8 +36,8 @@ use std::time::Duration;
 
 /// The path of the audit file.
 pub const AUDIT_FILE_ENV: &str = "OPENAB_SHEPHERD_AUDIT_FILE";
-/// The actor of the watchdog's nudges.
-pub const WATCHDOG_ACTOR: &str = "system:watchdog";
+/// The actor of the routine's nudges.
+pub const ROUTINE_ACTOR: &str = "system:routine";
 /// The tool-error code of a refused call whose audit record could not be written.
 pub const UNAVAILABLE_CODE: &str = "audit_unavailable";
 const WARN_INTERVAL_SECS: u64 = 60;
@@ -652,12 +652,12 @@ mod tests {
     }
 
     #[test]
-    fn the_watchdog_is_an_actor_like_any_other() {
+    fn the_routine_is_an_actor_like_any_other() {
         let (audit, sink) = memory_audit();
         audit
-            .before(WATCHDOG_ACTOR, "send_input", &sample("send_input"))
+            .before(ROUTINE_ACTOR, "send_input", &sample("send_input"))
             .unwrap();
-        assert_eq!(sink.records()[0]["client"], "system:watchdog");
+        assert_eq!(sink.records()[0]["client"], "system:routine");
     }
 
     const CANARY: &str = "CANARY-9f3c1e";

@@ -814,7 +814,7 @@ mod issue4_pr1_http {
         let dir = TempDir::new("i4-http-identity");
         let server = start(dir.path(), false);
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "client": "alice",
-            "params": {"name": "read_output", "client": "alice", "actor": "system:watchdog",
+            "params": {"name": "read_output", "client": "alice", "actor": "system:routine",
                        "arguments": {"terminal": "work", "client": "alice"}}});
         let bearer = format!("Bearer {}", token("ci-1", SECRET_CI));
         let host = format!("127.0.0.1:{}", server.port);
@@ -822,7 +822,7 @@ mod issue4_pr1_http {
         assert_eq!(status, 200);
         let records = server.sink.records();
         assert_eq!(records.last().unwrap()["client"], "ci-1");
-        assert!(!server.sink.bytes().contains("system:watchdog"));
+        assert!(!server.sink.bytes().contains("system:routine"));
     }
 
     #[test]

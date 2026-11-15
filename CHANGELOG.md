@@ -4,6 +4,11 @@
 
 ### Changed
 
+- The built-in watchdog is now the routine: profile key `routine`, `src/routine.rs`, stderr lines
+  `routine nudge` / `routine gave up`, and audit actor `system:routine` (was `system:watchdog`).
+  Behaviour and limits are unchanged. The `watchdog` profile key (shipped in 0.4.0) is still
+  accepted as a deprecated alias that prints one warning to stderr; setting both keys is a
+  startup error.
 - Kiro permission dialogs: the tool name before the arrow must now be `shell`, `fs_write`, `mcp`
   or `web_fetch` (the set that was accepted by accident before); any other name is refused with a
   reason naming it. A command that wraps onto continuation lines is refused with a "wrapped

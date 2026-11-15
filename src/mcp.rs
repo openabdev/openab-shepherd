@@ -1149,11 +1149,11 @@ mod issue4_pr1_mcp {
             &sh,
             &caller,
             "read_output",
-            json!({"terminal": "work", "client": "root", "actor": "system:watchdog"}),
+            json!({"terminal": "work", "client": "root", "actor": "system:routine"}),
         );
         assert_eq!(out["isError"], false, "{out}");
         let records = sink.records();
         assert_eq!(records[0]["client"], "tester");
-        assert!(!sink.bytes().contains("system:watchdog"));
+        assert!(!sink.bytes().contains("system:routine"));
     }
 }

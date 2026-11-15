@@ -457,7 +457,7 @@ pub enum ErrorKind {
 
 /// The part of a paste-without-Enter failure's detail that names it. The
 /// backend that two-steps a send (paste, then Enter) builds the failure with
-/// [`pasted_unsubmitted`]; the watchdog recognizes it with
+/// [`pasted_unsubmitted`]; the routine recognizes it with
 /// [`is_pasted_unsubmitted`]. Both use this one text, so rewording it cannot
 /// separate them.
 const PASTED_UNSUBMITTED: &str = "the text was pasted but Enter was not pressed";

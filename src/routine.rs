@@ -1,26 +1,26 @@
-//! The watchdog: Shepherd's own liveness check on the panes a profile
-//! started with a `watchdog` section (see [`WatchdogConfig`]).
+//! The routine: Shepherd's own liveness check on the panes a profile
+//! started with a `routine` section (see [`RoutineConfig`]).
 //!
 //! A coding CLI's main session sometimes ends a turn with work left and
 //! simply stops: not working, not blocked, not waiting on anything Shepherd
-//! can see. The watchdog notices that one state — a finished turn that sits
+//! can see. The routine notices that one state — a finished turn that sits
 //! untouched past the profile's idle timeout, with unfinished work left when
 //! a todo file is configured — and types the profile's nudge text through
 //! the same path `send_input` uses (see `tools::send_text`).
 //!
 //! The decision here is mechanical on purpose. Whether the remaining work is
 //! worth doing, or the agent is stuck on a question for a person, is a
-//! judgment for the client supervising through `wait_status`; the watchdog
+//! judgment for the client supervising through `wait_status`; the routine
 //! never answers a dialog and never types into a blocked pane.
 
 use crate::agent::Agent;
 use crate::backend::{State, TerminalInfo};
-use crate::profiles::WatchdogConfig;
+use crate::profiles::RoutineConfig;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// How often the watchdog thread looks at the panes it watches.
+/// How often the routine thread looks at the panes it watches.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The turn advances one nudge may explain. A nudge usually makes the agent
@@ -29,9 +29,9 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// own and clears the consecutive count.
 pub const NUDGE_TURN_ALLOWANCE: u64 = 3;
 
-/// How long the watchdog waits for a pane's lock before it skips that pane
+/// How long the routine waits for a pane's lock before it skips that pane
 /// for the tick. The lock is held for the whole of another call's send or
-/// wait, and the one watchdog thread serves every watched pane.
+/// wait, and the one routine thread serves every watched pane.
 pub const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// What a profile's todo file says about the work, when one is configured.
@@ -43,11 +43,11 @@ pub enum Todo {
     Unchecked,
     /// No unchecked item: every item is checked, or there are no items.
     Finished,
-    /// The file could not be read. The watchdog fails closed: no nudge.
+    /// The file could not be read. The routine fails closed: no nudge.
     Unreadable,
 }
 
-/// The most todo-file bytes the watchdog will read. A todo list is small;
+/// The most todo-file bytes the routine will read. A todo list is small;
 /// anything larger is treated as unreadable rather than read into memory.
 pub const MAX_TODO_BYTES: u64 = 256 * 1024;
 
@@ -117,7 +117,7 @@ fn open_dir_fd(path: &Path) -> Option<fs::File> {
 }
 
 /// Read the todo file named by the relative path `rel` inside the working
-/// directory `cwd`, resolving `cwd` now. The watchdog itself reads through
+/// directory `cwd`, resolving `cwd` now. The routine itself reads through
 /// the [`WorkDir`] its watch opened once ([`read_todo_in`]); this form is
 /// for a caller with only a path.
 pub fn read_todo(cwd: &Path, rel: &Path) -> Todo {
@@ -132,7 +132,7 @@ pub fn read_todo(cwd: &Path, rel: &Path) -> Todo {
 ///
 /// The file is read defensively: the supervised agent writes in the same
 /// directory, so the path could be a FIFO (which would block a plain read
-/// forever and stall the single watchdog thread), a symlink out of the
+/// forever and stall the single routine thread), a symlink out of the
 /// directory, or an unbounded file. The working directory is the boundary
 /// the read enforces: on Unix it is the directory fd `work` holds, opened
 /// once (its ancestors were resolved by that open, so a working directory
@@ -246,7 +246,7 @@ fn open_todo_refusing_symlinks(dir: &fs::File, rel: &Path) -> Option<fs::File> {
     Some(unsafe { fs::File::from_raw_fd(file_fd) })
 }
 
-/// Why a nudge is due; the watchdog's log line names it.
+/// Why a nudge is due; the routine's log line names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NudgeReason {
     /// A todo file is configured and still has an unchecked item.
@@ -271,16 +271,16 @@ pub enum WatchEvent {
     None,
     /// Type the nudge text now.
     Nudge(NudgeReason),
-    /// This observation reached `max_consecutive_nudges`: the watchdog
+    /// This observation reached `max_consecutive_nudges`: the routine
     /// stops for this pane. Returned once, on the crossing observation.
     GaveUp,
 }
 
-/// One pane's watchdog state: its profile's configuration, where it runs,
-/// and what the watchdog has seen and done so far.
+/// One pane's routine state: its profile's configuration, where it runs,
+/// and what the routine has seen and done so far.
 #[derive(Debug)]
 pub struct PaneWatch {
-    config: WatchdogConfig,
+    config: RoutineConfig,
     work_dir: WorkDir,
     agent: Agent,
     /// The backend id of the pane this watch was registered for. A name
@@ -290,7 +290,7 @@ pub struct PaneWatch {
     /// its own clears the consecutive count and a give-up: progress is the
     /// reset. Turns a nudge itself causes do not clear anything (see
     /// `nudge_allowance`) — otherwise every answered nudge would reset the
-    /// cap and the watchdog would nudge forever.
+    /// cap and the routine would nudge forever.
     last_turn: Option<u64>,
     /// How many turn advances the nudges sent so far may still explain:
     /// set to [`NUDGE_TURN_ALLOWANCE`] by each nudge (not summed, so
@@ -321,7 +321,7 @@ impl PaneWatch {
     /// A watch over a pane that runs in `cwd`. The working directory is
     /// resolved here, once, and every later todo read goes through that
     /// resolution.
-    pub fn new(config: WatchdogConfig, cwd: PathBuf, agent: Agent, pane_id: String) -> Self {
+    pub fn new(config: RoutineConfig, cwd: PathBuf, agent: Agent, pane_id: String) -> Self {
         Self {
             config,
             work_dir: WorkDir::open(&cwd),
@@ -339,7 +339,7 @@ impl PaneWatch {
         }
     }
 
-    pub fn config(&self) -> &WatchdogConfig {
+    pub fn config(&self) -> &RoutineConfig {
         &self.config
     }
 
@@ -397,11 +397,11 @@ impl PaneWatch {
     /// Observe the pane once. `todo` is the todo file's state at this
     /// observation ([`Todo::NotConfigured`] when the profile names none).
     pub fn observe(&mut self, info: &TerminalInfo, todo: Todo, now: Instant) -> WatchEvent {
-        // Turn bookkeeping runs even while the watchdog is stopped for this
+        // Turn bookkeeping runs even while the routine is stopped for this
         // pane, because an advancing turn is what clears the stop. The one
         // exception is the turns a nudge itself causes: the agent that
         // answers a nudge runs a turn (or a few), and that advance is the
-        // watchdog's own doing, not progress — it must not reset the cap,
+        // routine's own doing, not progress — it must not reset the cap,
         // or an agent that answers every nudge would be nudged forever.
         // What a nudge may explain is bounded by `nudge_allowance`; the cap
         // itself counts nudges sent, so it holds however many turns, or
@@ -488,9 +488,9 @@ impl PaneWatch {
     /// not pressed (the native backend's two-step send refused the second
     /// step). The text is sitting on the pane's input line: retrying
     /// would paste a second copy, and a person pressing Enter in the
-    /// meantime would submit text the watchdog recorded as unsent. The
-    /// watchdog therefore stops for this pane — as it does at the cap —
-    /// until a turn advance the watchdog did not cause clears the stop.
+    /// meantime would submit text the routine recorded as unsent. The
+    /// routine therefore stops for this pane — as it does at the cap —
+    /// until a turn advance the routine did not cause clears the stop.
     pub fn note_pasted_unsubmitted(&mut self, now: Instant) {
         self.consecutive += 1;
         self.last_nudge = Some(now);
@@ -504,8 +504,8 @@ mod tests {
     use crate::backend::ProgramStatus;
     use crate::testutil::TempDir;
 
-    fn config() -> WatchdogConfig {
-        WatchdogConfig {
+    fn config() -> RoutineConfig {
+        RoutineConfig {
             idle_timeout: Duration::from_secs(60),
             cooldown: Duration::from_secs(30),
             max_consecutive_nudges: 3,
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn read_todo_refuses_a_fifo_a_symlink_and_an_oversized_file() {
-        let dir = TempDir::new("watchdog-todo-guards");
+        let dir = TempDir::new("routine-todo-guards");
         // A FIFO would block a plain read forever; it is not a regular
         // file, so it is unreadable without reading.
         #[cfg(unix)]
@@ -963,8 +963,8 @@ mod tests {
         // outside the working directory. Every component is refused.
         #[cfg(unix)]
         {
-            let dir = TempDir::new("watchdog-todo-symlink-dir");
-            let outside = TempDir::new("watchdog-todo-outside");
+            let dir = TempDir::new("routine-todo-symlink-dir");
+            let outside = TempDir::new("routine-todo-outside");
             std::fs::write(outside.path().join("TODO.md"), "- [ ] left\n").unwrap();
             std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
             assert_eq!(
@@ -990,9 +990,9 @@ mod tests {
         // directory through an explicit symlinked ancestor is that case.
         #[cfg(unix)]
         {
-            let dir = TempDir::new("watchdog-todo-symlink-ancestor");
+            let dir = TempDir::new("routine-todo-symlink-ancestor");
             std::fs::write(dir.path().join("TODO.md"), "- [ ] left\n").unwrap();
-            let alias_parent = TempDir::new("watchdog-todo-alias-parent");
+            let alias_parent = TempDir::new("routine-todo-alias-parent");
             let alias = alias_parent.path().join("alias");
             std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
             assert_eq!(read_todo(&alias, Path::new("TODO.md")), Todo::Unchecked);
@@ -1010,7 +1010,7 @@ mod tests {
         // watch began with, never from the symlink's target.
         #[cfg(unix)]
         {
-            let parent = TempDir::new("watchdog-todo-swap");
+            let parent = TempDir::new("routine-todo-swap");
             let cwd = parent.path().join("work");
             std::fs::create_dir(&cwd).unwrap();
             std::fs::write(cwd.join("TODO.md"), "- [x] done\n").unwrap();
@@ -1032,7 +1032,7 @@ mod tests {
 
     #[test]
     fn unchecked_items_inside_a_fenced_code_block_do_not_count() {
-        let dir = TempDir::new("watchdog-todo-fence");
+        let dir = TempDir::new("routine-todo-fence");
         let file = dir.path().join("TODO.md");
         let rel = Path::new("TODO.md");
         std::fs::write(&file, "- [x] done\n```\n- [ ] example\n```\n").unwrap();
@@ -1051,7 +1051,7 @@ mod tests {
     fn a_zero_cooldown_allows_the_next_nudge_at_the_next_observation() {
         let t0 = Instant::now();
         let mut watch = PaneWatch::new(
-            WatchdogConfig {
+            RoutineConfig {
                 cooldown: Duration::ZERO,
                 ..config()
             },
@@ -1074,7 +1074,7 @@ mod tests {
 
     #[test]
     fn read_todo_counts_only_dash_unchecked_items() {
-        let dir = TempDir::new("watchdog-todo");
+        let dir = TempDir::new("routine-todo");
         let file = dir.path().join("TODO.md");
         let rel = Path::new("TODO.md");
         std::fs::write(&file, "- [x] done\n- [ ] left\n").unwrap();
@@ -1124,7 +1124,7 @@ mod tests {
             WatchEvent::Nudge(_)
         ));
         watch.note_pasted_unsubmitted(at(t0, 60));
-        // Long past the cooldown, the watchdog still does not paste a
+        // Long past the cooldown, the routine still does not paste a
         // second copy onto the input line.
         assert_eq!(
             watch.observe(&done, Todo::NotConfigured, at(t0, 3600)),

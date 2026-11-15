@@ -27,8 +27,8 @@ use crate::dialog::Choice;
 use crate::input::{validate_input, validate_name};
 use crate::opencode_dialog;
 use crate::panelock::{PaneGuard, PaneLocks};
-use crate::profiles::{CwdError, LaunchPolicy, WatchdogConfig};
-use crate::watchdog::{self, PaneWatch, Todo, WatchEvent};
+use crate::profiles::{CwdError, LaunchPolicy, RoutineConfig};
+use crate::routine::{self, PaneWatch, Todo, WatchEvent};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -91,10 +91,10 @@ pub struct Shepherd {
     locks: Arc<PaneLocks>,
     policy: Arc<LaunchPolicy>,
     panes: Arc<Mutex<HashMap<String, PaneAgent>>>,
-    watchdog: Arc<Mutex<HashMap<String, PaneWatch>>>,
-    /// How long the watchdog waits for a pane's lock before it skips the
-    /// pane for this tick (see [`watchdog::LOCK_WAIT`]); tests shorten it.
-    watchdog_lock_wait: Duration,
+    routine: Arc<Mutex<HashMap<String, PaneWatch>>>,
+    /// How long the routine waits for a pane's lock before it skips the
+    /// pane for this tick (see [`routine::LOCK_WAIT`]); tests shorten it.
+    routine_lock_wait: Duration,
     /// Where calls are recorded, when the operator set an audit file. `None`
     /// records nothing.
     audit: Option<Arc<Audit>>,
@@ -131,13 +131,13 @@ impl Shepherd {
             locks: Arc::new(PaneLocks::default()),
             policy: Arc::new(policy),
             panes: Arc::new(Mutex::new(HashMap::new())),
-            watchdog: Arc::new(Mutex::new(HashMap::new())),
-            watchdog_lock_wait: watchdog::LOCK_WAIT,
+            routine: Arc::new(Mutex::new(HashMap::new())),
+            routine_lock_wait: routine::LOCK_WAIT,
             audit: None,
         }
     }
 
-    /// Record calls to `audit`. Set before the watchdog starts, so its
+    /// Record calls to `audit`. Set before the routine starts, so its
     /// nudges are recorded too.
     pub fn with_audit(mut self, audit: Arc<Audit>) -> Self {
         self.audit = Some(audit);
@@ -208,7 +208,7 @@ impl Shepherd {
     /// start may have reused the name while the caller was still working
     /// on the old pane, and dropping the new pane's record would silently
     /// disable the checks keyed on it — notably the Devin mode-switch
-    /// refusal in `send_text_guarded`. Mirrors `forget_watchdog_if`.
+    /// refusal in `send_text_guarded`. Mirrors `forget_routine_if`.
     fn forget_agent_if(&self, name: &str, pane_id: &str) {
         let mut panes = self.panes();
         let belongs = panes
@@ -219,33 +219,33 @@ impl Shepherd {
         }
     }
 
-    fn watchdog_map(&self) -> MutexGuard<'_, HashMap<String, PaneWatch>> {
-        self.watchdog.lock().unwrap_or_else(PoisonError::into_inner)
+    fn routine_map(&self) -> MutexGuard<'_, HashMap<String, PaneWatch>> {
+        self.routine.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn register_watchdog(
+    fn register_routine(
         &self,
         name: &str,
-        config: WatchdogConfig,
+        config: RoutineConfig,
         cwd: PathBuf,
         agent: Agent,
         pane_id: String,
     ) {
-        self.watchdog_map().insert(
+        self.routine_map().insert(
             name.to_string(),
             PaneWatch::new(config, cwd, agent, pane_id),
         );
     }
 
-    fn forget_watchdog(&self, name: &str) {
-        self.watchdog_map().remove(name);
+    fn forget_routine(&self, name: &str) {
+        self.routine_map().remove(name);
     }
 
     /// Forget the watch for `name` only when it is still the watch that was
     /// registered for pane `pane_id`: a new `start_pane` may have reused
     /// the name and registered its own watch in between.
-    fn forget_watchdog_if(&self, name: &str, pane_id: &str) {
-        let mut map = self.watchdog_map();
+    fn forget_routine_if(&self, name: &str, pane_id: &str) {
+        let mut map = self.routine_map();
         if map
             .get(name)
             .is_some_and(|watch| watch.pane_id() == pane_id)
@@ -254,34 +254,34 @@ impl Shepherd {
         }
     }
 
-    /// Start the watchdog thread (see `watchdog`), when any launch profile
-    /// sets a watchdog. With none there is no thread and nothing to watch.
+    /// Start the routine thread (see `routine`), when any launch profile
+    /// sets a routine. With none there is no thread and nothing to watch.
     /// The binary calls this once at startup; tests drive
-    /// [`Shepherd::watchdog_tick_at`] with a fixed clock instead.
-    pub fn spawn_watchdog(&self) {
-        if !self.policy.has_watchdog() {
+    /// [`Shepherd::routine_tick_at`] with a fixed clock instead.
+    pub fn spawn_routine(&self) {
+        if !self.policy.has_routine() {
             return;
         }
         let sh = self.clone();
         let spawned = thread::Builder::new()
-            .name("watchdog".to_string())
+            .name("routine".to_string())
             .spawn(move || loop {
-                thread::sleep(watchdog::CHECK_INTERVAL);
-                sh.watchdog_tick_with(&Instant::now);
+                thread::sleep(routine::CHECK_INTERVAL);
+                sh.routine_tick_with(&Instant::now);
             });
         if let Err(err) = spawned {
-            eprintln!("openab-shepherd: watchdog: cannot start the watchdog thread: {err}");
+            eprintln!("openab-shepherd: routine: cannot start the routine thread: {err}");
         }
     }
 
-    /// One watchdog pass at a fixed time (tests). Production passes a
-    /// live clock through [`Shepherd::watchdog_tick_with`] instead.
+    /// One routine pass at a fixed time (tests). Production passes a
+    /// live clock through [`Shepherd::routine_tick_with`] instead.
     #[cfg(test)]
-    pub(crate) fn watchdog_tick_at(&self, now: Instant) {
-        self.watchdog_tick_with(&|| now);
+    pub(crate) fn routine_tick_at(&self, now: Instant) {
+        self.routine_tick_with(&|| now);
     }
 
-    /// One watchdog pass: read every watched pane once and act on what its
+    /// One routine pass: read every watched pane once and act on what its
     /// observation decided. A pane that no longer resolves is forgotten.
     ///
     /// The clock is consulted fresh for every pane, and again after a
@@ -290,27 +290,27 @@ impl Shepherd {
     /// tick-start instant would backdate later panes' idle clocks and
     /// record nudges earlier than they happened, cutting the cooldown
     /// short.
-    pub(crate) fn watchdog_tick_with(&self, clock: &dyn Fn() -> Instant) {
-        let names: Vec<String> = self.watchdog_map().keys().cloned().collect();
+    pub(crate) fn routine_tick_with(&self, clock: &dyn Fn() -> Instant) {
+        let names: Vec<String> = self.routine_map().keys().cloned().collect();
         for name in names {
-            // One pane's panic must not end the watchdog thread (or the
+            // One pane's panic must not end the routine thread (or the
             // checks of the panes after it) silently.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.watchdog_check(&name, clock);
+                self.routine_check(&name, clock);
             }));
             if result.is_err() {
                 eprintln!(
-                    "openab-shepherd: watchdog: pane {name}: the watchdog check panicked; \
+                    "openab-shepherd: routine: pane {name}: the routine check panicked; \
                      skipping this pane for this tick"
                 );
             }
         }
     }
 
-    fn watchdog_check(&self, name: &str, clock: &dyn Fn() -> Instant) {
+    fn routine_check(&self, name: &str, clock: &dyn Fn() -> Instant) {
         let now = clock();
         let (config, work_dir, todo_rel, pane_id, finished_state) = {
-            let map = self.watchdog_map();
+            let map = self.routine_map();
             let Some(watch) = map.get(name) else {
                 return;
             };
@@ -327,7 +327,7 @@ impl Shepherd {
             Ok(info) => info,
             Err(err) => {
                 if err.data["error"] == "not_found" {
-                    self.forget_watchdog_if(name, &pane_id);
+                    self.forget_routine_if(name, &pane_id);
                 }
                 return;
             }
@@ -341,15 +341,15 @@ impl Shepherd {
         // be again: forget the watch (id-qualified) instead of resolving
         // it and re-reading its todo file on every tick until removal.
         if !info.live {
-            self.forget_watchdog_if(name, &pane_id);
+            self.forget_routine_if(name, &pane_id);
             return;
         }
         let todo = match &todo_rel {
-            Some(rel) => watchdog::read_todo_in(&work_dir, rel),
+            Some(rel) => routine::read_todo_in(&work_dir, rel),
             None => Todo::NotConfigured,
         };
         let (event, idle_secs) = {
-            let mut map = self.watchdog_map();
+            let mut map = self.routine_map();
             let Some(watch) = map.get_mut(name) else {
                 return;
             };
@@ -361,7 +361,7 @@ impl Shepherd {
             }
             if watch.note_todo(todo) {
                 eprintln!(
-                    "openab-shepherd: watchdog: pane {name}: the configured todo file \
+                    "openab-shepherd: routine: pane {name}: the configured todo file \
                      became unreadable; not nudging while it is"
                 );
             }
@@ -372,8 +372,8 @@ impl Shepherd {
             WatchEvent::None => {}
             WatchEvent::GaveUp => {
                 eprintln!(
-                    "openab-shepherd: watchdog: pane {name}: {} nudges without progress \
-                     the watchdog did not cause; not nudging again until there is some",
+                    "openab-shepherd: routine gave up: pane {name}: {} nudges without progress \
+                     the routine did not cause; not nudging again until there is some",
                     config.max_consecutive_nudges
                 );
             }
@@ -400,21 +400,21 @@ impl Shepherd {
                     &config.nudge_text,
                     Some(guard),
                     Some(&pane_id),
-                    Some(self.watchdog_lock_wait),
-                    Some(audit::WATCHDOG_ACTOR),
+                    Some(self.routine_lock_wait),
+                    Some(audit::ROUTINE_ACTOR),
                 ) {
                     Ok(_) => {
                         // The send just returned: stamp it with a fresh
                         // time, not the observation time, or a slow send
                         // would eat into (or erase) the cooldown.
                         let sent_at = clock();
-                        if let Some(watch) = self.watchdog_map().get_mut(name) {
+                        if let Some(watch) = self.routine_map().get_mut(name) {
                             if watch.pane_id() == pane_id {
                                 watch.note_nudged(sent_at);
                             }
                         }
                         eprintln!(
-                            "openab-shepherd: watchdog: nudged pane {name} (turn {turn}, \
+                            "openab-shepherd: routine nudge: pane {name} (turn {turn}, \
                              idle {}s): {}",
                             idle_secs.unwrap_or(0),
                             reason.as_str()
@@ -437,7 +437,7 @@ impl Shepherd {
                         let pasted_unsubmitted = err.data["backend_detail"]
                             .as_str()
                             .is_some_and(crate::backend::is_pasted_unsubmitted);
-                        if let Some(watch) = self.watchdog_map().get_mut(name) {
+                        if let Some(watch) = self.routine_map().get_mut(name) {
                             if watch.pane_id() == pane_id {
                                 if pasted_unsubmitted {
                                     watch.note_pasted_unsubmitted(failed_at);
@@ -448,15 +448,15 @@ impl Shepherd {
                         }
                         if pasted_unsubmitted {
                             eprintln!(
-                                "openab-shepherd: watchdog: pane {name}: the nudge text was \
+                                "openab-shepherd: routine: pane {name}: the nudge text was \
                                  pasted but Enter was not pressed; not retrying, and the \
-                                 watchdog stops for this pane until a turn advance it did \
+                                 routine stops for this pane until a turn advance it did \
                                  not cause: {}",
                                 err.text
                             );
                         } else {
                             eprintln!(
-                                "openab-shepherd: watchdog: pane {name}: the nudge was not sent: {}",
+                                "openab-shepherd: routine: pane {name}: the nudge was not sent: {}",
                                 err.text
                             );
                         }
@@ -706,25 +706,25 @@ fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
             // earlier pane with the same name had.
             None => sh.forget_agent(name),
         }
-        // The watchdog watches only a pane a watchdog profile started here;
+        // The routine watches only a pane a routine profile started here;
         // any other start under this name drops an earlier registration.
         let watched = spec
             .profile
             .as_deref()
             .and_then(|p| sh.policy.profile(p))
-            .and_then(|p| p.watchdog.clone().map(|config| (config, p.agent)));
+            .and_then(|p| p.routine.clone().map(|config| (config, p.agent)));
         match (watched, spec.cwd.as_deref()) {
             (Some((config, agent)), Some(cwd)) => {
-                sh.register_watchdog(name, config, PathBuf::from(cwd), agent, info.id.clone())
+                sh.register_routine(name, config, PathBuf::from(cwd), agent, info.id.clone())
             }
             (Some(_), None) => {
                 eprintln!(
-                    "openab-shepherd: watchdog: pane {name}: the start named no working \
-                     directory, so the watchdog does not watch this pane"
+                    "openab-shepherd: routine: pane {name}: the start named no working \
+                     directory, so the routine does not watch this pane"
                 );
-                sh.forget_watchdog(name);
+                sh.forget_routine(name);
             }
-            _ => sh.forget_watchdog(name),
+            _ => sh.forget_routine(name),
         }
     }
     Ok(info.to_json())
@@ -938,7 +938,7 @@ fn send_input(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
 
 /// Type `text` into the pane `terminal` and press Enter: send_input's whole
 /// path, under the pane lock and with its refusals (a blocked pane, the Devin
-/// mode-switch rule). The watchdog's nudge goes through here too, so a nudge
+/// mode-switch rule). The routine's nudge goes through here too, so a nudge
 /// is refused exactly where a caller's text would be.
 ///
 /// This function must not grow caller-specific behaviour: the only
@@ -972,7 +972,7 @@ fn send_text_guarded(
 /// nothing is sent. `None` waits as every other tool does.
 ///
 /// `audit_actor` is set by a caller that does not come through `mcp::call_tool`
-/// (the watchdog), which records MCP calls itself: the send is then recorded
+/// (the routine), which records MCP calls itself: the send is then recorded
 /// as a `send_input` by that actor, before it, and is refused when the record
 /// cannot be written. This adds no behaviour to the send itself.
 fn send_text_within(
@@ -993,7 +993,7 @@ fn send_text_within(
             .map_err(|unavailable| unavailable.to_tool_error())?;
     }
     let (_guard, pane, now) = lock_pane_within(sh, terminal, lock_wait)?;
-    // A caller that observed a specific pane (the watchdog) can pin the
+    // A caller that observed a specific pane (the routine) can pin the
     // send to that pane's id: if the name was reused while waiting for
     // the pane lock, `lock_pane`'s own check sees two reads of the NEW
     // pane and passes, so compare against the observed id here.
@@ -1379,7 +1379,7 @@ fn remove_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     // and dropping the new pane's agent record would disable the Devin
     // mode-switch refusal for it.
     sh.forget_agent_if(&terminal, pane.as_str());
-    sh.forget_watchdog_if(&terminal, pane.as_str());
+    sh.forget_routine_if(&terminal, pane.as_str());
     Ok(json!({
         "name": terminal,
         "was_live": removed.was_live,
@@ -3681,12 +3681,12 @@ mod tests {
         assert!(!text.contains("kiro-cli"), "{text}");
     }
 
-    fn watchdog_policy(dir: &std::path::Path, watchdog: Value) -> LaunchPolicy {
+    fn routine_policy(dir: &std::path::Path, routine: Value) -> LaunchPolicy {
         let bin = fake_kiro(dir).to_string_lossy().into_owned();
         let text = json!({
             "profiles": [
                 {"name": "kiro", "argv": ["kiro-cli", "chat"], "cwds": [dir],
-                 "watchdog": watchdog}
+                 "routine": routine}
             ]
         });
         LaunchPolicy::from_json(&text.to_string())
@@ -3695,24 +3695,24 @@ mod tests {
     }
 
     /// A Shepherd over a runnable `fake`, with the fake able to see the pane
-    /// locks, and the `kiro` watchdog profile of `watchdog_policy` started as
+    /// locks, and the `kiro` routine profile of `routine_policy` started as
     /// pane `work`, finished at turn 3.
     fn watched_pane(
-        watchdog: Value,
+        routine: Value,
         tag: &str,
     ) -> (Shepherd, FakeBackend, crate::testutil::TempDir) {
-        watched_pane_with_caps(watchdog, tag, true)
+        watched_pane_with_caps(routine, tag, true)
     }
 
     fn watched_pane_with_caps(
-        watchdog: Value,
+        routine: Value,
         tag: &str,
         conditional_input: bool,
     ) -> (Shepherd, FakeBackend, crate::testutil::TempDir) {
         let dir = crate::testutil::TempDir::new(tag);
         let fake = FakeBackend::new(conditional_input);
         fake.state.lock().unwrap().runnable = true;
-        let sh = Shepherd::with_policy(fake.clone(), watchdog_policy(dir.path(), watchdog));
+        let sh = Shepherd::with_policy(fake.clone(), routine_policy(dir.path(), routine));
         fake.state.lock().unwrap().locks = Some(Arc::clone(sh.pane_locks()));
         call(
             &sh,
@@ -3731,17 +3731,17 @@ mod tests {
     }
 
     #[test]
-    fn the_watchdog_nudges_a_stalled_profile_pane() {
+    fn the_routine_nudges_a_stalled_profile_pane() {
         let (sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "cooldown_secs": 10,
                    "nudge_text": "check your todo and continue"}),
-            "tools-watchdog-nudge",
+            "tools-routine-nudge",
         );
         let t0 = Instant::now();
         // The first pass only starts the idle clock.
-        sh.watchdog_tick_at(t0);
+        sh.routine_tick_at(t0);
         assert!(fake.state.lock().unwrap().sent.is_empty());
-        sh.watchdog_tick_at(t0 + Duration::from_secs(11));
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
         assert_eq!(
             fake.state.lock().unwrap().sent,
             [("check your todo and continue".to_string(), true)]
@@ -3749,10 +3749,10 @@ mod tests {
     }
 
     #[test]
-    fn the_watchdog_never_nudges_a_blocked_pane() {
+    fn the_routine_never_nudges_a_blocked_pane() {
         let (sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
-            "tools-watchdog-blocked",
+            "tools-routine-blocked",
         );
         {
             let mut state = fake.state.lock().unwrap();
@@ -3762,14 +3762,14 @@ mod tests {
             });
         }
         let t0 = Instant::now();
-        sh.watchdog_tick_at(t0);
-        sh.watchdog_tick_at(t0 + Duration::from_secs(3600));
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(3600));
         assert!(fake.state.lock().unwrap().sent.is_empty());
     }
 
     #[test]
     fn a_guarded_nudge_is_refused_when_the_pane_changed_after_the_observation() {
-        // The watchdog conditions its send on the finished state and turn
+        // The routine conditions its send on the finished state and turn
         // it observed. If the pane flipped to blocked, went back to
         // working, or advanced to a new turn before the send, nothing is
         // typed.
@@ -3784,7 +3784,7 @@ mod tests {
             // the backend, as the `keys` guard tests show.)
             let (sh, fake, _dir) = watched_pane_with_caps(
                 json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
-                "tools-watchdog-flip",
+                "tools-routine-flip",
                 false,
             );
             {
@@ -3814,7 +3814,7 @@ mod tests {
     /// change at the read the nudge's send makes inside the pane lock (the
     /// third get of the next tick: the check's resolve, then the send's two),
     /// and tick again past the idle timeout. The backend is conditional, so
-    /// only the guard the watchdog built can refuse the send.
+    /// only the guard the routine built can refuse the send.
     fn tick_with_pane_flipping_before_the_send(
         sh: &Shepherd,
         fake: &FakeBackend,
@@ -3822,20 +3822,20 @@ mod tests {
         turn: Option<u64>,
     ) {
         let t0 = Instant::now();
-        sh.watchdog_tick_at(t0);
+        sh.routine_tick_at(t0);
         {
             let mut fake_state = fake.state.lock().unwrap();
             let gets = fake_state.calls.iter().filter(|c| **c == "get").count();
             fake_state.flip_on_get = Some((gets + 3, state, turn));
         }
-        sh.watchdog_tick_at(t0 + Duration::from_secs(11));
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
     }
 
     #[test]
-    fn the_watchdog_does_not_nudge_a_pane_that_went_blocked_before_the_send() {
+    fn the_routine_does_not_nudge_a_pane_that_went_blocked_before_the_send() {
         let (sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
-            "tools-watchdog-tick-blocked",
+            "tools-routine-tick-blocked",
         );
         tick_with_pane_flipping_before_the_send(&sh, &fake, State::Blocked, None);
         assert!(fake.calls().contains(&"send"), "the send was never tried");
@@ -3843,10 +3843,10 @@ mod tests {
     }
 
     #[test]
-    fn the_watchdog_does_not_nudge_a_pane_that_went_back_to_working_before_the_send() {
+    fn the_routine_does_not_nudge_a_pane_that_went_back_to_working_before_the_send() {
         let (sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
-            "tools-watchdog-tick-working",
+            "tools-routine-tick-working",
         );
         tick_with_pane_flipping_before_the_send(&sh, &fake, State::Working, None);
         assert!(fake.calls().contains(&"send"), "the send was never tried");
@@ -3854,10 +3854,10 @@ mod tests {
     }
 
     #[test]
-    fn the_watchdog_does_not_nudge_a_pane_whose_turn_advanced_before_the_send() {
+    fn the_routine_does_not_nudge_a_pane_whose_turn_advanced_before_the_send() {
         let (sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
-            "tools-watchdog-tick-turn",
+            "tools-routine-tick-turn",
         );
         tick_with_pane_flipping_before_the_send(&sh, &fake, State::Done, Some(4));
         assert!(fake.calls().contains(&"send"), "the send was never tried");
@@ -3865,29 +3865,29 @@ mod tests {
     }
 
     #[test]
-    fn the_watchdog_does_not_nudge_a_working_pane() {
+    fn the_routine_does_not_nudge_a_working_pane() {
         let (sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
-            "tools-watchdog-tick-idle-working",
+            "tools-routine-tick-idle-working",
         );
         fake.state.lock().unwrap().panes[0].status = Some(ProgramStatus {
             state: State::Working,
             kind: None,
         });
         let t0 = Instant::now();
-        sh.watchdog_tick_at(t0);
-        sh.watchdog_tick_at(t0 + Duration::from_secs(3600));
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(3600));
         assert!(!fake.calls().contains(&"send"));
         assert!(fake.state.lock().unwrap().sent.is_empty());
     }
 
     #[test]
-    fn the_watchdog_nudges_when_the_pane_is_unchanged_at_the_send() {
+    fn the_routine_nudges_when_the_pane_is_unchanged_at_the_send() {
         // Positive control for the flip tests: the same conditional backend
         // lets the send through when nothing changed.
         let (sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
-            "tools-watchdog-tick-control",
+            "tools-routine-tick-control",
         );
         tick_with_pane_flipping_before_the_send(&sh, &fake, State::Done, Some(3));
         assert_eq!(
@@ -3900,12 +3900,12 @@ mod tests {
     fn removing_a_watched_pane_unregisters_it() {
         let (sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
-            "tools-watchdog-remove",
+            "tools-routine-remove",
         );
         call(&sh, "remove_pane", &args(json!({"terminal": "work"}))).unwrap();
-        assert!(sh.watchdog_map().is_empty());
+        assert!(sh.routine_map().is_empty());
         let t0 = Instant::now();
-        sh.watchdog_tick_at(t0 + Duration::from_secs(3600));
+        sh.routine_tick_at(t0 + Duration::from_secs(3600));
         assert!(fake.state.lock().unwrap().sent.is_empty());
     }
 
@@ -3913,13 +3913,13 @@ mod tests {
     fn a_watched_pane_whose_program_ended_is_forgotten() {
         let (sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
-            "tools-watchdog-ended",
+            "tools-routine-ended",
         );
         fake.state.lock().unwrap().panes[0].live = false;
         let t0 = Instant::now();
-        sh.watchdog_tick_at(t0 + Duration::from_secs(3600));
+        sh.routine_tick_at(t0 + Duration::from_secs(3600));
         assert!(
-            sh.watchdog_map().is_empty(),
+            sh.routine_map().is_empty(),
             "the ended pane's watch was not forgotten"
         );
         assert!(fake.state.lock().unwrap().sent.is_empty());
@@ -3934,11 +3934,11 @@ mod tests {
         let (sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "cooldown_secs": 10,
                    "nudge_text": "continue"}),
-            "tools-watchdog-slow-send",
+            "tools-routine-slow-send",
         );
         let t0 = Instant::now();
         // First pass only starts the idle clock.
-        sh.watchdog_tick_at(t0);
+        sh.routine_tick_at(t0);
         assert!(fake.state.lock().unwrap().sent.is_empty());
         // Observation at t0+11 (nudge due); the send "returns" at t0+111.
         let calls = AtomicUsize::new(0);
@@ -3949,14 +3949,14 @@ mod tests {
                 t0 + Duration::from_secs(111)
             }
         };
-        sh.watchdog_tick_with(&slow_clock);
+        sh.routine_tick_with(&slow_clock);
         assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
         // 5 s after the send actually finished (but 105 s after the
         // observation): still inside the cooldown from the real send.
-        sh.watchdog_tick_at(t0 + Duration::from_secs(116));
+        sh.routine_tick_at(t0 + Duration::from_secs(116));
         assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
         // Past the cooldown from the real send time: nudged again.
-        sh.watchdog_tick_at(t0 + Duration::from_secs(122));
+        sh.routine_tick_at(t0 + Duration::from_secs(122));
         assert_eq!(fake.state.lock().unwrap().sent.len(), 2);
     }
 
@@ -3969,7 +3969,7 @@ mod tests {
         use std::sync::mpsc;
         let (sh, fake, dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
-            "tools-watchdog-remove-race",
+            "tools-routine-remove-race",
         );
         let (started_tx, started) = mpsc::channel();
         let (proceed_tx, proceed_rx) = mpsc::channel();
@@ -3982,8 +3982,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("remove never started");
         // The new start's registration under the reused name.
-        let config = sh.watchdog_map().get("work").unwrap().config().clone();
-        sh.register_watchdog(
+        let config = sh.routine_map().get("work").unwrap().config().clone();
+        sh.register_routine(
             "work",
             config,
             dir.path().to_path_buf(),
@@ -3995,7 +3995,7 @@ mod tests {
         sh.remember_agent("work", Agent::Devin, Some("id-work-2".to_string()));
         proceed_tx.send(()).unwrap();
         remover.join().unwrap().unwrap();
-        let map = sh.watchdog_map();
+        let map = sh.routine_map();
         assert_eq!(
             map.get("work").map(|watch| watch.pane_id()),
             Some("id-work-2"),
@@ -4010,11 +4010,11 @@ mod tests {
 
     #[test]
     fn a_guarded_send_pinned_to_another_pane_id_is_refused() {
-        // The watchdog passes the id of the pane it observed; if the name
+        // The routine passes the id of the pane it observed; if the name
         // now resolves to a different pane, nothing is typed into it.
         let (sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
-            "tools-watchdog-wrong-pane",
+            "tools-routine-wrong-pane",
         );
         let err = send_text_guarded(&sh, "work", "continue", None, Some("id-other")).unwrap_err();
         assert_eq!(err.data["error"], "terminal_changed");
@@ -4025,28 +4025,28 @@ mod tests {
     }
 
     #[test]
-    fn the_watchdog_nudges_only_while_the_todo_file_has_work_left() {
+    fn the_routine_nudges_only_while_the_todo_file_has_work_left() {
         let (sh, fake, dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue",
                    "todo_file": "TODO.md"}),
-            "tools-watchdog-todo",
+            "tools-routine-todo",
         );
         // The pane runs in the canonical directory the profile resolved to.
         let todo = std::fs::canonicalize(dir.path()).unwrap().join("TODO.md");
         std::fs::write(&todo, "- [x] everything is done\n").unwrap();
         let t0 = Instant::now();
-        sh.watchdog_tick_at(t0);
-        sh.watchdog_tick_at(t0 + Duration::from_secs(60));
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(60));
         assert!(fake.state.lock().unwrap().sent.is_empty());
         // Work appears in the file: the same stalled pane is nudged.
         std::fs::write(&todo, "- [x] done\n- [ ] one more thing\n").unwrap();
-        sh.watchdog_tick_at(t0 + Duration::from_secs(61));
+        sh.routine_tick_at(t0 + Duration::from_secs(61));
         assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
     }
 
     #[test]
-    fn a_pane_from_a_profile_without_a_watchdog_is_not_watched() {
-        let dir = crate::testutil::TempDir::new("tools-watchdog-unwatched");
+    fn a_pane_from_a_profile_without_a_routine_is_not_watched() {
+        let dir = crate::testutil::TempDir::new("tools-routine-unwatched");
         let fake = FakeBackend::new(true);
         fake.state.lock().unwrap().runnable = true;
         let sh = Shepherd::with_policy(fake.clone(), kiro_policy(dir.path(), false));
@@ -4066,18 +4066,18 @@ mod tests {
             state.panes[0].turn = Some(3);
         }
         let t0 = Instant::now();
-        sh.watchdog_tick_at(t0);
-        sh.watchdog_tick_at(t0 + Duration::from_secs(3600));
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(3600));
         assert!(fake.state.lock().unwrap().sent.is_empty());
     }
 
     #[test]
-    fn restarting_a_name_from_a_profile_without_a_watchdog_forgets_the_old_watch() {
-        // Start `work` from a watchdog profile, then start the same name
+    fn restarting_a_name_from_a_profile_without_a_routine_forgets_the_old_watch() {
+        // Start `work` from a routine profile, then start the same name
         // from a profile without one (here with arbitrary argv, which the
         // policy allows): the old registration must be dropped, or the
         // new pane would be nudged under the old profile's rules.
-        let dir = crate::testutil::TempDir::new("tools-watchdog-restart-plain");
+        let dir = crate::testutil::TempDir::new("tools-routine-restart-plain");
         let fake = FakeBackend::new(true);
         fake.state.lock().unwrap().runnable = true;
         let bin = fake_kiro(dir.path()).to_string_lossy().into_owned();
@@ -4085,7 +4085,7 @@ mod tests {
             "allow_arbitrary_command": true,
             "profiles": [
                 {"name": "kiro", "argv": ["kiro-cli", "chat"], "cwds": [dir.path()],
-                 "watchdog": {"idle_timeout_secs": 10, "nudge_text": "continue"}}
+                 "routine": {"idle_timeout_secs": 10, "nudge_text": "continue"}}
             ]
         });
         let policy = LaunchPolicy::from_json(&text.to_string())
@@ -4099,7 +4099,7 @@ mod tests {
             &args(json!({"profile": "kiro", "name": "work"})),
         )
         .unwrap();
-        assert_eq!(sh.watchdog_map().len(), 1);
+        assert_eq!(sh.routine_map().len(), 1);
         call(
             &sh,
             "start_pane",
@@ -4107,31 +4107,31 @@ mod tests {
         )
         .unwrap();
         assert!(
-            sh.watchdog_map().is_empty(),
+            sh.routine_map().is_empty(),
             "the restart kept the old pane's watch"
         );
     }
 
     #[test]
-    fn the_watchdog_skips_a_pane_whose_lock_stays_held_and_nudges_it_later() {
+    fn the_routine_skips_a_pane_whose_lock_stays_held_and_nudges_it_later() {
         // Another call holds the pane's lock (a long send or wait). The
-        // watchdog thread must not block on it: that would stall every
+        // routine thread must not block on it: that would stall every
         // other watched pane. It skips the pane for the tick, counts
         // nothing, and nudges once the lock is free.
         let (mut sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "cooldown_secs": 10,
                    "nudge_text": "continue"}),
-            "tools-watchdog-lock-held",
+            "tools-routine-lock-held",
         );
-        sh.watchdog_lock_wait = Duration::from_millis(50);
+        sh.routine_lock_wait = Duration::from_millis(50);
         let t0 = Instant::now();
-        sh.watchdog_tick_at(t0);
+        sh.routine_tick_at(t0);
         let held = sh.pane_locks().lock("id-work");
         let (done_tx, done) = std::sync::mpsc::channel();
         let ticker = {
             let sh = sh.clone();
             thread::spawn(move || {
-                sh.watchdog_tick_at(t0 + Duration::from_secs(11));
+                sh.routine_tick_at(t0 + Duration::from_secs(11));
                 done_tx.send(()).unwrap();
             })
         };
@@ -4139,11 +4139,11 @@ mod tests {
         // Release the lock first, so a blocked tick (a failing run) ends too.
         drop(held);
         ticker.join().unwrap();
-        assert!(finished, "the watchdog tick blocked on the held pane lock");
+        assert!(finished, "the routine tick blocked on the held pane lock");
         assert!(fake.state.lock().unwrap().sent.is_empty());
         // Nothing was counted against the pane: the next tick, 1 s later and
         // well inside what a counted attempt's cooldown would be, nudges.
-        sh.watchdog_tick_at(t0 + Duration::from_secs(12));
+        sh.routine_tick_at(t0 + Duration::from_secs(12));
         assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
     }
 
@@ -4156,26 +4156,26 @@ mod tests {
         let json_config = json!({"idle_timeout_secs": 10, "cooldown_secs": 10,
                                  "nudge_text": "continue"});
         // The backend's own paste-without-Enter failure: no second paste.
-        let (sh, fake, _dir) = watched_pane(json_config.clone(), "tools-watchdog-pasted");
+        let (sh, fake, _dir) = watched_pane(json_config.clone(), "tools-routine-pasted");
         fake.state.lock().unwrap().send_error = Some(crate::backend::pasted_unsubmitted(
             "id-work",
             "the program became blocked",
         ));
         let t0 = Instant::now();
-        sh.watchdog_tick_at(t0);
-        sh.watchdog_tick_at(t0 + Duration::from_secs(11));
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
         assert_eq!(sends_tried(&fake), 1);
-        sh.watchdog_tick_at(t0 + Duration::from_secs(3600));
-        assert_eq!(sends_tried(&fake), 1, "the watchdog pasted a second copy");
+        sh.routine_tick_at(t0 + Duration::from_secs(3600));
+        assert_eq!(sends_tried(&fake), 1, "the routine pasted a second copy");
         // Control: any other failure is counted (cooldown) and retried after.
-        let (sh, fake, _dir) = watched_pane(json_config, "tools-watchdog-failed");
+        let (sh, fake, _dir) = watched_pane(json_config, "tools-routine-failed");
         fake.state.lock().unwrap().send_error = Some(BackendError::new(ErrorKind::Other, "boom"));
-        sh.watchdog_tick_at(t0);
-        sh.watchdog_tick_at(t0 + Duration::from_secs(11));
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
         assert_eq!(sends_tried(&fake), 1);
-        sh.watchdog_tick_at(t0 + Duration::from_secs(12));
+        sh.routine_tick_at(t0 + Duration::from_secs(12));
         assert_eq!(sends_tried(&fake), 1, "a failed nudge skipped the cooldown");
-        sh.watchdog_tick_at(t0 + Duration::from_secs(22));
+        sh.routine_tick_at(t0 + Duration::from_secs(22));
         assert_eq!(sends_tried(&fake), 2);
     }
 
@@ -4187,22 +4187,22 @@ mod tests {
         let (sh, fake, dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue",
                    "todo_file": "TODO.md"}),
-            "tools-watchdog-cwd-swap",
+            "tools-routine-cwd-swap",
         );
         let cwd = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(cwd.join("TODO.md"), "- [x] everything is done\n").unwrap();
-        let outside = crate::testutil::TempDir::new("tools-watchdog-cwd-swap-outside");
+        let outside = crate::testutil::TempDir::new("tools-routine-cwd-swap-outside");
         std::fs::write(outside.path().join("TODO.md"), "- [ ] planted\n").unwrap();
         let moved = cwd.with_extension("moved");
         std::fs::rename(&cwd, &moved).unwrap();
         std::os::unix::fs::symlink(outside.path(), &cwd).unwrap();
         let t0 = Instant::now();
-        sh.watchdog_tick_at(t0);
-        sh.watchdog_tick_at(t0 + Duration::from_secs(60));
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(60));
         let sent = fake.state.lock().unwrap().sent.len();
         // Put the directory back so the temp dir cleans up.
         std::fs::remove_file(&cwd).unwrap();
         std::fs::rename(&moved, &cwd).unwrap();
-        assert_eq!(sent, 0, "the watchdog followed the swapped symlink");
+        assert_eq!(sent, 0, "the routine followed the swapped symlink");
     }
 }

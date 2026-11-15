@@ -41,12 +41,12 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_PROFILES: usize = 64;
 const MAX_ARGV: usize = 256;
 const MAX_CWDS: usize = 32;
-/// Bounds on a profile's `watchdog` seconds fields.
-const WATCHDOG_MIN_IDLE_TIMEOUT_SECS: u64 = 10;
-const WATCHDOG_MAX_SECS: u64 = 86_400;
-/// Bounds and default for a profile's `watchdog` nudge count.
-const WATCHDOG_MAX_NUDGES: u64 = 100;
-const WATCHDOG_DEFAULT_NUDGES: u64 = 3;
+/// Bounds on a profile's `routine` seconds fields.
+const ROUTINE_MIN_IDLE_TIMEOUT_SECS: u64 = 10;
+const ROUTINE_MAX_SECS: u64 = 86_400;
+/// Bounds and default for a profile's `routine` nudge count.
+const ROUTINE_MAX_NUDGES: u64 = 100;
+const ROUTINE_DEFAULT_NUDGES: u64 = 3;
 /// The native backend's limit on extra variables.
 const MAX_ENV: usize = 32;
 const SECURITY_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -74,15 +74,15 @@ pub enum EnvSource {
     Literal(String),
 }
 
-/// One profile's watchdog: Shepherd's own liveness check on the panes the
-/// profile starts (see `watchdog.rs`). Off unless a profile sets it.
+/// One profile's routine: Shepherd's own liveness check on the panes the
+/// profile starts (see `routine.rs`). Off unless a profile sets it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WatchdogConfig {
+pub struct RoutineConfig {
     /// How long a finished turn must sit untouched before a nudge.
     pub idle_timeout: Duration,
     /// The least time between two nudges to the same pane.
     pub cooldown: Duration,
-    /// Nudges without the turn advancing before the watchdog stops for the
+    /// Nudges without the turn advancing before the routine stops for the
     /// pane (an advancing turn clears the stop).
     pub max_consecutive_nudges: u32,
     /// A todo file in the pane's working directory; when set, a nudge also
@@ -106,8 +106,8 @@ pub struct Profile {
     pub permission_mode: PermissionMode,
     /// Lets a kiro profile declare `permission_mode` bypass. Ignored for devin.
     pub allow_bypass: bool,
-    /// The profile's watchdog, when it sets one.
-    pub watchdog: Option<WatchdogConfig>,
+    /// The profile's routine, when it sets one.
+    pub routine: Option<RoutineConfig>,
 }
 
 impl Profile {
@@ -284,9 +284,9 @@ impl LaunchPolicy {
         self.profiles.iter().find(|p| p.name == name)
     }
 
-    /// Whether any profile sets a watchdog.
-    pub fn has_watchdog(&self) -> bool {
-        self.profiles.iter().any(|p| p.watchdog.is_some())
+    /// Whether any profile sets a routine.
+    pub fn has_routine(&self) -> bool {
+        self.profiles.iter().any(|p| p.routine.is_some())
     }
 
     /// What a caller may start: profile names and allowed directories, and
@@ -543,6 +543,7 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
             "extra_args",
             "cwds",
             "env",
+            "routine",
             "watchdog",
         ],
         &at,
@@ -692,7 +693,19 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
             .ok_or_else(|| err(format!("{at}: env: {key} must be a string")))?;
         env.push((key.clone(), parse_source(text, &at, key, keychain_ok)?));
     }
-    let watchdog = parse_watchdog(map.get("watchdog"), &at, agent)?;
+    let routine = match (map.get("routine"), map.get("watchdog")) {
+        (Some(_), Some(_)) => {
+            return Err(err(format!(
+                "{at}: sets both routine and watchdog; watchdog is the old name of routine, so remove watchdog"
+            )));
+        }
+        (None, Some(old)) => {
+            // Deprecated alias (shipped in v0.4.0): same section, one warning.
+            eprintln!("{}", watchdog_alias_warning(&at));
+            parse_routine(Some(old), &at, agent)?
+        }
+        (new, None) => parse_routine(new, &at, agent)?,
+    };
     Ok(Profile {
         name,
         argv,
@@ -701,12 +714,12 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         agent,
         permission_mode,
         allow_bypass,
-        watchdog,
+        routine,
     })
 }
 
-/// A whole number of seconds from a `watchdog` field, when the field is set.
-fn watchdog_secs(
+/// A whole number of seconds from a `routine` field, when the field is set.
+fn routine_secs(
     map: &Map<String, Value>,
     field: &str,
     at: &str,
@@ -715,17 +728,17 @@ fn watchdog_secs(
         None => Ok(None),
         Some(value) => value.as_u64().map(Some).ok_or_else(|| {
             err(format!(
-                "{at}: watchdog: {field} must be a whole number of seconds"
+                "{at}: routine: {field} must be a whole number of seconds"
             ))
         }),
     }
 }
 
-/// A profile's `watchdog` section. Every number is bounded; the nudge text
-/// follows the same input rules as `send_input`'s text, because the watchdog
+/// A profile's `routine` section. Every number is bounded; the nudge text
+/// follows the same input rules as `send_input`'s text, because the routine
 /// types it through that path.
-/// A whole number (not seconds) from a `watchdog` field, when set.
-fn watchdog_count(
+/// A whole number (not seconds) from a `routine` field, when set.
+fn routine_count(
     map: &Map<String, Value>,
     field: &str,
     at: &str,
@@ -735,7 +748,7 @@ fn watchdog_count(
         Some(value) => value
             .as_u64()
             .map(Some)
-            .ok_or_else(|| err(format!("{at}: watchdog: {field} must be a whole number"))),
+            .ok_or_else(|| err(format!("{at}: routine: {field} must be a whole number"))),
     }
 }
 
@@ -789,17 +802,21 @@ fn is_bare_confirmation(text: &str) -> bool {
         || (word.len() <= 2 && word.chars().all(|c| c.is_ascii_digit()))
 }
 
-fn parse_watchdog(
+fn watchdog_alias_warning(at: &str) -> String {
+    format!("openab-shepherd: {at}: the `watchdog` key is deprecated; rename it to `routine`")
+}
+
+fn parse_routine(
     value: Option<&Value>,
     at: &str,
     agent: Agent,
-) -> Result<Option<WatchdogConfig>, ConfigError> {
+) -> Result<Option<RoutineConfig>, ConfigError> {
     let Some(value) = value else {
         return Ok(None);
     };
     let map = value
         .as_object()
-        .ok_or_else(|| err(format!("{at}: watchdog must be an object")))?;
+        .ok_or_else(|| err(format!("{at}: routine must be an object")))?;
     only_keys(
         map,
         &[
@@ -809,50 +826,50 @@ fn parse_watchdog(
             "todo_file",
             "nudge_text",
         ],
-        &format!("{at}: watchdog"),
+        &format!("{at}: routine"),
     )?;
-    let idle_timeout_secs = watchdog_secs(map, "idle_timeout_secs", at)?
-        .ok_or_else(|| err(format!("{at}: watchdog needs idle_timeout_secs")))?;
-    if !(WATCHDOG_MIN_IDLE_TIMEOUT_SECS..=WATCHDOG_MAX_SECS).contains(&idle_timeout_secs) {
+    let idle_timeout_secs = routine_secs(map, "idle_timeout_secs", at)?
+        .ok_or_else(|| err(format!("{at}: routine needs idle_timeout_secs")))?;
+    if !(ROUTINE_MIN_IDLE_TIMEOUT_SECS..=ROUTINE_MAX_SECS).contains(&idle_timeout_secs) {
         return Err(err(format!(
-            "{at}: watchdog: idle_timeout_secs must be between {WATCHDOG_MIN_IDLE_TIMEOUT_SECS} and {WATCHDOG_MAX_SECS}"
+            "{at}: routine: idle_timeout_secs must be between {ROUTINE_MIN_IDLE_TIMEOUT_SECS} and {ROUTINE_MAX_SECS}"
         )));
     }
-    let cooldown_secs = watchdog_secs(map, "cooldown_secs", at)?.unwrap_or(idle_timeout_secs);
-    if cooldown_secs > WATCHDOG_MAX_SECS {
+    let cooldown_secs = routine_secs(map, "cooldown_secs", at)?.unwrap_or(idle_timeout_secs);
+    if cooldown_secs > ROUTINE_MAX_SECS {
         return Err(err(format!(
-            "{at}: watchdog: cooldown_secs must be between 0 and {WATCHDOG_MAX_SECS}"
+            "{at}: routine: cooldown_secs must be between 0 and {ROUTINE_MAX_SECS}"
         )));
     }
     let max_nudges =
-        watchdog_count(map, "max_consecutive_nudges", at)?.unwrap_or(WATCHDOG_DEFAULT_NUDGES);
-    if !(1..=WATCHDOG_MAX_NUDGES).contains(&max_nudges) {
+        routine_count(map, "max_consecutive_nudges", at)?.unwrap_or(ROUTINE_DEFAULT_NUDGES);
+    if !(1..=ROUTINE_MAX_NUDGES).contains(&max_nudges) {
         return Err(err(format!(
-            "{at}: watchdog: max_consecutive_nudges must be between 1 and {WATCHDOG_MAX_NUDGES}"
+            "{at}: routine: max_consecutive_nudges must be between 1 and {ROUTINE_MAX_NUDGES}"
         )));
     }
     let nudge_text = match map.get("nudge_text") {
-        None => return Err(err(format!("{at}: watchdog needs nudge_text"))),
+        None => return Err(err(format!("{at}: routine needs nudge_text"))),
         Some(Value::String(text)) => {
-            validate_input(text).map_err(|e| err(format!("{at}: watchdog: nudge_text: {e}")))?
+            validate_input(text).map_err(|e| err(format!("{at}: routine: nudge_text: {e}")))?
         }
-        Some(_) => return Err(err(format!("{at}: watchdog: nudge_text must be a string"))),
+        Some(_) => return Err(err(format!("{at}: routine: nudge_text must be a string"))),
     };
     if is_bare_confirmation(&nudge_text) {
         return Err(err(format!(
-            "{at}: watchdog: nudge_text may not be a bare confirmation or menu answer such as y, yes, 1 or ok: a nudge that lands in a dialog Shepherd did not see would answer it. Use a sentence that tells the agent what to do"
+            "{at}: routine: nudge_text may not be a bare confirmation or menu answer such as y, yes, 1 or ok: a nudge that lands in a dialog Shepherd did not see would answer it. Use a sentence that tells the agent what to do"
         )));
     }
     if agent == Agent::Devin && nudge_text.trim().eq_ignore_ascii_case("/yolo") {
         return Err(err(format!(
-            "{at}: watchdog: nudge_text may not be /yolo for devin: the Devin mode-switch rule refuses it at runtime, so the watchdog could never send it"
+            "{at}: routine: nudge_text may not be /yolo for devin: the Devin mode-switch rule refuses it at runtime, so the routine could never send it"
         )));
     }
     let todo_file = match map.get("todo_file") {
         None => None,
         Some(Value::String(text)) => {
             let text =
-                validate_input(text).map_err(|e| err(format!("{at}: watchdog: todo_file: {e}")))?;
+                validate_input(text).map_err(|e| err(format!("{at}: routine: todo_file: {e}")))?;
             let path = Path::new(&text);
             let escapes = path.is_absolute()
                 || path.components().any(|part| {
@@ -863,14 +880,14 @@ fn parse_watchdog(
                 });
             if escapes {
                 return Err(err(format!(
-                    "{at}: watchdog: todo_file must be a relative path inside the working directory"
+                    "{at}: routine: todo_file must be a relative path inside the working directory"
                 )));
             }
             Some(path.to_path_buf())
         }
-        Some(_) => return Err(err(format!("{at}: watchdog: todo_file must be a string"))),
+        Some(_) => return Err(err(format!("{at}: routine: todo_file must be a string"))),
     };
-    Ok(Some(WatchdogConfig {
+    Ok(Some(RoutineConfig {
         idle_timeout: Duration::from_secs(idle_timeout_secs),
         cooldown: Duration::from_secs(cooldown_secs),
         max_consecutive_nudges: u32::try_from(max_nudges).unwrap_or(u32::MAX),
@@ -1542,57 +1559,94 @@ mod tests {
         );
     }
 
-    fn watchdog_policy(dir: &Path, watchdog: Value) -> String {
+    fn routine_policy(dir: &Path, routine: Value) -> String {
         json!({"profiles": [{"name": "kiro", "argv": ["kiro-cli", "chat"],
-            "cwds": [dir], "watchdog": watchdog}]})
+            "cwds": [dir], "routine": routine}]})
         .to_string()
     }
 
     #[test]
-    fn a_watchdog_section_parses_with_its_defaults() {
-        let dir = TempDir::new("profiles-watchdog-defaults");
-        let p = policy(&watchdog_policy(
+    fn a_routine_section_parses_with_its_defaults() {
+        let dir = TempDir::new("profiles-routine-defaults");
+        let p = policy(&routine_policy(
             dir.path(),
             json!({"idle_timeout_secs": 120, "nudge_text": "keep going"}),
         ));
-        let watchdog = p.profile("kiro").unwrap().watchdog.clone().unwrap();
-        assert_eq!(watchdog.idle_timeout, Duration::from_secs(120));
+        let routine = p.profile("kiro").unwrap().routine.clone().unwrap();
+        assert_eq!(routine.idle_timeout, Duration::from_secs(120));
         // The cooldown defaults to the idle timeout.
-        assert_eq!(watchdog.cooldown, Duration::from_secs(120));
-        assert_eq!(watchdog.max_consecutive_nudges, 3);
-        assert_eq!(watchdog.todo_file, None);
-        assert_eq!(watchdog.nudge_text, "keep going");
-        assert!(p.has_watchdog());
+        assert_eq!(routine.cooldown, Duration::from_secs(120));
+        assert_eq!(routine.max_consecutive_nudges, 3);
+        assert_eq!(routine.todo_file, None);
+        assert_eq!(routine.nudge_text, "keep going");
+        assert!(p.has_routine());
     }
 
     #[test]
-    fn a_watchdog_section_parses_every_field() {
-        let dir = TempDir::new("profiles-watchdog-full");
-        let p = policy(&watchdog_policy(
+    fn a_routine_section_parses_every_field() {
+        let dir = TempDir::new("profiles-routine-full");
+        let p = policy(&routine_policy(
             dir.path(),
             json!({"idle_timeout_secs": 300, "cooldown_secs": 45,
                    "max_consecutive_nudges": 5, "todo_file": "notes/TODO.md",
                    "nudge_text": "Check your todo list."}),
         ));
-        let watchdog = p.profile("kiro").unwrap().watchdog.clone().unwrap();
-        assert_eq!(watchdog.idle_timeout, Duration::from_secs(300));
-        assert_eq!(watchdog.cooldown, Duration::from_secs(45));
-        assert_eq!(watchdog.max_consecutive_nudges, 5);
-        assert_eq!(watchdog.todo_file, Some(PathBuf::from("notes/TODO.md")));
-        assert_eq!(watchdog.nudge_text, "Check your todo list.");
+        let routine = p.profile("kiro").unwrap().routine.clone().unwrap();
+        assert_eq!(routine.idle_timeout, Duration::from_secs(300));
+        assert_eq!(routine.cooldown, Duration::from_secs(45));
+        assert_eq!(routine.max_consecutive_nudges, 5);
+        assert_eq!(routine.todo_file, Some(PathBuf::from("notes/TODO.md")));
+        assert_eq!(routine.nudge_text, "Check your todo list.");
     }
 
     #[test]
-    fn a_profile_without_a_watchdog_section_has_none() {
-        let dir = TempDir::new("profiles-watchdog-absent");
+    fn the_old_watchdog_key_is_still_accepted_as_routine() {
+        let dir = TempDir::new("profiles-routine-alias");
+        let p = policy(
+            &json!({"profiles": [{"name": "kiro", "argv": ["kiro-cli", "chat"],
+                "cwds": [dir.path()],
+                "watchdog": {"idle_timeout_secs": 120, "nudge_text": "keep going"}}]})
+            .to_string(),
+        );
+        let routine = p.profile("kiro").unwrap().routine.clone().unwrap();
+        assert_eq!(routine.idle_timeout, Duration::from_secs(120));
+        assert_eq!(routine.nudge_text, "keep going");
+        assert!(p.has_routine());
+    }
+
+    #[test]
+    fn the_watchdog_alias_warning_is_one_line_naming_the_fix() {
+        let w = watchdog_alias_warning("profile kiro");
+        assert!(!w.contains('\n'), "{w}");
+        assert!(w.contains("`watchdog` key is deprecated") && w.contains("rename it to `routine`"));
+    }
+
+    #[test]
+    fn setting_both_routine_and_watchdog_is_refused() {
+        let dir = TempDir::new("profiles-routine-both");
+        let section = json!({"idle_timeout_secs": 120, "nudge_text": "keep going"});
+        let message = refused(
+            &json!({"profiles": [{"name": "kiro", "argv": ["kiro-cli", "chat"],
+                "cwds": [dir.path()], "routine": section, "watchdog": section}]})
+            .to_string(),
+        );
+        assert!(
+            message.contains("both routine and watchdog") && message.contains("remove watchdog"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_profile_without_a_routine_section_has_none() {
+        let dir = TempDir::new("profiles-routine-absent");
         let p = policy(&one_profile(dir.path(), json!({})));
-        assert!(p.profile("kiro").unwrap().watchdog.is_none());
-        assert!(!p.has_watchdog());
+        assert!(p.profile("kiro").unwrap().routine.is_none());
+        assert!(!p.has_routine());
     }
 
     #[test]
-    fn a_watchdog_section_is_refused_when_wrong() {
-        let dir = TempDir::new("profiles-watchdog-refused");
+    fn a_routine_section_is_refused_when_wrong() {
+        let dir = TempDir::new("profiles-routine-refused");
         let cases: Vec<Value> = vec![
             json!("soon"),
             json!({"nudge_text": "x"}),
@@ -1610,30 +1664,30 @@ mod tests {
             json!({"idle_timeout_secs": 120, "nudge_text": "x", "bogus": 1}),
         ];
         for case in cases {
-            let message = refused(&watchdog_policy(dir.path(), case.clone()));
-            assert!(message.contains("watchdog"), "{case}: {message}");
+            let message = refused(&routine_policy(dir.path(), case.clone()));
+            assert!(message.contains("routine"), "{case}: {message}");
         }
     }
 
     #[test]
-    fn a_devin_watchdog_may_not_nudge_with_yolo() {
-        let dir = TempDir::new("profiles-watchdog-devin-yolo");
+    fn a_devin_routine_may_not_nudge_with_yolo() {
+        let dir = TempDir::new("profiles-routine-devin-yolo");
         let text = json!({"profiles": [{"name": "dn", "argv": ["devin"],
             "cwds": [dir.path()], "agent": "devin",
-            "watchdog": {"idle_timeout_secs": 120, "nudge_text": "/yolo"}}]})
+            "routine": {"idle_timeout_secs": 120, "nudge_text": "/yolo"}}]})
         .to_string();
         let message = refused(&text);
-        assert!(message.contains("watchdog"), "{message}");
+        assert!(message.contains("routine"), "{message}");
         assert!(message.contains("/yolo"), "{message}");
     }
 
     #[test]
-    fn a_watchdog_nudge_text_may_not_be_a_bare_confirmation() {
-        let dir = TempDir::new("profiles-watchdog-bare-confirmation");
+    fn a_routine_nudge_text_may_not_be_a_bare_confirmation() {
+        let dir = TempDir::new("profiles-routine-bare-confirmation");
         let with = |nudge: &str| {
             json!({"profiles": [{"name": "kiro", "argv": ["kiro-cli", "chat"],
                 "cwds": [dir.path()],
-                "watchdog": {"idle_timeout_secs": 120, "nudge_text": nudge}}]})
+                "routine": {"idle_timeout_secs": 120, "nudge_text": nudge}}]})
             .to_string()
         };
         for bad in [
@@ -1684,7 +1738,7 @@ mod tests {
             assert_eq!(
                 p.profile("kiro")
                     .unwrap()
-                    .watchdog
+                    .routine
                     .as_ref()
                     .unwrap()
                     .nudge_text,
