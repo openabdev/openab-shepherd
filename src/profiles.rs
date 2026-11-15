@@ -701,9 +701,7 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         }
         (None, Some(old)) => {
             // Deprecated alias (shipped in v0.4.0): same section, one warning.
-            eprintln!(
-                "openab-shepherd: {at}: the `watchdog` key is deprecated; rename it to `routine`"
-            );
+            eprintln!("{}", watchdog_alias_warning(&at));
             parse_routine(Some(old), &at, agent)?
         }
         (new, None) => parse_routine(new, &at, agent)?,
@@ -802,6 +800,10 @@ fn is_bare_confirmation(text: &str) -> bool {
     word.chars().count() <= 1
         || ANSWERS.contains(&word.as_str())
         || (word.len() <= 2 && word.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn watchdog_alias_warning(at: &str) -> String {
+    format!("openab-shepherd: {at}: the `watchdog` key is deprecated; rename it to `routine`")
 }
 
 fn parse_routine(
@@ -1610,6 +1612,13 @@ mod tests {
         assert_eq!(routine.idle_timeout, Duration::from_secs(120));
         assert_eq!(routine.nudge_text, "keep going");
         assert!(p.has_routine());
+    }
+
+    #[test]
+    fn the_watchdog_alias_warning_is_one_line_naming_the_fix() {
+        let w = watchdog_alias_warning("profile kiro");
+        assert!(!w.contains('\n'), "{w}");
+        assert!(w.contains("`watchdog` key is deprecated") && w.contains("rename it to `routine`"));
     }
 
     #[test]
