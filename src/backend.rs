@@ -446,6 +446,10 @@ pub enum ErrorKind {
     ScreenRefused,
     /// The pane's program has ended.
     Finished,
+    /// The pane was picked up again from its output tail, so its screen and
+    /// modes may differ from what the program believes; nothing was sent.
+    /// It clears when the program next repaints.
+    Replayed,
     /// The backend cannot do this.
     Unsupported(String),
     /// The backend refused the request's parameters.
@@ -503,6 +507,7 @@ impl BackendError {
             ErrorKind::StatusMismatch => "status_mismatch",
             ErrorKind::ScreenRefused => "screen_refused",
             ErrorKind::Finished => "pane_finished",
+            ErrorKind::Replayed => "pane_replayed",
             ErrorKind::Unsupported(_) => "unsupported",
             ErrorKind::InvalidInput => "invalid_input",
             ErrorKind::Protocol | ErrorKind::Other => "backend_error",

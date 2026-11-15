@@ -1408,6 +1408,9 @@ fn backend_failure(terminal: Option<&str>, err: BackendError) -> ToolError {
             format!("the screen check on {pane} refused the key; nothing was sent")
         }
         ErrorKind::Finished => format!("{pane} has finished; its program is no longer running"),
+        ErrorKind::Replayed => format!(
+            "{pane} was picked up after a restart and its screen is not yet trusted; nothing was sent"
+        ),
         ErrorKind::Unsupported(op) => format!("the terminal backend does not support {op}"),
         ErrorKind::InvalidInput => "the terminal backend refused the request".to_string(),
         ErrorKind::Protocol => "the terminal backend sent a reply Shepherd cannot use".to_string(),
@@ -3358,6 +3361,28 @@ mod tests {
         assert_eq!(
             argv[1..].iter().map(String::as_str).collect::<Vec<_>>(),
             ["chat", "--trust-workspace"]
+        );
+    }
+
+    #[test]
+    fn a_replayed_pane_reaches_callers_as_pane_replayed() {
+        let failure = backend_failure(
+            Some("work"),
+            BackendError::new(ErrorKind::Replayed, "raw backend text --force"),
+        );
+        assert_eq!(failure.data["error"], "pane_replayed");
+        assert_eq!(failure.data["terminal"], "work");
+        assert_eq!(failure.data["backend_detail"], "raw backend text --force");
+        assert!(failure.text.starts_with("pane_replayed: "));
+        assert!(
+            failure.text.contains("nothing was sent"),
+            "{}",
+            failure.text
+        );
+        assert!(
+            !failure.text.contains("raw backend text"),
+            "{}",
+            failure.text
         );
     }
 

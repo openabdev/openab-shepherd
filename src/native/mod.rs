@@ -18,6 +18,7 @@
 mod host;
 pub(crate) mod keys;
 mod meta;
+mod replay;
 pub(crate) mod status;
 pub(crate) mod term;
 #[cfg(test)]
@@ -26,6 +27,8 @@ mod tests;
 mod tests_forged;
 #[cfg(test)]
 mod tests_output;
+#[cfg(test)]
+mod tests_replay;
 #[cfg(test)]
 mod tests_tail;
 
@@ -44,16 +47,18 @@ use host::local::LocalHost;
 use host::{pty, HostEvents, KillOutcome, PtyHost, SpawnReq, KILL_GRACE};
 use keys::encode as encode_key;
 use meta::{MetaStore, PaneMeta};
+use replay::replay;
 use status::{LogEntry, Report, StatusLog, Tracker};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use term::Emulator;
+use term::{Emulator, COLS, ROWS};
 
 // Bounds and defaults (ADR §13). The screen size and scrollback are
 // `term::{ROWS, COLS, SCROLLBACK}`, the status log length is
@@ -72,6 +77,10 @@ const READ_SYNC_WAIT: Duration = Duration::from_millis(150);
 const INTERRUPT_DEFAULT: Duration = Duration::from_secs(10);
 /// How often interrupt re-reads the foreground group.
 const INTERRUPT_POLL: Duration = Duration::from_millis(50);
+/// How long an adopted pane keeps the one-row-smaller terminal before the
+/// return resize, so a program that repaints on SIGWINCH has painted the
+/// smaller size by the time the offset that counts is taken.
+const NUDGE_PAUSE: Duration = Duration::from_millis(150);
 
 const CAPABILITIES: Capabilities = Capabilities {
     conditional_input: true,
@@ -96,6 +105,15 @@ pub struct NativeConfig {
     pub extra_env: Vec<(OsString, OsString)>,
 }
 
+/// What [`NativeBackend::adopt`] picked up, by pane id.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Adoption {
+    pub adopted: Vec<String>,
+    /// The adopted panes that are live and were rebuilt from a wrapped tail
+    /// (or lost output), so they refuse writes until they repaint.
+    pub replayed: Vec<String>,
+}
+
 type EnvLookup = Box<dyn Fn(&str) -> Option<OsString> + Send + Sync>;
 
 /// The native backend. A cheap handle: clones share the same panes.
@@ -117,6 +135,9 @@ struct Inner {
     /// Keep each pane's metadata in the host (see [`meta`]). Off for the
     /// single-process server, which has no later front to read it.
     keep_meta: bool,
+    /// Dropping the last handle leaves the panes running in the host (the
+    /// front is going away, not the panes) instead of ending them.
+    leave_on_drop: AtomicBool,
 }
 
 #[derive(Default)]
@@ -156,6 +177,39 @@ struct PaneState {
     raw: VecDeque<u8>,
     last_output: Instant,
     log: StatusLog,
+    /// The tracker has no trustworthy state after adoption: treated as
+    /// working until a fresh report or the exit (not `reported` with no
+    /// status, which `wait` reads as finished).
+    unknown: bool,
+    /// The pane was rebuilt from a wrapped tail or lost output: the guard
+    /// refuses writes until the program repaints.
+    replayed: bool,
+    /// Output at or after this offset is the program's answer to the return
+    /// resize and clears `replayed`. None: nothing clears it.
+    clear_at: Option<u64>,
+    /// The offset after the last output byte the emulator has taken.
+    fed_end: u64,
+}
+
+impl PaneState {
+    fn fresh(emu: Emulator, tracker: Tracker) -> Self {
+        Self {
+            emu,
+            tracker,
+            live: true,
+            exit_code: None,
+            pending_send: None,
+            pending_replies: Vec::new(),
+            replies_overflowed: false,
+            raw: VecDeque::new(),
+            last_output: Instant::now(),
+            log: StatusLog::default(),
+            unknown: false,
+            replayed: false,
+            clear_at: None,
+            fed_end: 0,
+        }
+    }
 }
 
 impl NativeBackend {
@@ -193,6 +247,7 @@ impl NativeBackend {
         let table = Arc::new(Mutex::new(Table::default()));
         host.set_sink(Arc::new(FrontEvents {
             table: Arc::clone(&table),
+            epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
         }));
         Self {
             inner: Arc::new(Inner {
@@ -203,6 +258,7 @@ impl NativeBackend {
                 config,
                 env,
                 keep_meta,
+                leave_on_drop: AtomicBool::new(false),
             }),
         }
     }
@@ -211,6 +267,155 @@ impl NativeBackend {
     /// runs before it exits on a signal.
     pub fn shutdown(&self) {
         self.inner.end_all();
+    }
+
+    /// Make dropping the last handle leave the panes running in the host
+    /// instead of ending them: the front is going away, the panes are not.
+    #[cfg_attr(not(test), allow(dead_code))] // the front under a holder uses it
+    pub(crate) fn leave_panes_on_drop(&self) {
+        self.inner.leave_on_drop.store(true, Ordering::Release);
+    }
+
+    /// Pick up every pane the host holds that this front does not know yet:
+    /// rebuild its screen and tracker from the host's tail without answering
+    /// anything the tail asks, decide whether it is `unknown` or `replayed`,
+    /// and nudge a replayed pane to repaint. Emits no status events and
+    /// writes nothing to any pane (except the two resizes of the nudge).
+    ///
+    /// A pane enters the table only when its replay is done, and the table
+    /// stays locked from the host's tail read to that moment, so no output
+    /// can be lost or fed twice (the front skips bytes already replayed).
+    #[cfg_attr(not(test), allow(dead_code))] // the front under a holder calls it
+    pub(crate) fn adopt(&self) -> Result<Adoption, BackendError> {
+        let host = &self.inner.host;
+        let mut done = Adoption::default();
+        let mut nudge = Vec::new();
+        for listed in host.list() {
+            let mut table = self.inner.table()?;
+            if table.exiting {
+                break;
+            }
+            if table.panes.iter().any(|p| p.id == listed.id) {
+                continue;
+            }
+            let attached = match host.attach(&listed.id) {
+                Ok(attached) => attached,
+                // Ended since the list.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                    return Err(BackendError::new(
+                        ErrorKind::Unsupported("adopt".to_string()),
+                        format!("native: the host keeps no output tail: {err}"),
+                    ))
+                }
+                Err(err) => {
+                    return Err(BackendError::new(
+                        ErrorKind::Other,
+                        format!("native: {}: cannot read the tail: {err}", listed.id),
+                    ))
+                }
+            };
+            // The pane may have exited since the list, and its exit event went
+            // to a table that did not hold it yet. Read the state again now
+            // that the table is locked: from here on the event is not lost.
+            let Some(listed) = host.list().into_iter().find(|p| p.id == listed.id) else {
+                continue;
+            };
+            let meta = meta::load(&**host, &listed.id);
+            let adopted = replay(
+                &attached.bytes,
+                attached.tail_start,
+                meta.as_ref(),
+                now_ms(),
+            );
+            for note in &adopted.notes {
+                eprintln!("openab-shepherd: native: {}: {note}", listed.id);
+            }
+            let live = !listed.finished;
+            let wrong_size = (listed.cols, listed.rows) != (COLS, ROWS);
+            let replayed = adopted.replayed || wrong_size;
+            let snapshot = adopted.tracker.snapshot();
+            let mut tracker = adopted.tracker;
+            if !live {
+                tracker.on_exit();
+            }
+            let known = meta.clone().unwrap_or_default();
+            let store = self.inner.keep_meta.then(|| {
+                let store = MetaStore::new(Arc::clone(host), listed.id.clone(), known.clone());
+                // Keep the snapshot exact at the end of the tail, so the next
+                // adoption replays less. Not for a pane with no state.
+                let stale = known.tracker.as_ref() != Some(&snapshot)
+                    || known.tracker_seq != attached.tail_end;
+                if !adopted.unknown && stale {
+                    if let Err(err) = store.set_tracker(snapshot.clone(), attached.tail_end) {
+                        eprintln!(
+                            "openab-shepherd: native: {}: meta write failed: {err}",
+                            listed.id
+                        );
+                    }
+                }
+                store
+            });
+            let mut state = PaneState::fresh(adopted.emu, tracker);
+            state.live = live;
+            state.exit_code = listed.exit_code.filter(|_| !live);
+            state.unknown = adopted.unknown;
+            state.replayed = replayed;
+            state.fed_end = attached.tail_end;
+            state.raw = attached.bytes[attached.bytes.len().saturating_sub(RAW_RING)..]
+                .iter()
+                .copied()
+                .collect();
+            let pane = Arc::new(Pane {
+                id: listed.id.clone(),
+                name: known.name.clone(),
+                argv: known.argv.clone(),
+                cwd: known.cwd.clone(),
+                pid: listed.pid,
+                host: Arc::clone(host),
+                state: Mutex::new(state),
+                changed: Condvar::new(),
+                input: Mutex::new(()),
+                meta: store,
+            });
+            table.panes.push(Arc::clone(&pane));
+            drop(table);
+            done.adopted.push(listed.id.clone());
+            if replayed && live {
+                done.replayed.push(listed.id.clone());
+                nudge.push(pane);
+            }
+        }
+        self.inner.nudge(&nudge);
+        Ok(done)
+    }
+
+    /// A human typed into the pane: record it in the pane's metadata, wait
+    /// for the host to have it, and only then write the bytes. A crash in
+    /// between leaves the flag set and the pane untouched, never bytes
+    /// without the flag. Not guarded: a human may type into a replayed pane.
+    #[cfg_attr(not(test), allow(dead_code))] // the shared-panes attach calls it
+    pub(crate) fn human_input(&self, t: &TerminalRef, bytes: &[u8]) -> Result<(), BackendError> {
+        if bytes.is_empty() || bytes.len() > MAX_INPUT_BYTES {
+            return Err(invalid(format!(
+                "native: human input must be 1 to {MAX_INPUT_BYTES} bytes"
+            )));
+        }
+        let pane = self.inner.resolve(t)?;
+        let _input = pane.lock_input()?;
+        let meta = pane.meta.as_ref().ok_or_else(|| {
+            BackendError::new(
+                ErrorKind::Unsupported("human_input".to_string()),
+                "native: this front keeps no pane metadata",
+            )
+        })?;
+        meta.set_human_draft().map_err(|err| {
+            BackendError::new(
+                ErrorKind::Other,
+                format!("native: {}: cannot record the human input: {err}", pane.id),
+            )
+        })?;
+        pane.write_guarded(None, |_| Ok(bytes.to_vec()))
     }
 
     /// On SIGINT, SIGTERM or SIGHUP: end every pane, then exit the process
@@ -342,18 +547,7 @@ impl NativeBackend {
             cwd,
             pid: spawned.pid,
             host: Arc::clone(&self.inner.host),
-            state: Mutex::new(PaneState {
-                emu: Emulator::new(),
-                tracker: Tracker::default(),
-                live: true,
-                exit_code: None,
-                pending_send: None,
-                pending_replies: Vec::new(),
-                replies_overflowed: false,
-                raw: VecDeque::new(),
-                last_output: Instant::now(),
-                log: StatusLog::default(),
-            }),
+            state: Mutex::new(PaneState::fresh(Emulator::new(), Tracker::default())),
             changed: Condvar::new(),
             input: Mutex::new(()),
             meta,
@@ -401,6 +595,44 @@ impl Inner {
 }
 
 impl Inner {
+    /// Make each pane repaint: shrink its terminal by one row, give the
+    /// program a moment, then restore the size. Only the terminal changes;
+    /// the emulator stays at its fixed size. Output at or after the offset
+    /// the host has when the return resize goes out clears `replayed`, so a
+    /// repaint answering the smaller size never does.
+    fn nudge(&self, panes: &[Arc<Pane>]) {
+        let mut shrunk = Vec::new();
+        for pane in panes {
+            match self.host.resize(&pane.id, COLS, ROWS - 1) {
+                Ok(()) => shrunk.push(pane),
+                Err(err) => eprintln!("openab-shepherd: native: {}: nudge failed: {err}", pane.id),
+            }
+        }
+        if shrunk.is_empty() {
+            return;
+        }
+        thread::sleep(NUDGE_PAUSE);
+        for pane in shrunk {
+            match self.host.attach(&pane.id) {
+                Ok(now) => {
+                    let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    if st.replayed {
+                        st.clear_at = Some(now.tail_end);
+                    }
+                }
+                Err(err) => eprintln!(
+                    "openab-shepherd: native: {}: nudge cannot read the tail: {err}",
+                    pane.id
+                ),
+            }
+            if let Err(err) = self.host.resize(&pane.id, COLS, ROWS) {
+                eprintln!("openab-shepherd: native: {}: nudge failed: {err}", pane.id);
+            }
+        }
+    }
+}
+
+impl Inner {
     /// End every pane now (the host runs the shared-grace sequence). A child
     /// spawned after this is ended at once instead of entering the table.
     fn end_all(&self) {
@@ -415,6 +647,11 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        if self.leave_on_drop.load(Ordering::Acquire) {
+            // The panes outlive this front: stop hearing of them, end none.
+            self.host.set_sink(Arc::new(NoFront));
+            return;
+        }
         self.end_all();
     }
 }
@@ -515,6 +752,18 @@ impl Pane {
             return false;
         };
         let st = &mut *guard;
+        // Adoption has fed the emulator up to `fed_end`; a chunk the host
+        // delivers for bytes already in the replay is not fed twice.
+        let (seq, chunk) = if seq < st.fed_end {
+            let skip = (st.fed_end - seq).min(chunk.len() as u64);
+            (seq + skip, &chunk[skip as usize..])
+        } else {
+            (seq, chunk)
+        };
+        if chunk.is_empty() {
+            return true;
+        }
+        st.fed_end = seq + chunk.len() as u64;
         let before = self.meta.as_ref().map(|_| st.tracker.snapshot());
         st.raw.extend(chunk);
         let excess = st.raw.len().saturating_sub(RAW_RING);
@@ -532,6 +781,7 @@ impl Pane {
                         outcome = format!("{outcome} kind={kind}");
                     }
                     let applied = st.tracker.apply(state, kind, now_ms);
+                    st.unknown = false;
                     if working || applied.turn_changed {
                         st.pending_send = None;
                     }
@@ -561,6 +811,10 @@ impl Pane {
             );
         }
         st.last_output = Instant::now();
+        if st.replayed && st.clear_at.is_some_and(|at| seq >= at) {
+            st.replayed = false;
+            st.clear_at = None;
+        }
         let after = before.and_then(|before| {
             let now = st.tracker.snapshot();
             (now != before).then_some(now)
@@ -787,7 +1041,23 @@ fn check_guard(st: &PaneState, guard: &InputGuard, id: &str) -> Result<(), Backe
     if !st.live {
         return Err(finished(id));
     }
-    let state = st.tracker.state();
+    // Same critical section as the write: a pane rebuilt from a wrapped tail
+    // may sit in a mode the emulator never saw, so no key goes to it.
+    if st.replayed {
+        return Err(BackendError::new(
+            ErrorKind::Replayed,
+            format!(
+                "native: {id}: the pane was picked up after a restart and has not repainted; nothing was written"
+            ),
+        ));
+    }
+    // A pane with no trustworthy status counts as working.
+    let working = State::Working;
+    let state = if st.unknown {
+        Some(&working)
+    } else {
+        st.tracker.state()
+    };
     let kind = st.tracker.raw_kind().map(dialog_kind);
     if guard.refuse_when_blocked && state == Some(&State::Blocked) {
         return Err(BackendError::new(
@@ -865,17 +1135,41 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 /// dropped, since nothing can observe its screen any more.
 struct FrontEvents {
     table: Arc<Mutex<Table>>,
+    /// Which front this sink belongs to, so a host thread's cached pane from
+    /// an earlier front is never used for this one.
+    epoch: u64,
 }
 
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+
 thread_local! {
-    /// The pane the current host thread last resolved. A host thread serves
-    /// one pane, so the table is entered once per thread, not once per chunk.
-    static RESOLVED: RefCell<Option<Arc<Pane>>> = const { RefCell::new(None) };
+    /// The pane the current host thread last resolved, with the epoch of the
+    /// front it belongs to. A host thread serves one pane, so the table is
+    /// entered once per thread, not once per chunk.
+    static RESOLVED: RefCell<Option<(u64, Arc<Pane>)>> = const { RefCell::new(None) };
+}
+
+/// The sink of a host whose front is gone: the panes run on, the output
+/// stays in the host's tail, and nobody is told.
+struct NoFront;
+
+impl HostEvents for NoFront {
+    fn output(&self, _: &str, _: u64, _: &[u8]) -> bool {
+        true
+    }
+    fn idle(&self, _: &str) {}
+    fn exited(&self, _: &str, _: Option<i64>) {}
+    fn gap(&self, _: &str, _: u64) {}
 }
 
 impl FrontEvents {
     fn pane(&self, id: &str) -> Option<Arc<Pane>> {
-        if let Some(hit) = RESOLVED.with(|r| r.borrow().as_ref().filter(|p| p.id == id).cloned()) {
+        if let Some(hit) = RESOLVED.with(|r| {
+            r.borrow()
+                .as_ref()
+                .filter(|(epoch, p)| *epoch == self.epoch && p.id == id)
+                .map(|(_, p)| Arc::clone(p))
+        }) {
             return Some(hit);
         }
         let found = self
@@ -886,7 +1180,9 @@ impl FrontEvents {
             .iter()
             .find(|p| p.id == id)
             .cloned();
-        RESOLVED.with(|r| *r.borrow_mut() = found.clone());
+        RESOLVED.with(|r| {
+            *r.borrow_mut() = found.clone().map(|pane| (self.epoch, pane));
+        });
         found
     }
 }
@@ -926,7 +1222,19 @@ impl HostEvents for FrontEvents {
         pane.changed.notify_all();
     }
 
-    fn gap(&self, _id: &str, _new_start: u64) {}
+    fn gap(&self, id: &str, _new_start: u64) {
+        let Some(pane) = self.pane(id) else {
+            return;
+        };
+        // Output was dropped: the screen and the tracker are no longer what
+        // the program has painted. Like a wrapped tail, until it repaints.
+        let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.replayed = true;
+        st.unknown = true;
+        st.clear_at = None;
+        drop(st);
+        pane.changed.notify_all();
+    }
 }
 
 impl TerminalBackend for NativeBackend {
@@ -1157,7 +1465,8 @@ impl TerminalBackend for NativeBackend {
             }
             // A program that never reported counts as working until it exits;
             // an unstarted send keeps the wait on its turn.
-            let working = !st.tracker.reported() || st.tracker.state() == Some(&State::Working);
+            let working =
+                st.unknown || !st.tracker.reported() || st.tracker.state() == Some(&State::Working);
             if !working && st.pending_send.is_none() {
                 return Ok(result(true, WaitReason::Status));
             }

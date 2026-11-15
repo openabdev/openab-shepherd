@@ -59,9 +59,18 @@ struct Registry {
 /// (`MAX_FINISHED_PANES`) is the policy and is lower.
 const FINISHED_BACKSTOP: usize = 64;
 
+/// Where the host's threads report. Shared with them, and read at every
+/// event, so a front that starts later and calls `set_sink` is the one that
+/// hears of panes already running.
+type SinkCell = Arc<Mutex<Option<Arc<dyn HostEvents>>>>;
+
+fn current(cell: &SinkCell) -> Option<Arc<dyn HostEvents>> {
+    cell.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
 pub(crate) struct LocalHost {
     registry: Mutex<Registry>,
-    sink: Mutex<Option<Arc<dyn HostEvents>>>,
+    sink: SinkCell,
     /// The size of each pane's tail, or None for no tail. Off for the
     /// single-process server, which has no later front to serve, so it pays
     /// no memory and no copy per chunk.
@@ -105,6 +114,8 @@ pub(crate) struct ProcState {
     /// when the leader exited, not from when `live` was cleared.
     exited: bool,
     reader_done: bool,
+    /// How the leader ended, set with `live = false`.
+    exit_code: Option<i64>,
     /// The leader has been reaped: its pid, so the group and session ids,
     /// are no longer reserved for this pane (ADR §11).
     pub(crate) reaped: bool,
@@ -120,7 +131,7 @@ impl LocalHost {
     pub(crate) fn new() -> Self {
         Self {
             registry: Mutex::new(Registry::default()),
-            sink: Mutex::new(None),
+            sink: Arc::new(Mutex::new(None)),
             tail_cap: None,
             finished_backstop: FINISHED_BACKSTOP,
         }
@@ -188,12 +199,13 @@ impl PtyHost for LocalHost {
     }
 
     fn spawn(&self, req: SpawnReq) -> Result<Spawned, BackendError> {
-        let sink = self
-            .sink
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            .ok_or_else(|| BackendError::new(ErrorKind::Other, "native: the host has no sink"))?;
+        if current(&self.sink).is_none() {
+            return Err(BackendError::new(
+                ErrorKind::Other,
+                "native: the host has no sink",
+            ));
+        }
+        let sink = Arc::clone(&self.sink);
         self.evict_finished();
         let pty::Spawned {
             master,
@@ -215,6 +227,7 @@ impl PtyHost for LocalHost {
                 live: true,
                 exited: false,
                 reader_done: false,
+                exit_code: None,
                 reaped: false,
                 released: false,
                 group_lost: false,
@@ -356,12 +369,15 @@ impl PtyHost for LocalHost {
             .iter()
             .map(|pane| {
                 let (cols, rows) = *pane.size.lock().unwrap_or_else(PoisonError::into_inner);
+                let st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
                 HostPane {
                     id: pane.id.clone(),
                     pid: pane.pid,
                     cols,
                     rows,
-                    exited: pane.has_exited(),
+                    exited: st.exited,
+                    finished: !st.live,
+                    exit_code: st.exit_code,
                 }
             })
             .collect()
@@ -575,7 +591,7 @@ impl Proc {
 
 /// The reader thread: output to the sink until EOF, EIO or removal, and every
 /// `TREE_POLL` a fresh look for the pane's descendants.
-fn read_loop(pane: Arc<Proc>, sink: Arc<dyn HostEvents>) {
+fn read_loop(pane: Arc<Proc>, sink: SinkCell) {
     let fd = pane.master.as_raw_fd();
     let mut buf = vec![0u8; READ_CHUNK];
     let mut next_tree = Instant::now();
@@ -583,7 +599,11 @@ fn read_loop(pane: Arc<Proc>, sink: Arc<dyn HostEvents>) {
     let mut seq: u64 = 0;
     while !pane.shutdown.load(Ordering::Acquire) {
         match pty::poll_read(fd, &mut buf, READ_POLL_MS) {
-            Ok(None) => sink.idle(&pane.id),
+            Ok(None) => {
+                if let Some(sink) = current(&sink) {
+                    sink.idle(&pane.id);
+                }
+            }
             Ok(Some(0)) => break,
             Ok(Some(n)) => {
                 // The tail first, so a front that attaches after hearing of
@@ -593,7 +613,7 @@ fn read_loop(pane: Arc<Proc>, sink: Arc<dyn HostEvents>) {
                         .unwrap_or_else(PoisonError::into_inner)
                         .push(&buf[..n]);
                 }
-                if !sink.output(&pane.id, seq, &buf[..n]) {
+                if current(&sink).is_some_and(|sink| !sink.output(&pane.id, seq, &buf[..n])) {
                     break;
                 }
                 seq += n as u64;
@@ -627,7 +647,7 @@ fn read_loop(pane: Arc<Proc>, sink: Arc<dyn HostEvents>) {
 /// to the group and descendants, up to 2 s, and `release`; during a removal
 /// or shutdown, it waits for that to `release`. Then it reaps the leader,
 /// under the tree lock, so no look for descendants runs on a freed pid.
-fn reap(pane: Arc<Proc>, mut child: Child, slave: OwnedFd, sink: Arc<dyn HostEvents>) {
+fn reap(pane: Arc<Proc>, mut child: Child, slave: OwnedFd, sink: SinkCell) {
     let (code, reaped) = match pty::wait_exited(pane.pid) {
         Ok(code) => (Some(code), false),
         Err(err) => {
@@ -665,9 +685,12 @@ fn reap(pane: Arc<Proc>, mut child: Child, slave: OwnedFd, sink: Arc<dyn HostEve
         };
     }
     st.live = false;
+    st.exit_code = code;
     drop(st);
     // After the drain: every `output` of this pane has been delivered.
-    sink.exited(&pane.id, code);
+    if let Some(sink) = current(&sink) {
+        sink.exited(&pane.id, code);
+    }
     pane.changed.notify_all();
     if pane.stopping.load(Ordering::Acquire) {
         let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);

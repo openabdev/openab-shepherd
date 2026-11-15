@@ -194,7 +194,6 @@ impl MetaStore {
 
 /// Read a pane's meta from the host. None, with a log line, when the host has
 /// none, it cannot be read, or it is not usable (see [`PaneMeta::from_bytes`]).
-#[cfg_attr(not(test), allow(dead_code))] // adoption uses it next
 pub(crate) fn load(host: &dyn PtyHost, id: &str) -> Option<PaneMeta> {
     let bytes = match host.meta_get(id) {
         Ok(bytes) if bytes.is_empty() => return None,
