@@ -121,7 +121,8 @@ Two optional variables add named clients with limited scopes and an audit log:
 `OPENAB_SHEPHERD_CLIENTS` (path of the clients file, JSON, mode 0600, outside any git
 repository) and `OPENAB_SHEPHERD_AUDIT_FILE` (path of the audit log, JSON Lines, in a
 mode 0700 directory; required when a clients file is set). Without them, the single
-token keeps full control. See
+token keeps full control. With a clients file, a token file or token variable is a startup
+error: each caller gets its own entry in the clients file. See
 [Clients, scopes and the audit log](docs/operations.md#clients-scopes-and-the-audit-log).
 
 Every variable, profile field, tool argument, error code and bound is described in

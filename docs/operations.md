@@ -813,7 +813,6 @@ traceable in an audit log.
 ```json
 {
   "version": 1,
-  "allow_legacy_token": false,
   "clients": [
     {
       "id": "ci-1",
@@ -826,19 +825,20 @@ traceable in an audit log.
 }
 ```
 
-- `version` must be `1`. `allow_legacy_token` is optional (default `false`).
-- `id`: 1 to 32 characters of `a-z`, `0-9` and `-`. It must be unique. `legacy` is
-  reserved.
+- `version` must be `1`.
+- `id`: 1 to 32 characters of `a-z`, `0-9` and `-`. It must be unique.
 - `token_sha256`: the SHA-256 of the client's token, as 64 hex characters. The file
-  never holds a token. At most 256 clients.
+  never holds a token.
 - `scopes`: a non-empty list of the scopes below, each at most once.
 - `profiles`: the launch profile names this client may start. Optional; missing or
   empty means none. There is no "all profiles" entry.
 - `expires`: optional, Unix seconds. From that second on, the token is refused.
-- Unknown fields anywhere in the file are an error. The whole file is validated
-  before any of it is used; one bad entry stops startup with exit status 2.
-- File rules: the path is canonicalized, must be a regular file owned by the user
-  running Shepherd, with no group or other bits (mode 0600 or stricter; this is
+- Unknown fields anywhere in the file are an error (this includes the removed
+  `allow_legacy_token`). A key repeated inside one JSON object is not checked: the last
+  value wins. The whole file is validated before any of it is used; one bad entry
+  stops startup with exit status 2.
+- File rules: the path is canonicalized, must be a regular file, with no group or
+  other bits (mode 0600 or stricter; this is
   stricter than the profiles file because it holds hashes), at most 1 MiB, and
   outside the project folder and every git repository (same check as the token
   file).
@@ -847,9 +847,7 @@ traceable in an audit log.
 
 A token looks like `osh_<id>_<64 hex characters>`, where `<id>` is the client's
 `id`. Shepherd picks the record by the id in the token, hashes the whole token with
-SHA-256 and compares the two 32-byte digests in constant time. An unknown id is
-compared against a fixed dummy digest, so response time does not show whether an id
-exists. The client name used for authorization and audit comes only from the matched
+SHA-256 and compares the two 32-byte digests in constant time. The client name used for authorization and audit comes only from the matched
 record, never from a header. A bad, unknown or expired token gets HTTP 401, as
 before.
 
@@ -938,16 +936,15 @@ Typed text is not recorded, only its length, but a screen read by a client with
 ### Migration from the single token
 
 - No clients file: nothing changes. The token from `OPENAB_SHEPHERD_TOKEN_FILE` (or
-  `OPENAB_SHEPHERD_TOKEN`) becomes the client `legacy`, with every scope and every
+  `OPENAB_SHEPHERD_TOKEN`) becomes the client `default`, with every scope and every
   profile. It is audited only if `OPENAB_SHEPHERD_AUDIT_FILE` is set.
-- With a clients file, `OPENAB_SHEPHERD_TOKEN` (the token in the environment) is
-  refused at startup. `OPENAB_SHEPHERD_TOKEN_FILE` is also refused, unless the
-  clients file sets `"allow_legacy_token": true`. With that flag the old token keeps
-  working as `legacy` with every scope, and Shepherd prints a warning at startup.
-  Leaving the legacy token on beside scoped tokens cancels their limits, so use the
-  flag only while moving clients over, then remove the token file and the flag.
-- A clients file alone, with no token file, is valid: only the listed clients can
-  authenticate.
+- With a clients file, a token file or a token in the environment is a startup error,
+  because a token with every scope would cancel the limits of the others. The message
+  names the fix: unset the variable and give that client its own entry
+  (`token_sha256`) in the clients file, or unset `OPENAB_SHEPHERD_CLIENTS` to keep
+  the single token. There is no flag to keep both. A clients file that still has
+  `allow_legacy_token` is refused with a message to delete it.
+- A clients file alone is the valid shape: only the listed clients can authenticate.
 
 ### Operator recipe: a token and its hash
 
