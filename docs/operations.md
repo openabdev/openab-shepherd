@@ -958,8 +958,15 @@ docker build --platform linux/amd64 -t <registry>/openab-shepherd:<version> .
 docker image ls <registry>/openab-shepherd:<version>
 ```
 
-The default command serves on the IPv4 loopback address, port 8765, inside the
-container. Nothing is
+The default command is `openab-shepherd hold -- --host 127.0.0.1 --port 8765`: the
+pane holder runs as tini's child and starts the server on the IPv4 loopback address,
+port 8765, inside the container. **This is a change from the bare
+`openab-shepherd --host 127.0.0.1 --port 8765`**, which ran one process that served
+and owned its panes. Under `hold`, `SIGUSR2` (`docker kill -s USR2 <container>`; tini
+forwards it) restarts the server and the panes keep running, while `docker stop` and
+a pod deletion end the panes as before. To get the earlier behaviour, override the
+command: `docker run ... <image> openab-shepherd --host 127.0.0.1 --port 8765` (in a
+pod spec, set `args`, or `command` plus `args`). Nothing is
 published, so reach it from a container that shares the network namespace (a tailnet
 sidecar, for example). The token file and profiles file must be mounted or copied in
 at runtime, owned by uid 1000, with the modes listed above:
@@ -975,6 +982,49 @@ docker run --rm --platform linux/amd64 \
 
 To print the usage text without starting a server, run the binary by name:
 `docker run --rm --platform linux/amd64 <registry>/openab-shepherd:<version> openab-shepherd --help`.
+
+### Restarting the server under a service manager
+
+Run `openab-shepherd hold -- <server flags>` as the service's main process. The
+holder owns the panes and starts the server; `SIGUSR2` on the holder restarts the
+server alone and the panes keep running. Stopping or restarting the service
+(`systemctl restart`, `launchctl kickstart -k`, `docker stop`) sends SIGTERM to the
+holder, which ends every pane and exits.
+
+systemd (a user unit, or a system unit with `User=`):
+
+```ini
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/openab-shepherd hold -- --host 127.0.0.1 --port 8765
+ExecReload=/bin/kill -USR2 $MAINPID
+Restart=on-failure
+```
+
+`systemctl reload <unit>` restarts the server only. Keep the default `KillMode`
+(`control-group`). Do not set `KillMode=process` or `AbandonProcessGroup=`: the
+holder ends the panes on SIGTERM, and a pane that outlives it has no owner.
+
+launchd (`~/Library/LaunchAgents/<label>.plist`): set `ProgramArguments` to
+`openab-shepherd`, `hold`, `--`, then the server flags, and `KeepAlive` as needed.
+Restart the server only with `launchctl kill USR2 gui/$UID/<label>`.
+`launchctl kickstart -k gui/$UID/<label>` restarts the holder, so it ends the panes.
+
+Zombies: the holder is not a subreaper. It never sets `PR_SET_CHILD_SUBREAPER` and
+never calls `waitpid(-1)`, which would take the exit statuses that its per-pane
+reapers wait for. It reaps each pane's leader itself. A process that a pane leaves
+behind is ended with the pane tree; one that is re-parented before then goes to
+PID 1 (tini in a container, launchd or systemd elsewhere), which reaps it.
+`tests/zombie_subreaper.rs` checks this on Linux, with the test process standing in
+for tini.
+
+Replacing the binary in place: install the new file with `mv` over the old path
+(not `cp` onto the running file), then send `SIGUSR2` to the holder. The holder
+resolves its own executable path once, at start, and runs every later server from
+that path, so the holder keeps the old code and the next server runs the new
+binary. A new binary with a different `HOLDER_VERSION` cannot attach to the running
+holder: its server exits with status 78 and the holder logs both numbers and tries
+again. Restart the holder (which ends the panes) to move to such a release.
 
 ### Release
 

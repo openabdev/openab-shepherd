@@ -4,6 +4,12 @@
 
 ### Changed
 
+- Container image: the default command is now `openab-shepherd hold -- --host 127.0.0.1 --port 8765`
+  (the pane holder under tini) instead of the bare `openab-shepherd --host 127.0.0.1 --port 8765`.
+  With the holder, `SIGUSR2` restarts the server and the panes keep running; stopping the
+  container still ends them. Override the command with the bare invocation to get the earlier
+  single-process behaviour. Refs #76.
+
 - The built-in watchdog is now the routine: profile key `routine`, `src/routine.rs`, stderr lines
   `routine nudge` / `routine gave up`, and audit actor `system:routine` (was `system:watchdog`).
   Behaviour and limits are unchanged. The `watchdog` profile key (shipped in 0.4.0) is still

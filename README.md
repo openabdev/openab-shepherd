@@ -50,7 +50,9 @@ which answers a permission dialog may receive.
   (see [Status and known limits](#status-and-known-limits)).
 - **Container image.** The `Dockerfile` builds a Debian image that runs as uid 1000
   under tini, with kiro-cli pinned to 3.1.0 and checked against a SHA-256. The image
-  holds no token and no profiles file.
+  holds no token and no profiles file. Its default command runs the pane holder
+  (`openab-shepherd hold -- ...`); override the command with the bare
+  `openab-shepherd --host ... --port ...` for the single-process behaviour.
 
 ## How it works
 

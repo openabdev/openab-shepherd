@@ -4,6 +4,11 @@
 # The image holds no token and no launch profiles. A pod mounts them through an
 # init container that copies them into an emptyDir (see the README "Container image"
 # section). The server binds 127.0.0.1 only; the pod's tailnet sidecar forwards to it.
+#
+# The default command runs the pane holder (`hold`), which owns the panes and starts the
+# server, so a SIGUSR2 restarts the server and leaves the panes running. To get the
+# earlier behaviour (one process serves and owns its panes), override the command:
+#   docker run ... <image> openab-shepherd --host 127.0.0.1 --port 8765
 
 # --- Build stage ---
 # Keep the version in sync with rust-toolchain.toml (CI checks this).
@@ -24,6 +29,7 @@ LABEL org.opencontainers.image.source="https://github.com/openabdev/openab-sheph
 
 # git: the server runs `git rev-parse` at startup and refuses to start if git cannot run.
 # tini: PID 1 reaps orphaned pane processes, which otherwise stay as zombies.
+# The holder is not a subreaper and never waits on a pid it did not start.
 # ripgrep, procps: the same tools the openab kiro image gives kiro-cli.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git procps ripgrep tini unzip \
@@ -89,4 +95,4 @@ COPY --from=builder /build/target/release/openab-shepherd /usr/local/bin/openab-
 USER 1000:1000
 
 ENTRYPOINT ["tini", "--"]
-CMD ["openab-shepherd", "--host", "127.0.0.1", "--port", "8765"]
+CMD ["openab-shepherd", "hold", "--", "--host", "127.0.0.1", "--port", "8765"]
