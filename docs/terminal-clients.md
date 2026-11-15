@@ -63,7 +63,10 @@ Shepherd, and the operator's shell opens there under openab-pty.
   with the served name listed in `OPENAB_SHEPHERD_ALLOWED_HOSTS` (see
   [operations.md](operations.md#behind-tailscale-serve)); keep Funnel off.
   The bearer token is required on every request either way.
-- Panes are children of Shepherd and end when it restarts. A client that
+- A bare Shepherd's panes end when it restarts. Under `openab-shepherd hold`
+  they survive a server restart (see
+  [Restart survival](operations.md#restart-survival)), and a pane just picked up
+  may answer `pane_replayed` until it repaints. Either way a client that
   reconnects must re-discover panes with `list_panes` and must not cache a
   pane name across server restarts.
 

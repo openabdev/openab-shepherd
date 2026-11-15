@@ -22,9 +22,11 @@ whether the remaining work is worth doing, which a fixed nudge cannot.
 
 A timer thread checks every 5 s. It runs only when at least one launch profile sets
 a `routine` section, and it watches only panes that this Shepherd process started from
-such a profile. Registrations live in memory: a Shepherd restart forgets every
-watched pane, and a pane is watched again only when a routine profile starts it
-again.
+such a profile. Registrations survive a server restart when Shepherd runs under
+`openab-shepherd hold`: the profile name and the counters are kept with the pane, and
+the new server watches the pane again (see [Restart
+survival](operations.md#the-routine-across-a-restart)). A bare `openab-shepherd` owns
+its panes, so a restart ends them and there is nothing to watch.
 
 ## Conditions
 
@@ -125,9 +127,14 @@ The routine's audit trail is Shepherd's stderr log: every nudge (with
 the pane's idle seconds), every give-up and every failed attempt is a
 line there, and nowhere else — a client cannot tell a routine nudge
 from its own input except that the pane's turn counter advances, which a
-routine nudge does like any typed prompt. Registrations live only in
-memory: a Shepherd restart forgets every watched pane, and a pane is
-watched again only when a routine profile starts it again.
+routine nudge does like any typed prompt. A registration survives a
+server restart under `hold`: the new server rebuilds each watch from the pane's
+record, with the nudge count, the give-up flag and the allowance for turns its own
+nudges caused. It reads the routine's settings from the current profile, so a pane
+whose profile was removed, or no longer has a `routine`, is not watched, and one log
+line says so. The idle clock starts again at the restart. A pane that was picked up
+after a restart and has not repainted (`pane_replayed`) is skipped, not counted as a
+failed nudge.
 
 ## Identity and audit
 

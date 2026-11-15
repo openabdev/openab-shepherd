@@ -43,9 +43,12 @@ later is a contained change.
 | `src/backend.rs` | The `TerminalBackend` trait and Shepherd's own types: `TerminalInfo`, `ProgramStatus`, `Capabilities`, `InputGuard`, `BackendError`, ... |
 | `src/native/mod.rs` | `NativeBackend`: pane table, reader and reaper threads, guarded writes, the trait impl |
 | `src/native/pty.rs`, `term.rs`, `status.rs`, `keys.rs`, `procs.rs` | PTY spawn and child env; the `vt100` emulator and query replies; OSC 7501 parsing and turns; key encoding; the process table and descendant tree used by cleanup |
+| `src/native/host/` | The process half, behind the `PtyHost` trait: `local.rs` (PTYs and process trees in this process), `tail.rs` (the per-pane tail ring), `wire.rs`, `server.rs` and `client.rs` (the holder link), `supervisor.rs` (`hold`), `front.rs` (what `front` does at start) |
+| `src/native/meta.rs`, `replay.rs` | The per-pane record the front keeps in the holder, and silent replay of the tail on adoption |
 | `src/native/tests.rs` | Test-only: native tests with real programs |
 | `examples/native_probe.rs` | The real-Kiro probe for the native backend |
 | `examples/native_leak_check.rs` | Real-Kiro leak check: removes a pane and verifies no descendant process survives (issue #10) |
+| `examples/record_tail.rs` | Records a program's raw output and final screen as a replay fixture (user-run; see [Restart survival](#restart-survival)) |
 | `src/tools.rs` | The nine tools, their schemas, the safety rules, and the backend calls each one makes |
 | `src/routine.rs` | The per-pane routine state and its nudge decision (the tools run its thread) |
 | `src/dialog.rs` | Text parser for the kiro-cli permission dialog |
@@ -304,6 +307,7 @@ for debugging; do not parse it.
 | `name_taken` | `start_pane` with a name that is already in use (or, rarely, a generated name that collided; retry) |
 | `status_mismatch` | A backend-side input condition did not hold; nothing was sent |
 | `pane_finished` | The pane's program has ended |
+| `pane_replayed` | The pane was picked up by a new server after a restart and its screen is not yet trusted, so nothing was typed. Refused for `send_input`, `answer_dialog` and the routine's nudge. It clears when the program repaints; see [Restart survival](#restart-survival) |
 | `terminal_changed` | The name pointed at a different pane while waiting for the pane lock; nothing was sent |
 | `refused` | `answer_dialog` refused; see [answer_dialog](#answer_dialog) |
 | `unavailable` | The backend cannot be reached |
@@ -510,7 +514,7 @@ native call or its own fallback:
 | `program_status` | the backend reports the program's OSC 7501 status and turns | informational | true |
 | `history` | `read` with history lines returns scrollback | `read_output` with `lines > 0` returns `unsupported` | true |
 | `native_wait` | `wait` blocks inside the backend | informational (Shepherd would poll) | true |
-| `survives_restart` | panes outlive a Shepherd restart | informational | false by default; true under `openab-shepherd hold`, where a holder process owns the panes and restarts the server (SIGUSR2 restarts the server only) |
+| `survives_restart` | panes outlive a Shepherd restart | informational | false by default; true under `openab-shepherd hold`, where a holder process owns the panes and restarts the server (SIGUSR2 restarts the server only). The value comes from the pane host, not a constant. See [Restart survival](#restart-survival) |
 
 `RunSpec.profile` names the launch profile Shepherd resolved `argv` and `cwd` from,
 and `RunSpec.profile_env` carries that profile's environment, already read from its
@@ -598,6 +602,147 @@ scrollback (about 12.8 MB) and a 256 KiB raw ring, so about 520 MB in total.
 Verified against kiro-cli 3.1.0 by `examples/native_probe.rs` (see
 [`MVP-REPORT.md`](../MVP-REPORT.md)). The design is recorded in
 [`docs/adr/native-core.md`](adr/native-core.md).
+
+## Restart survival
+
+Panes live in a **holder**, a process that does not serve MCP, and the server (the
+**front**) is its child. `openab-shepherd hold -- <server flags>` starts the holder,
+which starts `openab-shepherd front` (a hidden subcommand of the same binary) with the
+flags after `--` and starts it again whenever it exits. The bare command is unchanged:
+one process serves and owns its panes, and `survives_restart` is false. The container
+image runs the holder by default (see [Container image](#container-image)).
+
+```
+openab-shepherd hold -- <server flags>                   holder: PTYs, process trees, tail rings
+  └─ openab-shepherd front --ops-fd 3 --events-fd 4 ...  front: MCP server, emulators, tools
+```
+
+The holder keeps, for each pane, the PTY and its process tree, the last 1 MiB of
+output with byte offsets (the **tail**), and a record of up to 64 KiB that the front
+writes (the **meta**: name, argv, cwd, agent kind, profile, the status tracker and the
+byte offset it is valid at, routine counters, and flags). The holder and the front
+talk over two socketpairs the holder creates at each front start, so nothing listens
+and no other process can attach.
+
+### What survives and what ends panes
+
+| Event | Panes |
+|-------|-------|
+| `SIGUSR2` to the holder | Survive. The front gets SIGTERM (SIGKILL after 5 s) and the next front starts at once |
+| The front crashes, is killed (`kill -9`), exits with a config error, or exits for any other reason | Survive. The holder logs how it ended and the first line it wrote to stderr, and starts the next front after 1 s, then 2 s, doubling to 30 s. A front that stayed up 60 s starts the delays over. The holder never exits because of a front |
+| `SIGTERM`, `SIGINT` or `SIGHUP` to the holder (`systemctl restart`, `launchctl kickstart -k`, `docker stop`, a pod deletion) | End. The holder stops the front, ends every pane and exits with status 128 plus the signal |
+| `SIGKILL` of the holder, or a reboot | End. Every PTY master closes, which hangs the panes up |
+| A panic on the holder's main thread | End, as in the bare server |
+| `remove_pane` | That pane ends, as always |
+
+A pane whose program exits while no front runs stays in the holder, finished, with its
+exit code and final output, until `remove_pane` ends it. The next front lists it with
+`list_panes` `all: true`.
+
+### What a new front does
+
+On start the front reads its settings, attaches to the holder and adopts every pane
+the holder lists. For each pane it replays the tail through a fresh emulator
+**silently**: the terminal queries in old output (DA, DSR, XTVERSION, kitty, colour)
+were answered long ago, so replay writes nothing to any pane and makes no status
+events, no status log entries and no pending input. A `wait_status` in progress is
+never satisfied by replayed history. It then rebuilds the tools layer from the meta:
+the pane's agent kind (so `answer_dialog` has its dialect), the `answered` flag, and
+the routine's watch. The log line is `front: attached; adopted N pane(s), M replayed`.
+
+- **Complete tail** (the pane has written at most 1 MiB since it started): the screen
+  and the turn count are rebuilt exactly, and the pane is live at once. `answer_dialog`
+  works on a dialog that was open when the old front died.
+- **Wrapped tail** (more than 1 MiB written): replay starts at the first line start
+  inside the tail, so an escape sequence is never cut in half, and the status tracker
+  is restored from the snapshot in the meta, so a turn that finished before the
+  snapshot is not counted again and one that finished after it is counted once. If the
+  meta has no usable snapshot, the pane's status is unknown, and `wait_status` treats
+  it as working until the program reports again. The screen may lack modes set earlier
+  (alternate screen, scroll region, kitty flags), so the pane is `replayed`: typed
+  input, `answer_dialog` and the routine's nudge are refused with `pane_replayed` and
+  nothing is written. The front asks the program to repaint by making the terminal one
+  row smaller for 150 ms and then full size again. The pane stops being `replayed` at
+  the first output after that. A program that does not repaint, such as an idle shell,
+  stays `replayed` until it prints something.
+- **A slow front** (it fell further behind than the ring holds) gets a `gap`, and its
+  pane is `replayed` and `unknown` until the next adoption.
+- `turn` is monotonic across a restart. When the snapshot is older than the first
+  replayed line, `turn` may undercount, and the front logs it.
+- The terminal size is fixed at 200 columns by 120 rows. A pane the holder lists at
+  another size is adopted as `replayed`.
+
+`replayed` is not a field of the pane object. A caller sees it as the `pane_replayed`
+error and acts as for any refusal: read the screen, wait, or leave the pane.
+
+### Settings: what reloads and what does not
+
+The front's environment is the holder's, frozen when the holder started, and so are
+the flags after `--`. Files are read again at every front start.
+
+| Reloads at each front start (`SIGUSR2` is enough) | Needs a holder restart (ends the panes) |
+|---|---|
+| The contents of the profiles file, the clients file and the token file | `OPENAB_SHEPHERD_TOKEN`, `OPENAB_SHEPHERD_TOKEN_FILE`, `OPENAB_SHEPHERD_PROFILES`, `OPENAB_SHEPHERD_CLIENTS`, `OPENAB_SHEPHERD_AUDIT_FILE`, `OPENAB_SHEPHERD_ALLOWED_HOSTS` and any other variable (a changed path counts) |
+| The routine's configuration of a profile | The bind address and port flags |
+
+A pane keeps the environment and argv it was started with. A changed profile applies to
+panes started afterwards.
+
+### The routine across a restart
+
+The routine's registrations are kept in the pane meta, so they survive a restart. The
+front restores, per pane, the profile name, the number of consecutive nudges, whether
+the routine gave up, and the allowance for turns the routine's own nudges caused. The
+counters are written before the nudge bytes, so a crash between the two over-counts
+one nudge and never under-counts it. `gave_up` stays given up across a restart, and the
+cap holds across a crash-looping front.
+
+The routine's configuration is read from the **current** profile, so editing the
+profile and sending `SIGUSR2` takes effect. A pane whose profile is gone, or has no
+`routine` now, is not watched, and the front logs one line. The idle clock starts again
+at adoption, which delays a nudge by at most `idle_timeout_secs` and never causes an
+extra one. A `pane_replayed` refusal is a skip, not a failed nudge, and it is logged
+once. A pane with a wrapped tail and nobody at it is not nudged until it repaints.
+
+### The version rule
+
+The two ends exchange a protocol number, `HOLDER_VERSION`, in the first frame each way,
+and it must be equal. A new binary installed over the old one may speak another number.
+Its front then exits with status 78 and logs `holder protocol N, front M`, the holder
+logs both numbers and tries again with the backoff above, and the panes stay alive
+throughout. Restart the holder, which ends the panes, to move to such a release. When
+the number is unchanged, replacing the binary and sending `SIGUSR2` is enough (see
+[Restarting the server under a service manager](#restarting-the-server-under-a-service-manager)).
+
+`OPENAB_SHEPHERD_TEST_HOLDER_VERSION` makes the front speak another number: an integer,
+or `@<path>` naming a file that holds one. The file is read at each front start, so an
+operator can change the number without restarting the holder, whose environment the
+front inherits. A missing or empty file means the real number. It is always compiled
+in, for the operator scripts. It is not a security control: the same account can run
+the binary in any way it likes (see the [trust model](adr/trust-model.md)).
+
+### Bad configuration
+
+A front that cannot load its settings exits with status 2, and the holder logs the
+status and the front's first stderr line on each attempt, with the delays above. The
+service looks healthy (the holder runs, the panes live) while nothing listens, and the
+image has no `HEALTHCHECK`. Fix the file, then wait for the next attempt or send
+`SIGUSR2`, which starts the front at once.
+
+### Verification
+
+The process tests in `tests/hold_front.rs` and `tests/zombie_subreaper.rs` and the
+in-process suites cover the mechanics without the MCP server. The scenarios that need
+the real server (kill the server mid-dialog, a service-manager restart, a wrapped
+tail, the routine after a restart) are scripts for an operator, in
+[`docs/operator-e2e/restart-survival.md`](operator-e2e/restart-survival.md). Where the
+implementation departs from the ADR is in the ADR's
+[implementation notes](adr/restart-survival-and-shared-panes.md#11-implementation-notes).
+
+`examples/record_tail.rs` records a real agent's output as a replay fixture: it runs
+the command on a native pane, waits for a quiet period, and writes the raw bytes and
+the final screen, after replacing the home directory and refusing to write anything
+that looks like a credential. It needs a logged-in CLI and is run by hand.
 
 ## Input rules
 
@@ -851,9 +996,11 @@ Use the same `printf %s`, not `echo`, so no newline is hashed.
   include `cwd` and the command line.
 - **`dialog` approves what the agent asked to do.**
 - **Revocation is restart-only.** The clients file is read once at startup. To
-  remove a client, edit the file and restart Shepherd. **A restart ends every pane**
-  (native panes are Shepherd's children). `SIGHUP` is not a reload: it is an exit
-  signal and ends every pane like `SIGINT` and `SIGTERM`. Use `expires` to bound a
+  remove a client, edit the file and restart Shepherd. **A restart of a bare server ends
+  every pane** (native panes are its children). Under `hold`, `SIGUSR2` on the holder
+  restarts the server alone, which reads the file again, and the panes keep running.
+  `SIGHUP` is not a reload: it is an exit signal and ends every pane like `SIGINT` and
+  `SIGTERM` (on the holder, too). Use `expires` to bound a
   token's life in the meantime.
 - The file holds hashes, so a leaked file does not reveal tokens, but a stolen live
   token works until it expires or the server restarts.
@@ -886,7 +1033,7 @@ build host needs `sh`, `cat`, `printf`, `env` and `ls`.
 
 The tool contract is pinned by `tests/tool_schema_snapshot.rs`. It compares the tool names and input schemas that `tools/list` reports with `tests/snapshots/tool_schemas.json`. A change to a tool name, argument, type, bound or argument description fails the test until the snapshot is regenerated with `UPDATE_SNAPSHOTS=1 cargo test --test tool_schema_snapshot` and committed in the same PR, so the contract change shows in review. The variable is ignored when `CI` is set. Result fields are not snapshotted: they are documented only as prose in [Tools](#tools), not in a machine-readable form.
 
-The operator end-to-end runbook, which drives real Devin and OpenCode panes through the MCP tools, is in [`docs/operator-e2e/`](operator-e2e/README.md).
+The operator end-to-end runbook, which drives real Devin and OpenCode panes through the MCP tools, is in [`docs/operator-e2e/`](operator-e2e/README.md). The restart-survival scripts (kill the server mid-dialog, SIGUSR2, service restart, the version loop, the routine after a restart) are in [`docs/operator-e2e/restart-survival.md`](operator-e2e/restart-survival.md). Agents never run either set: both start the real server.
 
 ## CI
 
@@ -1158,8 +1305,9 @@ try to update itself at run time).
   only the host; whether those may stay approvable remotely is an open design question,
   not decided by the parser. Other programs, other versions, and `kind` values
   `question` or `auth` are untested or refused. `force` is never sent.
-- **Native: no restart survival.** Native panes are Shepherd's children; they end
-  when Shepherd exits.
+- **Native: restart survival only under `hold`.** A bare `openab-shepherd` owns its
+  panes, and they end when it exits. Under `openab-shepherd hold` the panes outlive a
+  server restart but not the holder (see [Restart survival](#restart-survival)).
 - **Native: no viewer or attach.** Nobody can watch or type into a native pane
   except through the tools.
 - **Native: 8 live panes.** `start_pane` is refused while 8 panes run. Free a slot
