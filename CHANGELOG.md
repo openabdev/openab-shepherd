@@ -18,6 +18,13 @@
   authentications go to stderr, not to the audit file. Fail-closed and fail-open behaviour is
   unchanged.
 
+- Clients file: the single token is now the client `default` (it was `legacy` in unreleased
+  builds). With a clients file, a token file or an env token is a startup error that names the
+  fix, and `allow_legacy_token` is removed (a file that still sets it is refused with a message
+  to delete it). No released version had either, so this is not a breaking change. Removed: the
+  duplicate-key scan (the last value wins), the owner check, the client and profile count caps and
+  the dummy-digest compare. The 0600 mode check, the 1 MiB cap and the bearer-length cap stay.
+
 ## 0.4.0
 
 ### Breaking changes

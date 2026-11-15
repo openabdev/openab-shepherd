@@ -1,7 +1,6 @@
 //! The `openab-shepherd` binary: argument parsing and startup over the library.
 
 use openab_shepherd::audit::{self, Audit};
-use openab_shepherd::clients;
 use openab_shepherd::config::BackendChoice;
 use openab_shepherd::http::AppState;
 use openab_shepherd::native::{NativeBackend, NativeConfig};
@@ -20,8 +19,7 @@ Environment:
   OPENAB_SHEPHERD_TOKEN       the bearer token itself (use one of the two)
   OPENAB_SHEPHERD_CLIENTS     clients file (JSON, mode 600, outside any git repo):
                               named clients with scopes; needs the audit file,
-                              and refuses the two token variables above (the
-                              token file only with allow_legacy_token)
+                              and refuses the two token variables above
   OPENAB_SHEPHERD_AUDIT_FILE  audit log (JSON Lines) in a mode 700 directory
   OPENAB_SHEPHERD_BACKEND     native, the only backend (default {})
   OPENAB_SHEPHERD_PROFILES    launch profiles file (JSON, outside any git repo);
@@ -186,9 +184,6 @@ fn main() -> ExitCode {
         config.bind,
         http::MCP_PATH
     );
-    if config.clients.allow_legacy_token() && config.clients.has_legacy() {
-        eprintln!("openab-shepherd: warning: {}", clients::LEGACY_WARNING);
-    }
     if !config.allowed_hosts.is_empty() {
         let list: Vec<String> = config.allowed_hosts.iter().map(|h| h.to_string()).collect();
         eprintln!(

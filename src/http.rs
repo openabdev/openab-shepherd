@@ -23,7 +23,7 @@ pub const MCP_PATH: &str = "/mcp";
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 pub struct AppState {
-    /// Who may call: the clients file, or the single legacy token.
+    /// Who may call: the clients file, or the single token.
     pub clients: Clients,
     /// Extra Host values from `OPENAB_SHEPHERD_ALLOWED_HOSTS`; empty by default.
     pub allowed_hosts: Vec<AllowedHost>,
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn bearer_must_match_exactly() {
-        let clients = Clients::legacy_only(TOKEN);
+        let clients = Clients::single_token(TOKEN);
         let ok = |header: Option<&str>| clients.authenticate(header, 0).is_ok();
         assert!(ok(Some(&format!("Bearer {TOKEN}"))));
         assert!(!ok(None));
@@ -346,7 +346,7 @@ mod tests {
         let caller = clients
             .authenticate(Some(&format!("Bearer {TOKEN}")), 0)
             .unwrap();
-        assert_eq!(caller.client(), "legacy");
+        assert_eq!(caller.client(), "default");
     }
 
     #[test]
@@ -399,7 +399,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(AppState {
-            clients: Clients::legacy_only(TOKEN),
+            clients: Clients::single_token(TOKEN),
             allowed_hosts,
             shepherd: Shepherd::new(crate::testutil::FakeBackend::new(true)),
         });
@@ -414,7 +414,7 @@ mod tests {
         let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = held.local_addr().unwrap();
         let state = Arc::new(AppState {
-            clients: Clients::legacy_only(TOKEN),
+            clients: Clients::single_token(TOKEN),
             allowed_hosts: Vec::new(),
             shepherd: Shepherd::new(crate::testutil::FakeBackend::new(true)),
         });
@@ -673,7 +673,7 @@ mod issue4_pr1_http {
         let wrong_secret = format!("Bearer {}", token("alice", SECRET_CI));
         let unknown_id = format!("Bearer {}", token("nobody", SECRET_ALICE));
         let expired = format!("Bearer {}", token("old", SECRET_OBS));
-        let legacy_shape = "Bearer a-long-legacy-token-value-0123456789".to_string();
+        let single_shape = "Bearer a-long-single-token-value-0123456789".to_string();
         let truncated = format!("Bearer {}x", token("alice", SECRET_ALICE));
         let mut bodies = Vec::new();
         for header in [
@@ -684,7 +684,7 @@ mod issue4_pr1_http {
             Some(wrong_secret.as_str()),
             Some(unknown_id.as_str()),
             Some(expired.as_str()),
-            Some(legacy_shape.as_str()),
+            Some(single_shape.as_str()),
             Some(truncated.as_str()),
         ] {
             let (status, body) = post(server.port, &host, header, INIT);
