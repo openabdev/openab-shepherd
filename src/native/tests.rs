@@ -7,15 +7,11 @@ use crate::testutil::TempDir;
 use crate::tools::{self, Args, Shepherd};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
+use std::os::fd::AsRawFd;
 
 const LONG: Duration = Duration::from_secs(10);
 
-thread_local! {
-    /// Set to make the next pane thread started on this thread fail.
-    pub(super) static FAIL_NEXT_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The pid of the last child `insert` recorded on this thread.
-    pub(super) static LAST_SPAWN_PID: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
-}
+use super::host::local::{Proc, FAIL_NEXT_THREAD, LAST_SPAWN_PID};
 
 /// idle; read a line; working then blocked (permission); read a line (Enter);
 /// echo it; working; 1 s; done; read a line.
@@ -111,6 +107,14 @@ fn state_is(info: &TerminalInfo, state: State) -> bool {
 
 fn pane_of(b: &NativeBackend, info: &TerminalInfo) -> Arc<Pane> {
     b.inner.resolve(&info.reference()).unwrap()
+}
+
+/// The host's process half of the pane.
+fn proc_of(b: &NativeBackend, info: &TerminalInfo) -> Arc<Proc> {
+    let host = Arc::clone(&b.inner.host_any)
+        .downcast::<LocalHost>()
+        .unwrap();
+    host.proc(&info.id).unwrap()
 }
 
 /// Whether any process is left in group `pgid`.
@@ -716,7 +720,10 @@ fn tcgetpgrp_on_the_master_names_the_session_group() {
     let b = backend();
     let info = b.run(&spec_line("pgrp", "sleep 30", &dir)).unwrap();
     let pane = pane_of(&b, &info);
-    assert_eq!(pty::tcgetpgrp(pane.master.as_raw_fd()), Some(pane.pid));
+    assert_eq!(
+        pty::tcgetpgrp(proc_of(&b, &info).master.as_raw_fd()),
+        Some(pane.pid)
+    );
 }
 
 // (g)
@@ -940,13 +947,14 @@ fn a_group_member_that_outlives_the_leader_is_ended() {
     let info = b.run(&spec_line("surv", SURVIVOR, &dir)).unwrap();
     let bg = printed_pid(&b, &info, "bg:");
     let pane = pane_of(&b, &info);
+    let host = proc_of(&b, &info);
     let ended = b.wait(&info.reference(), LONG).unwrap();
     assert_eq!(ended.reason, Some(WaitReason::Exit));
     assert_eq!(ended.exit_code, Some(5));
     thread::sleep(Duration::from_millis(300));
     assert!(process_alive(bg), "the survivor got no grace");
     assert!(
-        pane.owns_group(),
+        host.owns_group(),
         "the leader was reaped before its group ended"
     );
     assert!(
@@ -954,11 +962,11 @@ fn a_group_member_that_outlives_the_leader_is_ended() {
         "the survivor outlived its pane"
     );
     let end = Instant::now() + Duration::from_secs(5);
-    while pane.owns_group() && Instant::now() < end {
+    while host.owns_group() && Instant::now() < end {
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(!pane.owns_group());
-    assert!(pane.state.lock().unwrap().reaped);
+    assert!(!host.owns_group());
+    assert!(host.state.lock().unwrap().reaped);
     assert!(!process_alive(pane.pid), "the leader is still a zombie");
     let out = b.remove(&info.reference(), None).unwrap();
     assert!(!out.was_live);
@@ -1192,7 +1200,7 @@ fn a_lost_group_is_never_signalled() {
     let dir = TempDir::new("native-group-lost");
     let b = backend();
     let info = b.run(&spec_line("lost", "sleep 300", &dir)).unwrap();
-    let pane = pane_of(&b, &info);
+    let pane = proc_of(&b, &info);
     pane.state.lock().unwrap().group_lost = true;
     assert!(!pane.owns_group());
     pane.release();

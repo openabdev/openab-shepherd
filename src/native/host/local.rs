@@ -1,0 +1,613 @@
+//! [`LocalHost`]: the process half in this process. The code is the native
+//! core's former pane process handling, moved here unchanged; the screen half
+//! now reaches it through [`PtyHost`] and hears from its threads through
+//! [`HostEvents`].
+//!
+//! Locking: a pane's `tree` is taken before its `state`; nothing here holds a
+//! lock across a sleep, a poll or a wait, except the condvar waits, which
+//! release `state`. The registry lock is held only to look a pane up or
+//! change the list, never across a call into the sink or a wait.
+
+use super::{
+    procs, pty, HostEvents, HostPane, KillOutcome, PtyHost, SpawnReq, Spawned, KILL_GRACE,
+};
+use crate::backend::{BackendError, ErrorKind};
+use crate::native::term::{COLS, ROWS};
+use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
+use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+thread_local! {
+    /// Set to make the next pane thread started on this thread fail.
+    pub(crate) static FAIL_NEXT_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The pid of the last child spawned on this thread.
+    pub(crate) static LAST_SPAWN_PID: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+const READ_CHUNK: usize = 16 * 1024;
+/// How often the reader wakes to check for removal.
+const READ_POLL_MS: libc::c_int = 200;
+/// After the leader exits, how long the reaper waits for the reader to take
+/// the last output, so a read after `wait` returns `exit` shows it.
+const EXIT_DRAIN: Duration = Duration::from_millis(500);
+/// How often the reader refreshes the pane's process tree while the leader
+/// runs, so a descendant is known before its parent can exit (ADR §11).
+const TREE_POLL: Duration = Duration::from_millis(250);
+/// How often a stop re-checks whether the pane's descendants have exited.
+const TREE_WAIT_POLL: Duration = Duration::from_millis(50);
+/// At most this many refresh-and-stop rounds before the final SIGKILL.
+const FREEZE_ROUNDS: usize = 8;
+
+/// The panes this host runs, in creation order.
+#[derive(Default)]
+struct Registry {
+    next_id: u64,
+    panes: Vec<Arc<Proc>>,
+}
+
+pub(crate) struct LocalHost {
+    registry: Mutex<Registry>,
+    sink: Mutex<Option<Arc<dyn HostEvents>>>,
+}
+
+pub(crate) struct Proc {
+    pub(crate) id: String,
+    /// The leader's pid, which is also the group id.
+    pub(crate) pid: i32,
+    pub(crate) master: OwnedFd,
+    /// The size last set on the terminal, `(cols, rows)`.
+    size: Mutex<(u16, u16)>,
+    pub(crate) state: Mutex<ProcState>,
+    changed: Condvar,
+    /// Every descendant seen so far (ADR §11). Taken before `state`.
+    tree: Mutex<procs::Tree>,
+    /// A removal or shutdown is ending the pane: the reaper leaves the
+    /// descendants' grace to it and reaps once it has released the pane.
+    stopping: AtomicBool,
+    /// Stops the reader. Set only once the leader is reaped, because a
+    /// process exiting with output still queued on the terminal waits
+    /// (on macOS forever) for someone to read it. The parent's copy of the
+    /// slave stays open until the leader exits (issue #54), so macOS cannot
+    /// lose a quick program's output; the reaper closes it at the exit.
+    shutdown: AtomicBool,
+    reader: Mutex<Option<JoinHandle<()>>>,
+}
+
+pub(crate) struct ProcState {
+    /// The leader has exited and the reader has drained the terminal (or the
+    /// drain wait ran out).
+    live: bool,
+    /// The leader has exited: set as soon as its status is read, before the
+    /// reaper waits for the reader to drain, so a stop decides `killed` from
+    /// when the leader exited, not from when `live` was cleared.
+    exited: bool,
+    reader_done: bool,
+    /// The leader has been reaped: its pid, so the group and session ids,
+    /// are no longer reserved for this pane (ADR §11).
+    pub(crate) reaped: bool,
+    /// The pane's group and descendants were killed for good (`release`);
+    /// the reaper reaps the leader only after this.
+    released: bool,
+    /// The reaper fell back to a plain wait, which frees the group id: the
+    /// group is never signalled again.
+    pub(crate) group_lost: bool,
+}
+
+impl LocalHost {
+    pub(crate) fn new() -> Self {
+        Self {
+            registry: Mutex::new(Registry::default()),
+            sink: Mutex::new(None),
+        }
+    }
+
+    fn registry(&self) -> std::sync::MutexGuard<'_, Registry> {
+        self.registry.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn find(&self, id: &str) -> Option<Arc<Proc>> {
+        self.registry().panes.iter().find(|p| p.id == id).cloned()
+    }
+
+    fn take(&self, id: &str) -> Option<Arc<Proc>> {
+        let mut registry = self.registry();
+        let at = registry.panes.iter().position(|p| p.id == id)?;
+        Some(registry.panes.remove(at))
+    }
+
+    fn unknown(id: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::NotFound, format!("no such pane: {id}"))
+    }
+
+    /// The pane's process state, for tests that read or set a flag.
+    #[cfg(test)]
+    pub(crate) fn proc(&self, id: &str) -> Option<Arc<Proc>> {
+        self.find(id)
+    }
+}
+
+impl PtyHost for LocalHost {
+    fn set_sink(&self, sink: Arc<dyn HostEvents>) {
+        *self.sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    fn spawn(&self, req: SpawnReq) -> Result<Spawned, BackendError> {
+        let sink = self
+            .sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| BackendError::new(ErrorKind::Other, "native: the host has no sink"))?;
+        let pty::Spawned {
+            master,
+            slave,
+            child,
+        } = pty::spawn(&req.argv, Path::new(&req.cwd), &req.env)?;
+        let pid = child.id() as i32;
+        #[cfg(test)]
+        LAST_SPAWN_PID.with(|last| last.set(pid));
+        let mut registry = self.registry();
+        registry.next_id += 1;
+        let id = format!("n:{}", registry.next_id);
+        let pane = Arc::new(Proc {
+            id: id.clone(),
+            pid,
+            master,
+            size: Mutex::new((COLS, ROWS)),
+            state: Mutex::new(ProcState {
+                live: true,
+                exited: false,
+                reader_done: false,
+                reaped: false,
+                released: false,
+                group_lost: false,
+            }),
+            changed: Condvar::new(),
+            tree: Mutex::new(procs::Tree::default()),
+            stopping: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            reader: Mutex::new(None),
+        });
+        registry.panes.push(Arc::clone(&pane));
+        drop(registry);
+        // The reaper takes the child from this slot, so if its thread cannot
+        // start, the child is still here to be reaped (review SOL-B2).
+        let child_slot = Arc::new(Mutex::new(Some(child)));
+        let reaper = {
+            let pane = Arc::clone(&pane);
+            let child_slot = Arc::clone(&child_slot);
+            let sink = Arc::clone(&sink);
+            spawn_thread(format!("native-reap-{}", pane.id), move || {
+                let child = child_slot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(child) = child {
+                    reap(pane, child, slave, sink);
+                }
+            })
+        };
+        let reader = reaper.and_then(|_| {
+            let pane = Arc::clone(&pane);
+            spawn_thread(format!("native-read-{}", pane.id), move || {
+                read_loop(pane, sink);
+            })
+        });
+        match reader {
+            Ok(handle) => {
+                if let Ok(mut slot) = pane.reader.lock() {
+                    *slot = Some(handle);
+                }
+                Ok(Spawned { id, pid })
+            }
+            Err(err) => {
+                pane.stopping.store(true, Ordering::Release);
+                pane.shutdown.store(true, Ordering::Release);
+                pane.release();
+                // No reaper took the child: reap the killed leader here.
+                let orphan = child_slot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(mut child) = orphan {
+                    {
+                        let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
+                        st.live = false;
+                        st.exited = true;
+                        st.group_lost = true;
+                    }
+                    let _ = child.wait();
+                    pane.state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .reaped = true;
+                    pane.changed.notify_all();
+                }
+                self.registry().panes.retain(|p| !Arc::ptr_eq(p, &pane));
+                Err(BackendError::new(
+                    ErrorKind::Other,
+                    format!("native: cannot start the pane's threads: {err}"),
+                ))
+            }
+        }
+    }
+
+    fn try_write(&self, id: &str, bytes: &[u8]) -> io::Result<usize> {
+        let pane = self.find(id).ok_or_else(|| Self::unknown(id))?;
+        pty::try_write(pane.master.as_raw_fd(), bytes)
+    }
+
+    fn wait_writable(&self, id: &str, timeout: Duration) -> io::Result<bool> {
+        let pane = self.find(id).ok_or_else(|| Self::unknown(id))?;
+        pty::poll_writable(pane.master.as_raw_fd(), timeout)
+    }
+
+    fn resize(&self, id: &str, cols: u16, rows: u16) -> io::Result<()> {
+        let pane = self.find(id).ok_or_else(|| Self::unknown(id))?;
+        pty::set_winsize(pane.master.as_raw_fd(), cols, rows)?;
+        *pane.size.lock().unwrap_or_else(PoisonError::into_inner) = (cols, rows);
+        Ok(())
+    }
+
+    fn signal(&self, id: &str, signal: i32) -> io::Result<()> {
+        let pane = self.find(id).ok_or_else(|| Self::unknown(id))?;
+        let st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if st.group_lost || st.reaped {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the pane's group is no longer its own",
+            ));
+        }
+        pty::killpg(pane.pid, signal)
+    }
+
+    /// SIGHUP and SIGTERM to the pane's group and every descendant, up to
+    /// `grace` for the leader and descendants to exit, then SIGKILL to the
+    /// group and every descendant left (ADR §11). The leader is reaped and
+    /// its exit reported before this returns. No key is sent first.
+    fn kill(&self, id: &str, grace: Duration) -> Option<KillOutcome> {
+        let pane = self.find(id)?;
+        pane.stopping.store(true, Ordering::Release);
+        pane.soft_stop();
+        let deadline = Instant::now() + grace;
+        pane.await_exit(deadline);
+        let killed = !pane.has_exited();
+        pane.await_tree_gone(deadline);
+        pane.release();
+        // The reaper records the exit code (128 + SIGKILL when killed) and
+        // reaps; the reader drains the terminal until then.
+        pane.await_reaped(Instant::now() + KILL_GRACE);
+        pane.shutdown.store(true, Ordering::Release);
+        let reader = pane.reader.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(reader) = reader {
+            let _ = reader.join();
+        }
+        self.registry().panes.retain(|p| !Arc::ptr_eq(p, &pane));
+        Some(KillOutcome { killed })
+    }
+
+    fn fg_pgrp(&self, id: &str) -> Option<i32> {
+        let pane = self.find(id)?;
+        pty::tcgetpgrp(pane.master.as_raw_fd())
+    }
+
+    fn list(&self) -> Vec<HostPane> {
+        let panes = self.registry().panes.clone();
+        panes
+            .iter()
+            .map(|pane| {
+                let (cols, rows) = *pane.size.lock().unwrap_or_else(PoisonError::into_inner);
+                HostPane {
+                    id: pane.id.clone(),
+                    pid: pane.pid,
+                    cols,
+                    rows,
+                    exited: pane.has_exited(),
+                }
+            })
+            .collect()
+    }
+
+    fn forget(&self, id: &str) {
+        if let Some(pane) = self.take(id) {
+            pane.stopping.store(true, Ordering::Release);
+            pane.release();
+        }
+    }
+
+    /// SIGHUP and SIGTERM to every pane's group and descendants, one wait of
+    /// up to 2 s for all of them, then kill what is left of each pane's tree
+    /// and wait (up to 2 s more) for the leaders to be reaped.
+    fn end_all(&self) {
+        let panes = std::mem::take(&mut self.registry().panes);
+        for pane in &panes {
+            pane.stopping.store(true, Ordering::Release);
+            pane.soft_stop();
+        }
+        let deadline = Instant::now() + KILL_GRACE;
+        for pane in &panes {
+            pane.await_exit(deadline);
+        }
+        for pane in &panes {
+            pane.await_tree_gone(deadline);
+        }
+        for pane in &panes {
+            pane.release();
+        }
+        let deadline = Instant::now() + KILL_GRACE;
+        for pane in &panes {
+            pane.await_reaped(deadline);
+            pane.shutdown.store(true, Ordering::Release);
+        }
+    }
+
+    fn survives_restart(&self) -> bool {
+        false
+    }
+}
+
+impl Proc {
+    fn has_exited(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .exited
+    }
+
+    fn is_live(&self) -> bool {
+        self.state.lock().is_ok_and(|st| st.live)
+    }
+
+    /// Whether the group id is still reserved for this pane: the leader is
+    /// not reaped yet (it runs, or is a zombie). Only then may Shepherd
+    /// signal the group or look up the group and session by the leader's pid
+    /// (POSIX does not reuse a pid while its process exists).
+    pub(crate) fn owns_group(&self) -> bool {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        !st.group_lost && !st.reaped
+    }
+
+    /// Send `signals` to the group if it is still ours, under `state`, so the
+    /// reservation cannot end between the check and the kill. Whether it was.
+    fn signal_group(&self, signals: &[libc::c_int]) -> bool {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if st.group_lost || st.reaped {
+            return false;
+        }
+        for &signal in signals {
+            self.signal(signal, st.live);
+        }
+        true
+    }
+
+    /// SIGHUP and SIGTERM to the group and to every known descendant, after
+    /// a fresh look for descendants. No key is typed (ADR §11).
+    fn soft_stop(&self) {
+        let mut tree = self.tree.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.owns_group() {
+            tree.refresh(self.pid);
+        }
+        self.signal_group(&[libc::SIGHUP, libc::SIGTERM]);
+        tree.signal_all(libc::SIGHUP);
+        tree.signal_all(libc::SIGTERM);
+    }
+
+    /// Wait until no known descendant runs, or `deadline` passes.
+    fn await_tree_gone(&self, deadline: Instant) {
+        loop {
+            {
+                let mut tree = self.tree.lock().unwrap_or_else(PoisonError::into_inner);
+                if self.owns_group() {
+                    tree.refresh(self.pid);
+                }
+                if !tree.any_alive() {
+                    return;
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            thread::sleep(left.min(TREE_WAIT_POLL));
+        }
+    }
+
+    /// End the pane's processes for good: look for descendants and SIGSTOP
+    /// them and the group, again until a look finds nobody new (a stopped
+    /// process cannot fork), then SIGKILL the group and every descendant.
+    /// After this the reaper reaps the leader, and the group id is no longer
+    /// reserved. Idempotent.
+    pub(crate) fn release(&self) {
+        let mut tree = self.tree.lock().unwrap_or_else(PoisonError::into_inner);
+        for round in 1..=FREEZE_ROUNDS {
+            let owned = self.owns_group();
+            let added = if owned { tree.refresh(self.pid) } else { 0 };
+            self.signal_group(&[libc::SIGSTOP]);
+            tree.signal_all(libc::SIGSTOP);
+            if !owned || (round > 1 && added == 0) {
+                break;
+            }
+        }
+        self.signal_group(&[libc::SIGKILL]);
+        tree.signal_all(libc::SIGKILL);
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .released = true;
+        drop(tree);
+        self.changed.notify_all();
+    }
+
+    /// Signal the group. EPERM once the leader has exited is not logged: on
+    /// macOS a group left with only its zombie leader answers EPERM.
+    fn signal(&self, signal: libc::c_int, live: bool) {
+        match pty::killpg(self.pid, signal) {
+            Err(err) if !live && err.raw_os_error() == Some(libc::EPERM) => {}
+            Err(err) => eprintln!("openab-shepherd: native: {}: kill failed: {err}", self.id),
+            Ok(()) => {}
+        }
+    }
+
+    /// Wait until the reaper has reaped the leader or `deadline` passes.
+    fn await_reaped(&self, deadline: Instant) {
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while !st.reaped && !st.group_lost {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            st = match self.changed.wait_timeout(st, left) {
+                Ok((next, _)) => next,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
+
+    /// Wait until the leader has exited or `deadline` passes.
+    fn await_exit(&self, deadline: Instant) {
+        let Ok(mut st) = self.state.lock() else {
+            return;
+        };
+        while !st.exited {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            match self.changed.wait_timeout(st, left) {
+                Ok((next, _)) => st = next,
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+/// The reader thread: output to the sink until EOF, EIO or removal, and every
+/// `TREE_POLL` a fresh look for the pane's descendants.
+fn read_loop(pane: Arc<Proc>, sink: Arc<dyn HostEvents>) {
+    let fd = pane.master.as_raw_fd();
+    let mut buf = vec![0u8; READ_CHUNK];
+    let mut next_tree = Instant::now();
+    // The offset of the first byte of the next chunk; counted, not stored.
+    let mut seq: u64 = 0;
+    while !pane.shutdown.load(Ordering::Acquire) {
+        match pty::poll_read(fd, &mut buf, READ_POLL_MS) {
+            Ok(None) => sink.idle(&pane.id),
+            Ok(Some(0)) => break,
+            Ok(Some(n)) => {
+                if !sink.output(&pane.id, seq, &buf[..n]) {
+                    break;
+                }
+                seq += n as u64;
+            }
+            Err(err) if err.raw_os_error() == Some(libc::EIO) => break,
+            Err(err) => {
+                eprintln!("openab-shepherd: native: {}: read failed: {err}", pane.id);
+                break;
+            }
+        }
+        if Instant::now() >= next_tree {
+            // try_lock: a stop holds the tree, and the reader must keep
+            // draining the terminal meanwhile.
+            if let Ok(mut tree) = pane.tree.try_lock() {
+                if pane.is_live() && pane.owns_group() {
+                    let _ = tree.refresh(pane.pid);
+                }
+            }
+            next_tree = Instant::now() + TREE_POLL;
+        }
+    }
+    if let Ok(mut st) = pane.state.lock() {
+        st.reader_done = true;
+    }
+    pane.changed.notify_all();
+}
+
+/// The reaper thread: waits for the leader to exit without reaping it (the
+/// zombie keeps the group and session ids ours) and records the exit. Then
+/// it ends what the leader left behind: on its own exit, SIGHUP and SIGTERM
+/// to the group and descendants, up to 2 s, and `release`; during a removal
+/// or shutdown, it waits for that to `release`. Then it reaps the leader,
+/// under the tree lock, so no look for descendants runs on a freed pid.
+fn reap(pane: Arc<Proc>, mut child: Child, slave: OwnedFd, sink: Arc<dyn HostEvents>) {
+    let (code, reaped) = match pty::wait_exited(pane.pid) {
+        Ok(code) => (Some(code), false),
+        Err(err) => {
+            // Not expected; fall back to a plain wait, which gives up the id.
+            // Marked lost under `state` first, so no signal can reach the
+            // group once the id may belong to another process (review N9).
+            eprintln!("openab-shepherd: native: {}: waitid failed: {err}", pane.id);
+            pane.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .group_lost = true;
+            let code = child.wait().ok().and_then(|status| {
+                status
+                    .code()
+                    .map(i64::from)
+                    .or_else(|| status.signal().map(|signal| 128 + i64::from(signal)))
+            });
+            (code, true)
+        }
+    };
+    // The leader has exited: the parent's slave copy is no longer needed.
+    drop(slave);
+    let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
+    st.exited = true;
+    pane.changed.notify_all();
+    let deadline = Instant::now() + EXIT_DRAIN;
+    while !st.reader_done {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        st = match pane.changed.wait_timeout(st, left) {
+            Ok((next, _)) => next,
+            Err(poisoned) => poisoned.into_inner().0,
+        };
+    }
+    st.live = false;
+    drop(st);
+    // After the drain: every `output` of this pane has been delivered.
+    sink.exited(&pane.id, code);
+    pane.changed.notify_all();
+    if pane.stopping.load(Ordering::Acquire) {
+        let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while !st.released {
+            st = match pane.changed.wait_timeout(st, Duration::from_secs(1)) {
+                Ok((next, _)) => next,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    } else {
+        pane.soft_stop();
+        pane.await_tree_gone(Instant::now() + KILL_GRACE);
+        pane.release();
+    }
+    let tree = pane.tree.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
+    if !reaped {
+        let _ = child.wait();
+    }
+    st.reaped = true;
+    drop(st);
+    drop(tree);
+    pane.changed.notify_all();
+}
+
+/// Start a named thread. In tests, `FAIL_NEXT_THREAD` makes the next start
+/// on this thread fail, dropping `f` as a failed spawn does.
+fn spawn_thread(name: String, f: impl FnOnce() + Send + 'static) -> io::Result<JoinHandle<()>> {
+    #[cfg(test)]
+    if FAIL_NEXT_THREAD.with(|fail| fail.replace(false)) {
+        drop(f);
+        return Err(io::Error::other("injected thread start failure"));
+    }
+    thread::Builder::new().name(name).spawn(f)
+}

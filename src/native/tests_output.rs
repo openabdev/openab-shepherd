@@ -7,7 +7,8 @@ use crate::profiles::LaunchPolicy;
 use crate::testutil::TempDir;
 use crate::tools::{self, Args, Shepherd};
 use serde_json::{json, Value};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 
 const LONG: Duration = Duration::from_secs(20);
 
