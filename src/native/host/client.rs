@@ -173,6 +173,7 @@ pub(crate) struct HolderClient {
 
 impl HolderClient {
     /// Greet the holder and start the router and events threads.
+    #[cfg_attr(not(test), allow(dead_code))] // the front passes its own version
     pub(crate) fn connect(ops: UnixStream, events: UnixStream) -> Result<Self, ConnectError> {
         Self::connect_as(ops, events, HOLDER_VERSION)
     }
@@ -277,7 +278,6 @@ impl HolderClient {
     }
 
     /// Whether the link has broken.
-    #[cfg_attr(not(test), allow(dead_code))] // the front under a holder exits on it (PR6)
     pub(crate) fn is_closed(&self) -> bool {
         self.shared.is_dead()
     }

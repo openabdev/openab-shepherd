@@ -510,7 +510,7 @@ native call or its own fallback:
 | `program_status` | the backend reports the program's OSC 7501 status and turns | informational | true |
 | `history` | `read` with history lines returns scrollback | `read_output` with `lines > 0` returns `unsupported` | true |
 | `native_wait` | `wait` blocks inside the backend | informational (Shepherd would poll) | true |
-| `survives_restart` | panes outlive a Shepherd restart | informational | false |
+| `survives_restart` | panes outlive a Shepherd restart | informational | false by default; true under `openab-shepherd hold`, where a holder process owns the panes and restarts the server (SIGUSR2 restarts the server only) |
 
 `RunSpec.profile` names the launch profile Shepherd resolved `argv` and `cwd` from,
 and `RunSpec.profile_env` carries that profile's environment, already read from its

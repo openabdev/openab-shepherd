@@ -53,7 +53,12 @@ mod tests_replay_held;
 #[cfg(test)]
 mod tests_tail;
 
+pub use host::front::{
+    connect_front, exit_on_signals_leaving_panes, front_version, FrontError, FrontLink, LinkWatch,
+    EXIT_LINK_CLOSED, EXIT_VERSION_MISMATCH, TEST_VERSION_ENV,
+};
 pub(crate) use host::pty::{default_signals_on_exec, effective_uid, SPAWN_LOCK};
+pub use host::supervisor::run_holder;
 pub use keys::KeyboardMode;
 pub use status::LogEntry as StatusLogEntry;
 
@@ -254,7 +259,6 @@ impl NativeBackend {
 
     /// A backend over `host` that also keeps each pane's metadata there.
     /// Nothing in the server builds one yet; the holder will.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn with_host_meta<H: PtyHost + 'static>(
         config: NativeConfig,
         env: EnvLookup,
@@ -282,6 +286,15 @@ impl NativeBackend {
         }
     }
 
+    /// A backend over the holder `client` reaches: its panes live in the
+    /// holder and outlive this process, so each one's metadata is kept there.
+    pub(crate) fn over_holder(
+        config: NativeConfig,
+        client: Arc<host::client::HolderClient>,
+    ) -> Self {
+        Self::with_host_meta(config, Box::new(|key| std::env::var_os(key)), client, true)
+    }
+
     /// Drop the pane from the table and adopt it from the host again.
     #[cfg(test)]
     fn readopt(&self, id: &str) -> Result<(), BackendError> {
@@ -299,7 +312,6 @@ impl NativeBackend {
 
     /// Make dropping the last handle leave the panes running in the host
     /// instead of ending them: the front is going away, the panes are not.
-    #[cfg_attr(not(test), allow(dead_code))] // the front under a holder uses it
     pub(crate) fn leave_panes_on_drop(&self) {
         self.inner.leave_on_drop.store(true, Ordering::Release);
     }
@@ -313,7 +325,6 @@ impl NativeBackend {
     /// A pane enters the table only when its replay is done, and the table
     /// stays locked from the host's tail read to that moment, so no output
     /// can be lost or fed twice (the front skips bytes already replayed).
-    #[cfg_attr(not(test), allow(dead_code))] // the front under a holder calls it
     pub(crate) fn adopt(&self) -> Result<Adoption, BackendError> {
         let host = &self.inner.host;
         let mut done = Adoption::default();
