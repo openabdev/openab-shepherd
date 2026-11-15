@@ -36,7 +36,7 @@ which answers a permission dialog may receive.
   it. A profile's `routine` section makes Shepherd type its `nudge_text` into a
   pane whose finished turn sits idle past `idle_timeout_secs`, with limits and a
   stderr log. Off unless a profile sets it; see
-  [docs/operations.md](docs/operations.md#routine-optional-per-profile).
+  [docs/routine.md](docs/routine.md).
 - **Native terminal core.** The default backend runs each pane on its own PTY with a
   `vt100` emulator, a cleared child environment and at most 8 live panes. Programs
   report their state (`idle`, `working`, `done`, `blocked`, ...) with OSC 7501
