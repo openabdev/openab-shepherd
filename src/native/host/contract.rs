@@ -12,24 +12,24 @@ use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-const LONG: Duration = Duration::from_secs(15);
+pub(super) const LONG: Duration = Duration::from_secs(15);
 
 /// Everything the sink was told, in order.
 #[derive(Default)]
-struct Events {
+pub(super) struct Events {
     /// Per pane: `(seq, bytes)` of each `output`.
-    output: HashMap<String, Vec<(u64, Vec<u8>)>>,
+    pub(super) output: HashMap<String, Vec<(u64, Vec<u8>)>>,
     /// Per pane: the exit code, once `exited` came.
-    exited: HashMap<String, Option<i64>>,
+    pub(super) exited: HashMap<String, Option<i64>>,
     /// Calls that broke the ordering promise (output after exit, twice exited).
-    violations: Vec<String>,
-    gaps: usize,
+    pub(super) violations: Vec<String>,
+    pub(super) gaps: usize,
 }
 
 #[derive(Default)]
-struct Recorder {
-    events: Mutex<Events>,
-    changed: Condvar,
+pub(super) struct Recorder {
+    pub(super) events: Mutex<Events>,
+    pub(super) changed: Condvar,
 }
 
 impl HostEvents for Recorder {
@@ -64,7 +64,7 @@ impl HostEvents for Recorder {
 
 impl Recorder {
     /// Block until `ready` holds for the events, or fail after `LONG`.
-    fn wait_until(&self, what: &str, ready: impl Fn(&Events) -> bool) {
+    pub(super) fn wait_until(&self, what: &str, ready: impl Fn(&Events) -> bool) {
         let end = Instant::now() + LONG;
         let mut ev = self.events.lock().unwrap();
         while !ready(&ev) {
@@ -74,7 +74,7 @@ impl Recorder {
         }
     }
 
-    fn text(&self, id: &str) -> String {
+    pub(super) fn text(&self, id: &str) -> String {
         let ev = self.events.lock().unwrap();
         let bytes: Vec<u8> = ev
             .output
@@ -86,7 +86,7 @@ impl Recorder {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    fn wait_text(&self, id: &str, needle: &str) {
+    pub(super) fn wait_text(&self, id: &str, needle: &str) {
         self.wait_until(&format!("{needle:?} from {id}"), |ev| {
             let all: Vec<u8> = ev
                 .output
@@ -99,20 +99,20 @@ impl Recorder {
         });
     }
 
-    fn wait_exit(&self, id: &str) -> Option<i64> {
+    pub(super) fn wait_exit(&self, id: &str) -> Option<i64> {
         self.wait_until(&format!("{id} to exit"), |ev| ev.exited.contains_key(id));
         self.events.lock().unwrap().exited[id]
     }
 }
 
-struct Rig {
-    host: Arc<dyn PtyHost>,
-    sink: Arc<Recorder>,
-    dir: TempDir,
+pub(super) struct Rig {
+    pub(super) host: Arc<dyn PtyHost>,
+    pub(super) sink: Arc<Recorder>,
+    pub(super) dir: TempDir,
 }
 
 impl Rig {
-    fn new(host: Arc<dyn PtyHost>, name: &str) -> Self {
+    pub(super) fn new(host: Arc<dyn PtyHost>, name: &str) -> Self {
         let sink = Arc::new(Recorder::default());
         host.set_sink(Arc::clone(&sink) as Arc<dyn HostEvents>);
         Self {
@@ -122,7 +122,7 @@ impl Rig {
         }
     }
 
-    fn spawn(&self, argv: &[&str]) -> super::Spawned {
+    pub(super) fn spawn(&self, argv: &[&str]) -> super::Spawned {
         let env = pty::child_env(|key| std::env::var_os(key), &[]).unwrap();
         self.host
             .spawn(SpawnReq {
@@ -133,18 +133,18 @@ impl Rig {
             .unwrap()
     }
 
-    fn sh(&self, line: &str) -> super::Spawned {
+    pub(super) fn sh(&self, line: &str) -> super::Spawned {
         self.spawn(&["/bin/sh", "-c", line])
     }
 }
 
-fn process_alive(pid: i32) -> bool {
+pub(super) fn process_alive(pid: i32) -> bool {
     // SAFETY: signal 0 only checks for existence.
     let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-fn gone_within(pid: i32, within: Duration) -> bool {
+pub(super) fn gone_within(pid: i32, within: Duration) -> bool {
     let end = Instant::now() + within;
     while Instant::now() < end {
         if !process_alive(pid) {
@@ -263,7 +263,7 @@ fn resize_is_seen_by_the_program(rig: &Rig) {
     rig.sink.wait_text(&pane.id, "30 100");
 }
 
-fn wait_write(rig: &Rig, id: &str, bytes: &[u8]) {
+pub(super) fn wait_write(rig: &Rig, id: &str, bytes: &[u8]) {
     let end = Instant::now() + LONG;
     loop {
         match rig.host.try_write(id, bytes) {
@@ -322,9 +322,9 @@ fn ids_are_stable_and_panes_stay_listed_until_ended(rig: &Rig) {
     assert!(gone_within(second.pid, Duration::from_secs(5)));
 }
 
-type Scenario = (&'static str, fn(&Rig));
+pub(super) type Scenario = (&'static str, fn(&Rig));
 
-const SCENARIOS: &[Scenario] = &[
+pub(super) const SCENARIOS: &[Scenario] = &[
     (
         "output is numbered and ordered",
         output_is_numbered_and_ordered,
@@ -353,10 +353,10 @@ const SCENARIOS: &[Scenario] = &[
 ];
 
 /// The tail size of the host the tail scenarios run on.
-const TAIL_TEST_CAP: usize = 4096;
+pub(super) const TAIL_TEST_CAP: usize = 4096;
 
 /// Every output byte of a pane, as the sink heard it.
-fn heard(rig: &Rig, id: &str) -> Vec<u8> {
+pub(super) fn heard(rig: &Rig, id: &str) -> Vec<u8> {
     let ev = rig.sink.events.lock().unwrap();
     ev.output
         .get(id)
@@ -376,7 +376,7 @@ fn print_exactly(rig: &Rig, n: usize) -> String {
 }
 
 /// Below the cap the tail is everything, from offset 0.
-fn attach_below_the_cap_is_complete(rig: &Rig) {
+pub(super) fn attach_below_the_cap_is_complete(rig: &Rig) {
     let id = print_exactly(rig, 1000);
     let at = rig.host.attach(&id).unwrap();
     assert_eq!((at.tail_start, at.tail_end), (0, 1000));
@@ -448,7 +448,7 @@ fn attach_is_atomic_under_output(rig: &Rig) {
 
 /// A pane that exited keeps its tail and its place until `kill`, which
 /// forgets it.
-fn an_exited_pane_keeps_its_tail_until_kill(rig: &Rig) {
+pub(super) fn an_exited_pane_keeps_its_tail_until_kill(rig: &Rig) {
     let pane = rig.sh("printf last-words; exit 3");
     assert_eq!(rig.sink.wait_exit(&pane.id), Some(3));
     std::thread::sleep(Duration::from_millis(300));
@@ -466,7 +466,7 @@ fn an_exited_pane_keeps_its_tail_until_kill(rig: &Rig) {
 
 /// `meta` is opaque bytes kept as set, replaced as a whole, empty before the
 /// first set, bounded, and gone with the pane.
-fn meta_is_kept_as_set(rig: &Rig) {
+pub(super) fn meta_is_kept_as_set(rig: &Rig) {
     let pane = rig.spawn(&["sleep", "30"]);
     assert_eq!(rig.host.meta_get(&pane.id).unwrap(), Vec::<u8>::new());
     let blob: Vec<u8> = (0..=255u8).collect();
@@ -499,7 +499,7 @@ fn meta_is_kept_as_set(rig: &Rig) {
     assert!(rig.host.meta_get(&pane.id).is_err());
 }
 
-const TAIL_SCENARIOS: &[Scenario] = &[
+pub(super) const TAIL_SCENARIOS: &[Scenario] = &[
     (
         "attach below the cap is complete",
         attach_below_the_cap_is_complete,
@@ -518,7 +518,7 @@ const TAIL_SCENARIOS: &[Scenario] = &[
 ];
 
 /// Run every scenario on a fresh host from `make`.
-fn run_contract(make: impl Fn() -> Arc<dyn PtyHost>) {
+pub(super) fn run_contract(make: impl Fn() -> Arc<dyn PtyHost>) {
     for (name, scenario) in SCENARIOS {
         eprintln!("host contract: {name}");
         let rig = Rig::new(make(), "host-contract");

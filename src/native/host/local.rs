@@ -10,8 +10,8 @@
 
 use super::tail::TailRing;
 use super::{
-    procs, pty, Attached, HostEvents, HostPane, KillOutcome, PtyHost, SpawnReq, Spawned,
-    KILL_GRACE, META_CAP,
+    procs, pty, Attached, HolderHost, HostEvents, HostPane, KillOutcome, PtyHost, SpawnReq,
+    Spawned, TailRead, KILL_GRACE, META_CAP,
 };
 use crate::backend::{BackendError, ErrorKind};
 use crate::native::term::{COLS, ROWS};
@@ -451,6 +451,31 @@ impl PtyHost for LocalHost {
 
     fn survives_restart(&self) -> bool {
         false
+    }
+}
+
+impl HolderHost for LocalHost {
+    fn tail_read(&self, id: &str, from: u64, max: usize) -> io::Result<TailRead> {
+        let pane = self.find(id).ok_or_else(|| Self::unknown(id))?;
+        let tail = pane
+            .tail
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "this host keeps no tail"))?;
+        let ring = tail.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(match ring.read_chunk(from, max) {
+            Ok(bytes) => TailRead::Bytes(bytes),
+            Err(start) => TailRead::Dropped { start },
+        })
+    }
+
+    fn tail_bounds(&self, id: &str) -> io::Result<(u64, u64)> {
+        let pane = self.find(id).ok_or_else(|| Self::unknown(id))?;
+        let tail = pane
+            .tail
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "this host keeps no tail"))?;
+        let ring = tail.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok((ring.start(), ring.end()))
     }
 }
 
