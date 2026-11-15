@@ -1193,3 +1193,295 @@ fn replay_time_of_a_full_tail() {
         adopted.unknown
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR4: the tools layer's record of a pane survives the front
+// ---------------------------------------------------------------------------
+
+mod tools_layer {
+    use super::*;
+    use crate::profiles::LaunchPolicy;
+    use crate::registry::{PaneRegistry, RoutineState};
+    use crate::tools::{call, Args, Shepherd};
+    use serde_json::{json, Value};
+
+    fn args(value: Value) -> Args {
+        value.as_object().unwrap().clone()
+    }
+
+    /// A policy with one `kiro` profile that runs `script` in `dir`.
+    fn policy(dir: &TempDir, script: &str, routine: Option<Value>) -> LaunchPolicy {
+        let mut profile = json!({
+            "name": "kiro",
+            "argv": ["/bin/sh", "-c", script],
+            "cwds": [dir.path()],
+        });
+        if let Some(routine) = routine {
+            profile["routine"] = routine;
+        }
+        LaunchPolicy::from_json(&json!({"profiles": [profile]}).to_string()).unwrap()
+    }
+
+    /// The tools over the split's current front, with the front as registry.
+    fn tools(s: &Split, policy: LaunchPolicy) -> Shepherd {
+        let b = s.b().clone();
+        Shepherd::with_policy(b.clone(), policy).with_registry(Arc::new(b))
+    }
+
+    /// Kill the front the way a restart does: the tools and the backend go,
+    /// the host and its panes stay. Then start a new front over the same
+    /// host, adopt, and rebuild the tools from the record.
+    fn restart(s: &mut Split, sh: Shepherd, policy: LaunchPolicy) -> Shepherd {
+        drop(sh);
+        s.kill_front();
+        s.new_front();
+        let sh = tools(s, policy);
+        sh.adopt_registry();
+        sh
+    }
+
+    const BLOCKED: &str = "\\033]7501;state=blocked:kind=permission\\007";
+    const DONE: &str = "\\033]7501;state=done\\007";
+
+    /// A pane that shows a Kiro permission dialog, then reads one line from
+    /// its terminal and notes that it did.
+    fn dialog_script(filler: usize) -> String {
+        format!(
+            "i=0; while [ $i -lt {filler} ]; do echo \"filler line $i\"; i=$((i+1)); done; \
+             printf '{WORKING}'; printf '{BLOCKED}'; cat dialog.txt; \
+             IFS= read -r l; echo got > received.txt; sleep 30"
+        )
+    }
+
+    fn start(sh: &Shepherd, name: &str) {
+        call(
+            sh,
+            "start_pane",
+            &args(json!({"profile": "kiro", "name": name})),
+        )
+        .unwrap();
+    }
+
+    fn answer(sh: &Shepherd, name: &str) -> Result<Value, crate::tools::ToolError> {
+        call(
+            sh,
+            "answer_dialog",
+            &args(json!({"terminal": name, "choice": "allow_once"})),
+        )
+    }
+
+    #[test]
+    fn answer_dialog_works_on_a_pane_a_front_before_started_when_the_tail_is_complete() {
+        let mut s = Split::new(1 << 20);
+        let dir = TempDir::new("pr4-dialog-live");
+        std::fs::write(
+            dir.path().join("dialog.txt"),
+            crate::dialog::fixtures::dialog_on_allow(),
+        )
+        .unwrap();
+        let pol = policy(&dir, &dialog_script(0), None);
+        let sh = tools(&s, pol);
+        start(&sh, "dlg");
+        let info = s.b().get(&TerminalRef::new("dlg")).unwrap();
+        wait_screen(s.b(), &info, "requires approval");
+        eventually("the blocked status", || {
+            let got = s.b().get(&TerminalRef::new("dlg")).ok()?;
+            got.status
+                .as_ref()
+                .is_some_and(|st| st.is_blocked_with("permission"))
+                .then_some(())
+        });
+        let sh = restart(&mut s, sh, policy(&dir, &dialog_script(0), None));
+        assert!(!is_replayed(s.b(), &info), "a complete tail is live");
+        // Without the record there would be no dialect and no keys.
+        answer(&sh, "dlg").expect("the dialog is answered after the restart");
+        eventually("the program to get the key", || {
+            dir.path().join("received.txt").exists().then_some(())
+        });
+    }
+
+    #[test]
+    fn answer_dialog_is_refused_and_sends_nothing_while_the_pane_is_replayed() {
+        let mut s = Split::new(2048);
+        let dir = TempDir::new("pr4-dialog-replayed");
+        std::fs::write(
+            dir.path().join("dialog.txt"),
+            crate::dialog::fixtures::dialog_on_allow(),
+        )
+        .unwrap();
+        // Enough output ahead of the dialog that the small tail has wrapped.
+        let pol = policy(&dir, &dialog_script(400), None);
+        let sh = tools(&s, pol);
+        start(&sh, "dlg");
+        let info = s.b().get(&TerminalRef::new("dlg")).unwrap();
+        wait_screen(s.b(), &info, "requires approval");
+        eventually("the blocked status", || {
+            let got = s.b().get(&TerminalRef::new("dlg")).ok()?;
+            got.status
+                .as_ref()
+                .is_some_and(|st| st.is_blocked_with("permission"))
+                .then_some(())
+        });
+        wait_wrapped(&s.host, &info);
+        // The status is in memory before the host has it: wait for the host,
+        // or the front dies before its snapshot lands and the pane adopts
+        // as unknown, which is a different test.
+        eventually("the snapshot in the host", || {
+            let kept = load(&*s.host, &info.id)?;
+            (kept.tracker?.to_json()["state"] == "blocked").then_some(())
+        });
+        let sh = restart(&mut s, sh, policy(&dir, &dialog_script(400), None));
+        assert!(is_replayed(s.b(), &info), "a wrapped tail is replayed");
+        let err = answer(&sh, "dlg").expect_err("a replayed pane is not answered");
+        assert_eq!(err.data["error"], "pane_replayed", "{err:?}");
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            !dir.path().join("received.txt").exists(),
+            "the program received a key through a replayed pane"
+        );
+    }
+
+    #[test]
+    fn the_routine_counters_and_the_turn_survive_a_restart_and_the_turn_is_not_counted_twice() {
+        let mut s = Split::new(1 << 20);
+        let dir = TempDir::new("pr4-routine");
+        let script = format!(
+            "printf '{WORKING}'; printf '{DONE}'; printf '{WORKING}'; printf '{DONE}'; \
+             cat > typed.txt"
+        );
+        let routine = || {
+            json!({"idle_timeout_secs": 10, "cooldown_secs": 1,
+                   "max_consecutive_nudges": 3, "nudge_text": "continue the work"})
+        };
+        let sh = tools(&s, policy(&dir, &script, Some(routine())));
+        start(&sh, "w");
+        let info = s.b().get(&TerminalRef::new("w")).unwrap();
+        let turn_before = eventually("two finished turns", || {
+            let got = s.b().get(&TerminalRef::new("w")).ok()?;
+            (got.turn == Some(2)
+                && got
+                    .status
+                    .as_ref()
+                    .is_some_and(|st| st.state == State::Done))
+            .then_some(2)
+        });
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
+        eventually("the nudge in the pane", || {
+            std::fs::read_to_string(dir.path().join("typed.txt"))
+                .ok()?
+                .contains("continue the work")
+                .then_some(())
+        });
+        // The count was in the host before the bytes went in.
+        let calls = s.host.calls();
+        let write = calls
+            .iter()
+            .position(|c| matches!(c, Call::Write(b) if b.windows(8).any(|w| w == b"continue")))
+            .expect("the nudge was written");
+        assert!(
+            calls[..write]
+                .iter()
+                .any(|c| matches!(c, Call::MetaSet { .. })),
+            "{calls:?}"
+        );
+        let kept = load(&*s.host, &info.id).unwrap();
+        assert_eq!(
+            kept.routine.as_ref().map(|r| r.consecutive),
+            Some(1),
+            "{kept:?}"
+        );
+        assert_eq!(kept.agent.as_deref(), Some("kiro"));
+        assert_eq!(kept.profile.as_deref(), Some("kiro"));
+
+        let sh = restart(&mut s, sh, policy(&dir, &script, Some(routine())));
+        // The agent kind is back, and the watch carries the count.
+        assert_eq!(sh.agent_of("w"), Some(crate::agent::Agent::Kiro));
+        let registered = PaneRegistry::registered(s.b());
+        assert_eq!(registered.len(), 1);
+        assert_eq!(
+            registered[0].routine,
+            Some(RoutineState {
+                consecutive: 1,
+                gave_up: false,
+                nudge_allowance: crate::routine::NUDGE_TURN_ALLOWANCE,
+            })
+        );
+        // The turn is what it was: the replay did not count a finished turn
+        // again (a repeat would read as progress and clear the cap).
+        let got = s.b().get(&TerminalRef::new("w")).unwrap();
+        assert_eq!(got.turn, Some(turn_before));
+    }
+
+    #[test]
+    fn a_count_the_host_cannot_keep_means_the_nudge_is_not_typed() {
+        let s = Split::new(1 << 20);
+        let dir = TempDir::new("pr4-routine-refused");
+        let script = format!("printf '{WORKING}'; printf '{DONE}'; cat > typed.txt");
+        let routine = json!({"idle_timeout_secs": 10, "cooldown_secs": 1,
+                             "nudge_text": "continue the work"});
+        let sh = tools(&s, policy(&dir, &script, Some(routine)));
+        start(&sh, "w");
+        eventually("a finished turn", || {
+            let got = s.b().get(&TerminalRef::new("w")).ok()?;
+            got.status
+                .as_ref()
+                .is_some_and(|st| st.state == State::Done)
+                .then_some(())
+        });
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        let mark = s.host.mark();
+        s.host.fail_meta.store(true, Ordering::SeqCst);
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
+        assert!(
+            s.host.writes_since(mark).is_empty(),
+            "bytes went in uncounted"
+        );
+        s.host.fail_meta.store(false, Ordering::SeqCst);
+        sh.routine_tick_at(t0 + Duration::from_secs(12));
+        eventually("the nudge once the count is kept", || {
+            std::fs::read_to_string(dir.path().join("typed.txt"))
+                .ok()?
+                .contains("continue the work")
+                .then_some(())
+        });
+    }
+
+    #[test]
+    fn meta_a_later_version_wrote_resurrects_no_agent_and_no_watch() {
+        let mut s = Split::new(1 << 20);
+        let dir = TempDir::new("pr4-stale");
+        let script = format!("printf '{WORKING}'; printf '{DONE}'; sleep 30");
+        let routine = json!({"idle_timeout_secs": 10, "nudge_text": "continue the work"});
+        let sh = tools(&s, policy(&dir, &script, Some(routine.clone())));
+        start(&sh, "w");
+        let info = s.b().get(&TerminalRef::new("w")).unwrap();
+        drop(sh);
+        s.kill_front();
+        s.host
+            .meta_set(&info.id, br#"{"v":99,"agent":"kiro"}"#)
+            .unwrap();
+        s.new_front();
+        let sh = tools(&s, policy(&dir, &script, Some(routine)));
+        sh.adopt_registry();
+        assert!(PaneRegistry::registered(s.b()).is_empty());
+        assert_eq!(sh.agent_of("w"), None);
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(3600));
+        assert!(s.host.writes_since(0).is_empty());
+    }
+
+    #[test]
+    fn removing_a_pane_leaves_no_record_behind() {
+        let s = Split::new(1 << 20);
+        let dir = TempDir::new("pr4-remove");
+        let sh = tools(&s, policy(&dir, "sleep 30", None));
+        start(&sh, "w");
+        assert_eq!(PaneRegistry::registered(s.b()).len(), 1);
+        call(&sh, "remove_pane", &args(json!({"terminal": "w"}))).unwrap();
+        assert!(PaneRegistry::registered(s.b()).is_empty());
+    }
+}
