@@ -4,9 +4,9 @@
 //! `unsafe` block of the native core is here, except the process-table reads
 //! in `procs.rs`.
 
+use crate::backend::{BackendError, ErrorKind};
 use crate::native::term::{COLS, ROWS};
 use crate::native::MAX_EXTRA_ENV;
-use crate::backend::{BackendError, ErrorKind};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -366,6 +366,22 @@ pub(crate) fn killpg(pgid: i32, signal: libc::c_int) -> io::Result<()> {
         if err.raw_os_error() != Some(libc::ESRCH) {
             return Err(err);
         }
+    }
+    Ok(())
+}
+
+/// Set the terminal size (`TIOCSWINSZ` on the master), which sends the
+/// foreground group SIGWINCH when it changed.
+pub(crate) fn set_winsize(fd: RawFd, cols: u16, rows: u16) -> io::Result<()> {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCSWINSZ reads one valid `winsize` through the pointer.
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, ptr::from_ref(&size)) } == -1 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
