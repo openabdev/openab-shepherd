@@ -16,6 +16,13 @@
   returns the Kiro tool name as `tool`. Measured on kiro-cli 3.3.0 (fixtures in
   `tests/fixtures/kiro-3.3.0/`). Refs #7.
 
+- Audit log: one `call` line before each mutating tool and a best-effort `outcome` line after it
+  (and after `read_output`); `list_panes`, `get_status` and `wait_status` write nothing. The records
+  no longer carry `v`, `seq`, `prev`, `recovered`, `intent_seq` or content digests, and the file is
+  no longer scanned or owner-checked at startup (the 0600/0700 mode checks stay). Failed
+  authentications go to stderr, not to the audit file. Fail-closed and fail-open behaviour is
+  unchanged.
+
 ## 0.4.0
 
 ### Breaking changes

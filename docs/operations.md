@@ -754,69 +754,55 @@ Everything not allowed is denied, and a tool with no scope mapping is denied.
 `OPENAB_SHEPHERD_AUDIT_FILE` is the path of a JSON Lines file. Without it nothing
 is recorded (only allowed when no clients file is set).
 
-- The file's directory must exist, be owned by the user running Shepherd, and have
-  no group or other bits (`mkdir -m 700`). The file is created with mode 0600, or an
-  existing one must be a regular file of that user with no group or other bits. The
-  path must be outside the project folder and every git repository. A symlink as the
-  last path part is refused.
+- The file's directory must exist and have no group or other bits (`mkdir -m 700`).
+  The file is created with mode 0600, or an existing one must be a regular file with
+  no group or other bits. The path must be outside the project folder and every git
+  repository. These checks catch operator mistakes such as a committed or
+  world-readable log.
 - The file is opened append-only. Each record is one `write`, under a mutex.
-  Records are numbered in order (`seq`), continuing from the last record already in
-  the file.
-- Fields of every record: `v` (format version, `1`), `seq`, `ts` (Unix seconds),
-  `ts_ms` (Unix milliseconds), `client` (the client id, or `system:routine` for the
-  routine's nudges), `tool`, `phase`, `prev` (reserved for a later hash chain, always
-  `null` now), and `recovered: true` on the first record after a torn tail.
-- `phase` is `intent` or `outcome` (`answer_dialog` and `start_pane` write both, and
-  the outcome has `intent_seq`), `call` (`send_input`, `remove_pane`,
-  `interrupt_pane`, written before the call), `outcome` only (the read tools, written
-  after), `denied` (the scope check refused it; `outcome` is `denied` and `reason`
-  says why), or `auth` (a failed authentication, with `reason` and `id_prefix`).
-- `outcome` is `ok`, `denied`, or `error:<code>` using the tool's error code.
+- Fields of every record: `ts` (Unix seconds), `ts_ms` (Unix milliseconds), `client`
+  (the client id, or `system:routine` for the routine's nudges), `tool` and
+  `phase`.
+- `phase` is one of:
+  - `call`: written before a mutating tool runs (`start_pane`, `send_input`,
+    `answer_dialog`, `remove_pane`, `interrupt_pane`).
+  - `outcome`: written after the call, best effort, for the mutating tools and for
+    `read_output`. It carries `outcome`, which is `ok` or `error:<code>` using the
+    tool's error code.
+  - `denied`: the scope check refused the call. `outcome` is `denied` and `reason`
+    says why.
+- `list_panes`, `get_status` and `wait_status` write no line.
 - Per-tool fields come from an allowlist; anything else is dropped:
-  - `start_pane`: `profile`, `cwd`, `pane` (name), `env_names` (variable names only),
-    and for `argv`: `program` (the file name of the first element), `argc` and
-    `argv_sha256`; for `line`: `line_len` and `line_sha256`.
-  - `send_input`: `pane`, `text_len`, `text_sha256`.
-  - `read_output`: `pane`, `lines`; the outcome adds `returned_lines` and
-    `returned_bytes`.
-  - `get_status`, `wait_status`, `interrupt_pane`, `remove_pane`: `pane`, and
-    `timeout` where the call has one. `list_panes`: `all`.
-  - `answer_dialog`: `pane`, `choice`; the outcome adds `highlight_len` and
-    `highlight_sha256` (the option that was highlighted), `moves`, `status_after`, and
-    on a refusal `screen_len` and `screen_sha256` (the screen the decision was based
-    on).
-  - Failed authentications: `id_prefix`, at most 16 characters of `a-z0-9-` from
-    the id the token claimed, never the secret. At most 20 are written per second;
-    the next record carries a `suppressed` count for the rest.
+  - `start_pane`: `profile` and `pane` (the requested name; the outcome line also
+    carries the name the pane got).
+  - `send_input`: `pane` and `text_len` (the length of the text in bytes).
+  - `answer_dialog`: `pane` and `choice`.
+  - `read_output`, `interrupt_pane`, `remove_pane`: `pane`.
 - Never recorded: tokens, token hashes, the `Authorization` header, environment
-  values, request bodies, typed text, screen text, file contents. Typed text, `line`,
-  `argv` and screens appear only as a length and a SHA-256 digest.
+  values, argv, request bodies, typed text, screen text, file contents.
+- Failed authentications are not written to the audit file. Shepherd prints each one
+  on stderr with the reason and at most 16 characters (`a-z0-9-`) of the id the token
+  claimed, never the secret.
 
-**Fail closed and fail open.** If the record that must come first cannot be written
-(disk full, I/O error; a file that was unlinked or renamed while Shepherd runs is not detected, because writes keep going to the old file), these tools are refused with the error code
-`audit_unavailable` and nothing is done: `start_pane`, `send_input`, `answer_dialog`
-and `remove_pane`. The routine's nudges follow the same rule. `interrupt_pane` and
-the read tools (`list_panes`, `get_status`, `wait_status`, `read_output`) go ahead.
-`interrupt_pane` stays open because it is how a person stops a runaway agent; it is
-still recorded when the write works. Failed writes are counted and reported on
-stderr at most once a minute. A full disk therefore stops state changes but not
-reading, interrupting, or answering a dialog in the terminal. A write failure after
-a call has run (an outcome line) cannot undo the call; it is counted only.
+**Fail closed and fail open.** If the `call` record cannot be written (disk full, I/O
+error; a file that was unlinked or renamed while Shepherd runs is not detected,
+because writes keep going to the old file), these tools are refused with the error
+code `audit_unavailable` and nothing is done: `start_pane`, `send_input`,
+`answer_dialog` and `remove_pane`. The routine's nudges follow the same rule.
+`interrupt_pane` and the reads go ahead. `interrupt_pane` stays open because it is
+how a person stops a runaway agent; it is still recorded when the write works.
+Failed writes are counted and reported on stderr at most once a minute. A full disk
+therefore stops state changes but not reading, interrupting, or answering a dialog in
+the terminal. A write failure after a call has run (an `outcome` line) cannot undo
+the call; it is counted only.
 
-**Torn tail.** A crash can leave the last line unfinished. At startup Shepherd
-notices that the file does not end in a newline, starts the next record on a new
-line, and marks it `recovered: true`. Readers should skip a line that is not valid
-JSON. Only the last 1 MiB of the file is read at startup to find the last `seq`.
+A crash can leave the last line unfinished, and a failed write can leave a partial
+line. Readers should skip a line that is not valid JSON.
 
-Audit space is availability: failed authentications (up to 20 a second) and read
-calls are written too, so a full disk stops the four state-changing tools. Put the
-file on a volume with room, and rotate it only by restarting Shepherd. Records are
-not fsynced, and `seq` restarts at 0 if the last 1 MiB holds no parsable `seq`.
-Digests of typed text are unsalted SHA-256, so short text can be guessed offline:
-treat the audit file as sensitive as the secrets typed into panes.
-
-There is no tool to read the log; read it on the host (`tail -f`, `jq`). The log is
-not rotated by Shepherd.
+Put the file on a volume with room. Shepherd does not rotate it, and records are not
+fsynced. There is no tool to read the log; read it on the host (`tail -f`, `jq`).
+Typed text is not recorded, only its length, but a screen read by a client with
+`read` can still contain secrets, so treat the log's host as you treat the panes.
 
 ### Migration from the single token
 
