@@ -41,6 +41,7 @@ use host::local::LocalHost;
 use host::{pty, HostEvents, KillOutcome, PtyHost, SpawnReq, KILL_GRACE};
 use keys::encode as encode_key;
 use status::{LogEntry, Report, StatusLog, Tracker};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io;
@@ -807,15 +808,27 @@ struct FrontEvents {
     table: Arc<Mutex<Table>>,
 }
 
+thread_local! {
+    /// The pane the current host thread last resolved. A host thread serves
+    /// one pane, so the table is entered once per thread, not once per chunk.
+    static RESOLVED: RefCell<Option<Arc<Pane>>> = const { RefCell::new(None) };
+}
+
 impl FrontEvents {
     fn pane(&self, id: &str) -> Option<Arc<Pane>> {
-        self.table
+        if let Some(hit) = RESOLVED.with(|r| r.borrow().as_ref().filter(|p| p.id == id).cloned()) {
+            return Some(hit);
+        }
+        let found = self
+            .table
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .panes
             .iter()
             .find(|p| p.id == id)
-            .cloned()
+            .cloned();
+        RESOLVED.with(|r| *r.borrow_mut() = found.clone());
+        found
     }
 }
 
