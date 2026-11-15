@@ -12,6 +12,16 @@ use std::thread::JoinHandle;
 
 const LONG: Duration = Duration::from_secs(20);
 
+/// Compiled twice, like `tests.rs`: in process, and as `tests_output_held`
+/// over a holder link.
+fn backend() -> NativeBackend {
+    test_front(
+        module_path!(),
+        NativeConfig::default(),
+        Box::new(|key| std::env::var_os(key)),
+    )
+}
+
 fn args(value: Value) -> Args {
     value.as_object().unwrap().clone()
 }
@@ -29,10 +39,20 @@ fn argv_spec(name: &str, argv: &[&str], dir: &TempDir) -> RunSpec {
 struct Load {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    /// Over a link (the `_held` copy of this file), one load at a time: the
+    /// in-process copy already runs its own, and four more loads on top of
+    /// them only make every other test in the process flakier.
+    _serial: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 impl Load {
     fn start() -> Load {
+        static HELD_LOADS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let serial = is_held(module_path!()).then(|| {
+            HELD_LOADS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         let stop = Arc::new(AtomicBool::new(false));
         let n = thread::available_parallelism().map_or(4, |n| n.get());
         let threads = (0..n)
@@ -46,7 +66,11 @@ impl Load {
                 })
             })
             .collect();
-        Load { stop, threads }
+        Load {
+            stop,
+            threads,
+            _serial: serial,
+        }
     }
 }
 
@@ -93,7 +117,7 @@ fn tool_after_exit(sh: &Shepherd, i: usize, dir: &TempDir) {
 #[test]
 fn quick_exit_output_is_readable_200_times() {
     let dir = TempDir::new("native-quick");
-    let b = NativeBackend::new(NativeConfig::default());
+    let b = backend();
     for i in 0..200 {
         read_after_exit(&b, i, &dir);
     }
@@ -102,7 +126,7 @@ fn quick_exit_output_is_readable_200_times() {
 #[test]
 fn quick_exit_output_is_readable_200_times_under_load() {
     let dir = TempDir::new("native-quick-load");
-    let b = NativeBackend::new(NativeConfig::default());
+    let b = backend();
     let _load = Load::start();
     for i in 0..200 {
         read_after_exit(&b, i, &dir);
@@ -112,7 +136,7 @@ fn quick_exit_output_is_readable_200_times_under_load() {
 #[test]
 fn quick_exit_output_reaches_read_output_200_times_under_load() {
     let dir = TempDir::new("native-quick-tool");
-    let b = NativeBackend::new(NativeConfig::default());
+    let b = backend();
     let sh = Shepherd::with_policy(b, LaunchPolicy::arbitrary());
     let _load = Load::start();
     for i in 0..200 {
@@ -144,7 +168,7 @@ fn gone_within(pid: i32, within: Duration) -> bool {
 #[test]
 fn leader_exit_with_a_printing_child_ends_the_pane() {
     let dir = TempDir::new("native-late");
-    let b = NativeBackend::new(NativeConfig::default());
+    let b = backend();
     let _load = Load::start();
     for i in 0..20 {
         let line = "(echo early-child; echo $$ > pid.txt; sleep 30; echo late-child) & sleep 0.5; echo leader-done";
@@ -179,7 +203,7 @@ fn leader_exit_with_a_printing_child_ends_the_pane() {
 #[test]
 fn large_output_of_a_quick_exit_is_received_up_to_the_cap() {
     let dir = TempDir::new("native-large");
-    let b = NativeBackend::new(NativeConfig::default());
+    let b = backend();
     let _load = Load::start();
     for i in 0..5 {
         let line = "i=1; while [ $i -le 20000 ]; do echo line-$i-0123456789; i=$((i+1)); done; echo END-MARK";
@@ -215,7 +239,7 @@ fn large_output_of_a_quick_exit_is_received_up_to_the_cap() {
 fn remove_and_shutdown_leave_no_descendant() {
     let dir = TempDir::new("native-end");
     for how in ["remove", "shutdown"] {
-        let b = NativeBackend::new(NativeConfig::default());
+        let b = backend();
         let file = format!("{how}.pid");
         let line = format!("sleep 300 & echo $! > {file}; wait");
         let info = b

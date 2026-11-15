@@ -3,7 +3,12 @@
 //! the human-input flag. Everything runs in process through the seam: the
 //! "front" is a `NativeBackend`, killing it drops the handle while the
 //! `LocalHost` and its panes live on, and a new front adopts what is there.
+//!
+//! The file is compiled twice (see `mod.rs`): once with the front calling the
+//! `LocalHost` directly, and once as `tests_replay_held`, where each front
+//! reaches the same host through a holder over a socketpair link.
 
+use super::host::held::Held;
 use super::host::local::LocalHost;
 use super::host::{Attached, HostPane, KillOutcome, Spawned};
 use super::meta::{load, PaneMeta};
@@ -14,6 +19,11 @@ use crate::testutil::TempDir;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 const LONG: Duration = Duration::from_secs(15);
+
+/// Whether this copy of the file runs the fronts over a holder link.
+fn held() -> bool {
+    super::is_held(module_path!())
+}
 
 /// Shell `printf` forms of the status reports.
 const WORKING: &str = "\\033]7501;state=working\\007";
@@ -41,7 +51,11 @@ enum Call {
 /// A [`LocalHost`] (with a tail) that logs the calls that change a pane, in
 /// order, and can refuse a write or a `meta_set`.
 struct Rec {
-    inner: LocalHost,
+    /// What the calls reach: the front's client while one is connected over a
+    /// link, otherwise the host itself.
+    inner: Mutex<Arc<dyn PtyHost>>,
+    /// The holder, when the fronts reach the host over a link.
+    rig: Option<Arc<Held>>,
     calls: Mutex<Vec<Call>>,
     fail_write: AtomicBool,
     fail_meta: AtomicBool,
@@ -76,14 +90,46 @@ impl HostEvents for CountExits {
 
 impl Rec {
     fn new(cap: usize) -> Arc<Self> {
+        let (inner, rig) = if held() {
+            let rig = Held::with_tail(cap);
+            (rig.connect() as Arc<dyn PtyHost>, Some(rig))
+        } else {
+            (
+                Arc::new(LocalHost::with_tail(cap)) as Arc<dyn PtyHost>,
+                None,
+            )
+        };
         Arc::new(Self {
-            inner: LocalHost::with_tail(cap),
+            inner: Mutex::new(inner),
+            rig,
             calls: Mutex::new(Vec::new()),
             fail_write: AtomicBool::new(false),
             fail_meta: AtomicBool::new(false),
             end_after_list: Mutex::new(None),
             exits_seen: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    fn inner(&self) -> Arc<dyn PtyHost> {
+        Arc::clone(&self.inner.lock().unwrap())
+    }
+
+    /// A new front's link (a no-op without a holder).
+    fn connect(&self) {
+        if let Some(rig) = &self.rig {
+            *self.inner.lock().unwrap() = rig.connect();
+        }
+    }
+
+    /// The front is gone: its link closes, the host stays and is reached
+    /// directly until the next front.
+    fn disconnect(&self) {
+        if let Some(rig) = &self.rig {
+            *self.inner.lock().unwrap() = Arc::clone(&rig.local) as Arc<dyn PtyHost>;
+            // Whatever the dead front had sent is handled before a test acts
+            // on the host directly.
+            assert!(rig.links_ended(LONG), "the old front's link never ended");
+        }
     }
 
     fn log(&self, call: Call) {
@@ -111,52 +157,52 @@ impl Rec {
 
 impl Drop for Rec {
     fn drop(&mut self) {
-        self.inner.end_all();
+        self.inner().end_all();
     }
 }
 
 impl PtyHost for Rec {
     fn set_sink(&self, sink: Arc<dyn HostEvents>) {
-        self.inner.set_sink(Arc::new(CountExits {
+        self.inner().set_sink(Arc::new(CountExits {
             next: sink,
             seen: Arc::clone(&self.exits_seen),
         }));
     }
     fn spawn(&self, req: SpawnReq) -> Result<Spawned, BackendError> {
-        self.inner.spawn(req)
+        self.inner().spawn(req)
     }
     fn try_write(&self, id: &str, bytes: &[u8]) -> io::Result<usize> {
         if self.fail_write.load(Ordering::SeqCst) {
             return Err(io::Error::other("injected write failure"));
         }
-        let n = self.inner.try_write(id, bytes)?;
+        let n = self.inner().try_write(id, bytes)?;
         if n > 0 {
             self.log(Call::Write(bytes[..n].to_vec()));
         }
         Ok(n)
     }
     fn wait_writable(&self, id: &str, timeout: Duration) -> io::Result<bool> {
-        self.inner.wait_writable(id, timeout)
+        self.inner().wait_writable(id, timeout)
     }
     fn resize(&self, id: &str, cols: u16, rows: u16) -> io::Result<()> {
         self.log(Call::Resize(cols, rows));
-        self.inner.resize(id, cols, rows)
+        self.inner().resize(id, cols, rows)
     }
     fn signal(&self, id: &str, signal: i32) -> io::Result<()> {
-        self.inner.signal(id, signal)
+        self.inner().signal(id, signal)
     }
     fn kill(&self, id: &str, grace: Duration) -> Option<KillOutcome> {
-        self.inner.kill(id, grace)
+        self.inner().kill(id, grace)
     }
     fn fg_pgrp(&self, id: &str) -> Option<i32> {
-        self.inner.fg_pgrp(id)
+        self.inner().fg_pgrp(id)
     }
     fn list(&self) -> Vec<HostPane> {
-        let listed = self.inner.list();
+        let listed = self.inner().list();
         let ending = self.end_after_list.lock().unwrap().take();
         if let Some(id) = ending {
             let seen = self.exits_seen.load(Ordering::SeqCst);
-            self.inner.signal(&id, 9).unwrap();
+            self.inner().signal(&id, 9).unwrap();
             // Return only once the exit reached the front's sink, which does
             // not know the pane yet: the event is dropped there.
             eventually("the exit to reach the sink", || {
@@ -166,13 +212,13 @@ impl PtyHost for Rec {
         listed
     }
     fn forget(&self, id: &str) {
-        self.inner.forget(id);
+        self.inner().forget(id);
     }
     fn end_all(&self) {
-        self.inner.end_all();
+        self.inner().end_all();
     }
     fn attach(&self, id: &str) -> io::Result<Attached> {
-        self.inner.attach(id)
+        self.inner().attach(id)
     }
     fn meta_set(&self, id: &str, bytes: &[u8]) -> io::Result<()> {
         if self.fail_meta.load(Ordering::SeqCst) {
@@ -180,10 +226,10 @@ impl PtyHost for Rec {
         }
         let human_draft = PaneMeta::from_bytes(bytes).is_ok_and(|m| m.human_draft);
         self.log(Call::MetaSet { human_draft });
-        self.inner.meta_set(id, bytes)
+        self.inner().meta_set(id, bytes)
     }
     fn meta_get(&self, id: &str) -> io::Result<Vec<u8>> {
-        self.inner.meta_get(id)
+        self.inner().meta_get(id)
     }
     fn survives_restart(&self) -> bool {
         true
@@ -221,10 +267,12 @@ impl Split {
         let front = self.front.take().expect("a front is running");
         front.leave_panes_on_drop();
         drop(front);
+        self.host.disconnect();
     }
 
     fn new_front(&mut self) -> Adoption {
         assert!(self.front.is_none(), "kill the front first");
+        self.host.connect();
         let front = front(&self.host);
         let adoption = front.adopt().unwrap();
         self.front = Some(front);
@@ -1072,7 +1120,7 @@ fn unusable_meta_adopts_the_pane_without_a_restore() {
         wait_screen(s.b(), &info, "READY");
         wait_wrapped(&s.host, &info);
         s.kill_front();
-        s.host.inner.meta_set(&info.id, &bad).unwrap();
+        s.host.inner().meta_set(&info.id, &bad).unwrap();
         s.new_front();
         with_state(s.b(), &info, |st| assert!(st.unknown && st.replayed));
     }
@@ -1458,6 +1506,15 @@ mod tools_layer {
         let sh = tools(&s, policy(&dir, &script, Some(routine.clone())));
         start(&sh, "w");
         let info = s.b().get(&TerminalRef::new("w")).unwrap();
+        // The front writes the turn to the meta after it has counted it, on
+        // the thread that reads the pane. Let that write land before the
+        // front dies, or it can overwrite the blob this test plants next.
+        eventually("the turn in the meta", || {
+            load(&*s.host, &info.id)?
+                .tracker
+                .filter(|t| t.turn() == 1)
+                .map(|_| ())
+        });
         drop(sh);
         s.kill_front();
         s.host

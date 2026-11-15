@@ -48,6 +48,31 @@ impl TailRing {
         self.end
     }
 
+    /// Up to `max` bytes from offset `from`: empty when `from` is at or past
+    /// the end, `Err(start)` when `from` was dropped and the ring now starts
+    /// at `start`.
+    pub(crate) fn read_chunk(&self, from: u64, max: usize) -> Result<Vec<u8>, u64> {
+        let start = self.start();
+        if from < start {
+            return Err(start);
+        }
+        if from >= self.end {
+            return Ok(Vec::new());
+        }
+        let skip = (from - start) as usize;
+        let n = (self.bytes.len() - skip).min(max);
+        let (head, tail) = self.bytes.as_slices();
+        let mut out = Vec::with_capacity(n);
+        if skip < head.len() {
+            let from_head = (head.len() - skip).min(n);
+            out.extend_from_slice(&head[skip..skip + from_head]);
+            out.extend_from_slice(&tail[..n - from_head]);
+        } else {
+            out.extend_from_slice(&tail[skip - head.len()..skip - head.len() + n]);
+        }
+        Ok(out)
+    }
+
     /// The bytes from offset `from` to the end. None when `from` is before
     /// the oldest byte held (it was dropped) or after the end.
     pub(crate) fn read_from(&self, from: u64) -> Option<Vec<u8>> {
@@ -152,6 +177,30 @@ mod tests {
             let mut ring = TailRing::new(16);
             fill(&mut ring, 100, chunk);
             check(&ring, 100, 16);
+        }
+    }
+
+    #[test]
+    fn read_chunk_matches_read_from_at_every_offset_and_size() {
+        // Fill so the deque has wrapped and has two slices.
+        for total in [10u64, 16, 17, 40, 100] {
+            let mut ring = TailRing::new(16);
+            fill(&mut ring, total, 5);
+            for from in 0..=total + 2 {
+                for max in [0usize, 1, 3, 15, 16, 17, 1000] {
+                    match ring.read_chunk(from, max) {
+                        Err(start) => {
+                            assert!(from < ring.start(), "total {total} from {from}");
+                            assert_eq!(start, ring.start());
+                        }
+                        Ok(got) => {
+                            let all = ring.read_from(from.min(ring.end())).unwrap();
+                            let want = &all[..all.len().min(max)];
+                            assert_eq!(got, want, "total {total} from {from} max {max}");
+                        }
+                    }
+                }
+            }
         }
     }
 

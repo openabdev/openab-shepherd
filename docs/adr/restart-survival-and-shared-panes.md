@@ -123,3 +123,13 @@ Panes survive the process that changes most. Attach, lease and draft need no new
 - #66: https://github.com/openabdev/openab-shepherd/issues/66
 - #4: https://github.com/openabdev/openab-shepherd/issues/4
 - Architecture comparison inputs: `.agents/tasks/arch-comparison/`
+
+## 11. Implementation notes
+
+Written as the code lands (#76); the list grows with each PR.
+
+- **The link is two socketpairs (PR5).** Section 3 and Q3 say "an anonymous socketpair". The wire library realises it as a pair of them: `ops` carries requests from the front and the holder's replies (with request ids), `events` carries the holder's `output`, `idle`, `exited` and `gap`. One stream would deadlock the front: `write_guarded` holds a pane's `state` lock while it waits for the reply to a `write`, and the thread that would read that reply could be inside `ingest`, waiting for the same lock. With two sockets, a router thread reads replies and takes no front lock. Both are still created by the holder and handed to the front at fork, so the ADR's trust and lifetime properties are unchanged. Everything is behind `Holder::serve(ops, events)` and `HolderClient::connect(ops, events)`, so a single-socket link would be a local change if the maintainer prefers it.
+- **Ops are more than the ADR lists (PR5).** `fg_pgrp` (`interrupt` needs the foreground group), `attach` (the tail bytes with their offsets, atomically), `idle` as an event (the in-process reader flushes terminal replies on a quiet poll), `end_all`, and `wait_writable`. `kill` on an exited pane forgets it. A `spawn` reply carries the leader's pid. The `hello` is a first frame in each direction, not an op.
+- **Events are cursors into the ring (PR5).** The holder's events thread walks a cursor per pane into the pane's tail ring. A front that reads slowly falls behind its cursor and is told `gap` when the cursor leaves the ring; the holder never waits for it.
+- **A killed pane's exit rides in the `kill` reply (PR5).** `remove` reads the exit code when `kill` returns, and the `exited` event may be far behind a flood of output on the other socket, so the reply carries the exit and the front gives it to the pane at once. The event that follows is dropped as a duplicate.
+

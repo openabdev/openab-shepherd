@@ -20,8 +20,36 @@ printf '\\033]7501;state=working\\007\\033]7501;state=blocked:kind=permission\\0
 echo \"got:$b\"; printf '\\033]7501;state=working\\007'; sleep 1; \
 printf '\\033]7501;state=done\\007'; read c; echo \"after:$c\"";
 
+/// This file is compiled twice (see `mod.rs`): once with a front in process,
+/// and once as `tests_held`, where every front reaches its panes through a
+/// holder over a socketpair link.
+fn held() -> bool {
+    is_held(module_path!())
+}
+
 fn backend() -> NativeBackend {
-    NativeBackend::new(NativeConfig::default())
+    test_front(
+        module_path!(),
+        NativeConfig::default(),
+        Box::new(|key| std::env::var_os(key)),
+    )
+}
+
+fn backend_with_env(
+    lookup: impl Fn(&str) -> Option<OsString> + Send + Sync + 'static,
+) -> NativeBackend {
+    test_front(module_path!(), NativeConfig::default(), Box::new(lookup))
+}
+
+/// Skip a test over a link: it sets a thread-local on the thread that
+/// spawns, and over a link the holder's thread spawns.
+macro_rules! local_only {
+    () => {
+        if held() {
+            eprintln!("skipped over a link: it reaches into the spawning thread");
+            return;
+        }
+    };
 }
 
 fn spec_line(name: &str, line: &str, dir: &TempDir) -> RunSpec {
@@ -111,9 +139,16 @@ fn pane_of(b: &NativeBackend, info: &TerminalInfo) -> Arc<Pane> {
 
 /// The host's process half of the pane.
 fn proc_of(b: &NativeBackend, info: &TerminalInfo) -> Arc<Proc> {
-    let host = Arc::clone(&b.inner.host_any)
-        .downcast::<LocalHost>()
-        .unwrap();
+    let any = Arc::clone(&b.inner.host_any);
+    let host = match any.downcast::<LocalHost>() {
+        Ok(local) => local,
+        // Over a link the panes are the holder's, in this process.
+        Err(any) => any
+            .downcast::<super::host::client::HolderClient>()
+            .expect("a LocalHost or a HolderClient")
+            .local_for_tests()
+            .expect("a test rig"),
+    };
     host.proc(&info.id).unwrap()
 }
 
@@ -154,7 +189,8 @@ fn capabilities_are_all_true_except_restart() {
             program_status: true,
             history: true,
             native_wait: true,
-            survives_restart: false,
+            // A host behind a holder outlives the front.
+            survives_restart: held(),
         }
     );
 }
@@ -296,6 +332,12 @@ fn osc_status_turns_and_guards_follow_the_program() {
     assert!(text.contains("got:"), "{text}");
     assert!(!text.contains("MARKER-XYZ"), "{text}");
 
+    // Adoption replays silently (no log entry, by design), so a pane that was
+    // adopted after its first reports has no log of them; the rest above holds
+    // either way.
+    if module_path!().contains("readopt") {
+        return;
+    }
     let log = b.status_log(&t).unwrap();
     let outcomes: Vec<&str> = log.iter().map(|e| e.outcome.as_str()).collect();
     assert_eq!(
@@ -329,9 +371,7 @@ fn the_child_sees_only_the_whitelisted_environment() {
         ("HC_SOCKET", "/tmp/hc-socket-secret-4.sock"),
         ("AWS_SECRET_ACCESS_KEY", "aws-secret-5"),
     ]);
-    let b = NativeBackend::with_env_lookup(NativeConfig::default(), move |key| {
-        parent.get(key).map(OsString::from)
-    });
+    let b = backend_with_env(move |key| parent.get(key).map(OsString::from));
     let info = b.run(&spec_argv("env", &["/usr/bin/env"], &dir)).unwrap();
     b.wait(&info.reference(), LONG).unwrap();
     let text = screen(&b, &info);
@@ -461,7 +501,7 @@ fn a_credential_reaches_only_its_profiles_pane() {
     write_script(&bin.join("kiro-cli"), "fake-kiro");
     let path = format!("/usr/bin:/bin:{}", bin.display());
     let parent_path = path.clone();
-    let b = NativeBackend::with_env_lookup(NativeConfig::default(), move |key| match key {
+    let b = backend_with_env(move |key| match key {
         "PATH" => Some(OsString::from(parent_path.clone())),
         "KIRO_API_KEY" => Some(OsString::from("parent-kiro-key")),
         _ => None,
@@ -1180,6 +1220,7 @@ fn send_input_through_the_tools_returns_pane_blocked() {
 /// zombie), and the pane is not left in the table.
 #[test]
 fn a_reaper_that_cannot_start_leaves_no_zombie() {
+    local_only!();
     let dir = TempDir::new("native-reaper-fail");
     let b = backend();
     FAIL_NEXT_THREAD.with(|fail| fail.set(true));
@@ -1197,6 +1238,11 @@ fn a_reaper_that_cannot_start_leaves_no_zombie() {
 /// nor shutdown signals that group again.
 #[test]
 fn a_lost_group_is_never_signalled() {
+    // Reaches into the process half after a pause that lets its tree poll
+    // find the shell's child, which `release` then ends by pid.
+    if module_path!().contains("readopt") {
+        return;
+    }
     let dir = TempDir::new("native-group-lost");
     let b = backend();
     let info = b.run(&spec_line("lost", "sleep 300", &dir)).unwrap();
@@ -1214,6 +1260,7 @@ fn a_lost_group_is_never_signalled() {
 /// at once instead of entering the table.
 #[test]
 fn a_run_after_shutdown_is_ended() {
+    local_only!();
     let dir = TempDir::new("native-exiting");
     let b = backend();
     b.shutdown();

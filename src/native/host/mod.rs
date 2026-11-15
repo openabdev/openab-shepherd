@@ -10,12 +10,22 @@
 //! (`n:N`), so the id means the same to anyone who later reaches the same
 //! host.
 
+#[cfg_attr(not(test), allow(dead_code))] // the `hold` subcommand uses it (PR6)
+pub(super) mod client;
 #[cfg(test)]
 mod contract;
+#[cfg(test)]
+pub(super) mod held;
 pub(super) mod local;
 pub(super) mod procs;
 pub(super) mod pty;
+#[cfg_attr(not(test), allow(dead_code))] // the `hold` subcommand uses it (PR6)
+pub(super) mod server;
 pub(super) mod tail;
+#[cfg(test)]
+pub(super) mod tests_link;
+#[cfg_attr(not(test), allow(dead_code))] // used by the client and the server
+pub(super) mod wire;
 
 use crate::backend::BackendError;
 use std::ffi::OsString;
@@ -166,4 +176,26 @@ pub(crate) trait HostEvents: Send + Sync {
     /// A host that keeps no replay buffer never sends it.
     #[allow(dead_code)] // the in-process host never sends it; a link host and its tests do
     fn gap(&self, id: &str, new_start: u64);
+}
+
+/// What a host that serves a link must offer beyond [`PtyHost`]: a read of
+/// the tail from an offset the reader keeps, so a front that is slow falls
+/// behind its own cursor instead of holding the pump back.
+pub(crate) trait HolderHost: PtyHost {
+    /// Up to `max` bytes of the pane's tail from offset `from`, or where the
+    /// tail now starts when `from` was already dropped. `NotFound` for an
+    /// unknown pane, `Unsupported` for a host that keeps no tail.
+    fn tail_read(&self, id: &str, from: u64, max: usize) -> io::Result<TailRead>;
+
+    /// The offsets `(start, end)` of the pane's tail.
+    fn tail_bounds(&self, id: &str) -> io::Result<(u64, u64)>;
+}
+
+/// The result of [`HolderHost::tail_read`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TailRead {
+    /// The bytes from the offset asked, none when the reader is caught up.
+    Bytes(Vec<u8>),
+    /// The offset asked was dropped: the tail now starts at `start`.
+    Dropped { start: u64 },
 }
