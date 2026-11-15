@@ -105,6 +105,10 @@ pub(crate) struct TrackerSnapshot {
 }
 
 impl TrackerSnapshot {
+    pub(crate) fn turn(&self) -> u64 {
+        self.turn
+    }
+
     pub(crate) fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "state": self.status.as_ref().map(|(s, _)| s.as_str()),
@@ -182,7 +186,6 @@ impl Tracker {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // adoption uses it next
     pub(crate) fn restore(snapshot: TrackerSnapshot) -> Self {
         Self {
             status: snapshot.status,

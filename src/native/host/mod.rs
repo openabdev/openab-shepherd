@@ -57,7 +57,6 @@ pub(crate) struct KillOutcome {
 
 /// One pane the host holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // read by the contract tests; adoption uses it next
 pub(crate) struct HostPane {
     pub id: String,
     pub pid: i32,
@@ -65,13 +64,18 @@ pub(crate) struct HostPane {
     pub rows: u16,
     /// The leader has exited (the pane stays listed until `kill` or `forget`).
     pub exited: bool,
+    /// The leader has exited and the host has delivered the pane's last
+    /// output: nothing more will arrive, and `exit_code` is set.
+    pub finished: bool,
+    /// How the leader ended once `finished` (128 + the signal for a signal
+    /// death); None when the status could not be read.
+    pub exit_code: Option<i64>,
 }
 
 /// What a host that keeps a tail hands a front that starts later: the offsets
 /// of the bytes it still has and the bytes themselves, read together so they
 /// describe the same moment.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // adoption uses it next
 pub(crate) struct Attached {
     /// Offset of the first byte in `bytes`; 0 means nothing was dropped.
     pub tail_start: u64,
@@ -84,7 +88,9 @@ pub(crate) struct Attached {
 ///
 /// [`spawn`]: PtyHost::spawn
 pub(crate) trait PtyHost: Send + Sync {
-    /// Where the host reports output and exits. Set once, before `spawn`.
+    /// Where the host reports output and exits: before the first `spawn`,
+    /// and again when a front that starts later takes over. Panes already
+    /// running report to the newest sink from their next event on.
     fn set_sink(&self, sink: Arc<dyn HostEvents>);
 
     /// Start a pane and its pump and reaper threads. The id is minted here.
@@ -98,7 +104,6 @@ pub(crate) trait PtyHost: Send + Sync {
     fn wait_writable(&self, id: &str, timeout: Duration) -> io::Result<bool>;
 
     /// Set the terminal size.
-    #[cfg_attr(not(test), allow(dead_code))] // the adoption nudge uses it next
     fn resize(&self, id: &str, cols: u16, rows: u16) -> io::Result<()>;
 
     /// Signal the pane's process group, while the group id is still the
@@ -115,7 +120,6 @@ pub(crate) trait PtyHost: Send + Sync {
     fn fg_pgrp(&self, id: &str) -> Option<i32>;
 
     /// Every pane the host holds, in creation order.
-    #[cfg_attr(not(test), allow(dead_code))] // adoption uses it next
     fn list(&self) -> Vec<HostPane>;
 
     /// Forget a pane that is no longer wanted without waiting: end what is
@@ -127,17 +131,14 @@ pub(crate) trait PtyHost: Send + Sync {
 
     /// The pane's tail with its offsets, atomically. `NotFound` for an
     /// unknown id, `Unsupported` for a host that keeps no tail.
-    #[cfg_attr(not(test), allow(dead_code))] // adoption uses it next
     fn attach(&self, id: &str) -> io::Result<Attached>;
 
     /// Replace the pane's metadata: opaque bytes the host never reads, at
     /// most [`META_CAP`]. It lives as long as the pane, so it survives the
     /// front, and is returned unchanged by `meta_get`.
-    #[cfg_attr(not(test), allow(dead_code))] // the front's meta store uses it
     fn meta_set(&self, id: &str, bytes: &[u8]) -> io::Result<()>;
 
     /// The pane's metadata; empty when none was set.
-    #[cfg_attr(not(test), allow(dead_code))] // adoption uses it next
     fn meta_get(&self, id: &str) -> io::Result<Vec<u8>>;
 
     /// Whether panes outlive the process that asked for them.
