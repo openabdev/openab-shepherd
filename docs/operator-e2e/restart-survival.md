@@ -39,7 +39,7 @@ installed (macmini has it).
 | `service-restart-macos.sh` | The holder under launchd: `launchctl kill USR2` keeps the pane, `launchctl kickstart -k` ends it | 1 min |
 | `service-restart-linux.sh` | The holder under a systemd user unit: `systemctl --user reload` keeps the pane, `restart` ends it | 1 min |
 | `version-mismatch.sh` | A front that speaks another protocol number exits 78 repeatedly with growing delays and the log names both numbers, MCP is down and the pane stays alive; then a matching front adopts it with its state | 1 min |
-| `routine-after-restart.sh` | A pane that had used its only nudge stays given up across SIGUSR2; a pane not yet nudged is nudged once by the new front; a profile that loses its `routine` block is no longer watched | 2 min |
+| `routine-after-restart.sh` | A pane that had used its only nudge stays given up across SIGUSR2; a pane not yet nudged is nudged by the new front at least once and at most `max_consecutive_nudges` times, then gives up and is not nudged again after a second restart; a profile that loses its `routine` block is no longer watched | 2 min |
 | `zombie-under-tini.sh` | The image under real tini on p1 (Docker): no defunct process, SIGUSR2 through tini, `docker stop`. `NO_TINI=1` is the control and must fail | 1 min |
 | `record-replay-fixture.sh AGENT` | Records replay fixtures for `claude`, `codex`, `kiro` or `opencode` with `examples/record_tail.rs` (2 model prompts) | 5 min |
 | `restart-cleanup.sh` | Stops a leftover holder and removes the throwaway files | 1 s |
@@ -76,7 +76,8 @@ Run one at a time: they share the port and the throwaway directories.
 - `version-mismatch.sh`, MCP never comes back after the file is emptied: the backoff reached 30 s.
   Wait, or send `kill -USR2` to the holder, which starts the next front at once.
 - `routine-after-restart.sh`, `fresh` is never nudged: the new front did not rebuild the watch. Look
-  for `its profile is gone or has no routine now` in the log.
+  for `its profile is gone or has no routine now` in the log. If `fresh` is nudged again after the second
+  restart, the new front lost the nudge counters.
 
 ## Results for the issue
 
