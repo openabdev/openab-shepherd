@@ -319,6 +319,9 @@ pub struct PaneWatch {
     /// Whether the last refusal was `pane_replayed`, so the skip is logged
     /// once and not on every tick.
     replayed_noted: bool,
+    /// Whether the last refusal was a person at the pane (a lease or a
+    /// draft), so the skip is logged once per episode.
+    held_noted: bool,
 }
 
 impl PaneWatch {
@@ -341,6 +344,7 @@ impl PaneWatch {
             last_nudge: None,
             gave_up: false,
             replayed_noted: false,
+            held_noted: false,
         }
     }
 
@@ -389,6 +393,14 @@ impl PaneWatch {
     /// caller logs it once.
     pub fn note_replayed(&mut self) -> bool {
         !std::mem::replace(&mut self.replayed_noted, true)
+    }
+
+    /// Record that a nudge was refused because a person is at the pane (it
+    /// holds the input lease or has an unsent draft). Nothing was sent and
+    /// nothing is counted: the nudge is not queued, the next tick looks
+    /// again. True the first time, so the caller logs it once.
+    pub fn note_held(&mut self) -> bool {
+        !std::mem::replace(&mut self.held_noted, true)
     }
 
     pub fn config(&self) -> &RoutineConfig {
@@ -492,6 +504,7 @@ impl PaneWatch {
             self.finished_seen = false;
             self.finished_since = None;
             self.replayed_noted = false;
+            self.held_noted = false;
         }
         if self.gave_up || !finished {
             return WatchEvent::None;
@@ -527,6 +540,7 @@ impl PaneWatch {
         self.last_nudge = Some(now);
         self.nudge_allowance = NUDGE_TURN_ALLOWANCE;
         self.replayed_noted = false;
+        self.held_noted = false;
     }
 
     /// Record that a nudge was refused or failed at `now`. A failed attempt
@@ -590,6 +604,27 @@ mod tests {
     /// `t0` plus `secs` seconds.
     fn at(t0: Instant, secs: u64) -> Instant {
         t0 + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn a_person_at_the_pane_is_noted_once_per_episode_and_counts_for_nothing() {
+        let t0 = Instant::now();
+        let mut watch = pane_watch(Agent::Kiro);
+        let done = info(State::Done, Some(3));
+        watch.observe(&done, Todo::NotConfigured, t0);
+        assert!(watch.note_held(), "the first refusal is logged");
+        assert!(!watch.note_held() && !watch.note_held(), "then it is quiet");
+        assert_eq!(watch.state(), RoutineState::default());
+        // The pane goes back to work: a new episode would be logged again.
+        watch.observe(
+            &info(State::Working, Some(4)),
+            Todo::NotConfigured,
+            at(t0, 5),
+        );
+        assert!(watch.note_held());
+        // A nudge that went in ends the episode too.
+        watch.note_nudged(at(t0, 10));
+        assert!(watch.note_held());
     }
 
     #[test]

@@ -16,7 +16,9 @@
 //! handle ends every pane.
 
 mod host;
+mod human;
 pub(crate) mod keys;
+mod lease;
 mod meta;
 mod replay;
 pub(crate) mod status;
@@ -74,6 +76,7 @@ use crate::input::MAX_INPUT_BYTES;
 use host::local::LocalHost;
 use host::{pty, HostEvents, KillOutcome, PtyHost, SpawnReq, KILL_GRACE};
 use keys::encode as encode_key;
+use lease::{Lease, LeaseClock};
 use meta::{MetaStore, PaneMeta};
 use replay::replay;
 use status::{LogEntry, Report, StatusLog, Tracker};
@@ -131,6 +134,8 @@ pub struct NativeConfig {
     /// Keys match `[A-Z_][A-Z0-9_]*`, values have no NUL; together with a
     /// run's own `RunSpec.env`, at most 32.
     pub extra_env: Vec<(OsString, OsString)>,
+    /// The clock the input lease's idle rule reads. Tests move it.
+    pub(crate) lease_clock: LeaseClock,
 }
 
 /// What [`NativeBackend::adopt`] picked up, by pane id.
@@ -192,8 +197,12 @@ struct Pane {
     host: Arc<dyn PtyHost>,
     state: Mutex<PaneState>,
     changed: Condvar,
-    /// Held for a whole write sequence (send, keys, interrupt, reply flush).
+    /// Held for a whole write sequence (send, keys, interrupt, reply flush),
+    /// and by every lease, draft and human-write operation, so none of them
+    /// lands in the middle of a bot's paste and Enter.
     input: Mutex<()>,
+    /// The clock of the lease's idle rule.
+    clock: LeaseClock,
     /// The only writer of this pane's host metadata, when kept.
     meta: Option<MetaStore>,
 }
@@ -222,6 +231,13 @@ struct PaneState {
     clear_at: Option<u64>,
     /// The offset after the last output byte the emulator has taken.
     fed_end: u64,
+    /// The person's input lease, if one is held. Never persisted: a front
+    /// that restarts has none.
+    lease: Option<Lease>,
+    /// A person typed into the pane and has not pressed Enter. Authoritative
+    /// here (the bare command keeps no meta); written through to the host's
+    /// meta when there is one, and restored from it by adoption.
+    draft: bool,
 }
 
 impl PaneState {
@@ -241,6 +257,8 @@ impl PaneState {
             replayed: false,
             clear_at: None,
             fed_end: 0,
+            lease: None,
+            draft: false,
         }
     }
 }
@@ -403,6 +421,7 @@ impl NativeBackend {
             state.unknown = adopted.unknown;
             state.replayed = replayed;
             state.fed_end = attached.tail_end;
+            state.draft = known.human_draft;
             state.raw = attached.bytes[attached.bytes.len().saturating_sub(RAW_RING)..]
                 .iter()
                 .copied()
@@ -417,6 +436,7 @@ impl NativeBackend {
                 state: Mutex::new(state),
                 changed: Condvar::new(),
                 input: Mutex::new(()),
+                clock: self.inner.config.lease_clock.clone(),
                 meta: store,
             });
             table.panes.push(Arc::clone(&pane));
@@ -429,34 +449,6 @@ impl NativeBackend {
         }
         self.inner.nudge(&nudge);
         Ok(done)
-    }
-
-    /// A human typed into the pane: record it in the pane's metadata, wait
-    /// for the host to have it, and only then write the bytes. A crash in
-    /// between leaves the flag set and the pane untouched, never bytes
-    /// without the flag. Not guarded: a human may type into a replayed pane.
-    #[cfg_attr(not(test), allow(dead_code))] // the shared-panes attach calls it
-    pub(crate) fn human_input(&self, t: &TerminalRef, bytes: &[u8]) -> Result<(), BackendError> {
-        if bytes.is_empty() || bytes.len() > MAX_INPUT_BYTES {
-            return Err(invalid(format!(
-                "native: human input must be 1 to {MAX_INPUT_BYTES} bytes"
-            )));
-        }
-        let pane = self.inner.resolve(t)?;
-        let _input = pane.lock_input()?;
-        let meta = pane.meta.as_ref().ok_or_else(|| {
-            BackendError::new(
-                ErrorKind::Unsupported("human_input".to_string()),
-                "native: this front keeps no pane metadata",
-            )
-        })?;
-        meta.set_human_draft().map_err(|err| {
-            BackendError::new(
-                ErrorKind::Other,
-                format!("native: {}: cannot record the human input: {err}", pane.id),
-            )
-        })?;
-        pane.write_guarded(None, |_| Ok(bytes.to_vec()))
     }
 
     /// On SIGINT, SIGTERM or SIGHUP: end every pane, then exit the process
@@ -591,6 +583,7 @@ impl NativeBackend {
             state: Mutex::new(PaneState::fresh(Emulator::new(), Tracker::default())),
             changed: Condvar::new(),
             input: Mutex::new(()),
+            clock: self.inner.config.lease_clock.clone(),
             meta,
         });
         table.panes.push(Arc::clone(&pane));
@@ -889,12 +882,18 @@ impl Pane {
         }
     }
 
-    /// Check `guard` (or only liveness, when None) and write the bytes
-    /// `bytes_for` gives, in one critical section on `state`, so no status
-    /// change lands between the check and the bytes entering the PTY. Call
-    /// with `input` held.
+    /// Check who may write, then `guard` (or only liveness, when None), and
+    /// write the bytes `bytes_for` gives, in one critical section on `state`,
+    /// so no status change lands between the check and the bytes entering the
+    /// PTY. Call with `input` held.
+    ///
+    /// The order of refusals for a bot is: the program has ended, a person
+    /// holds the lease, a person has a draft, then the guard's own conditions
+    /// (replayed, blocked, status, turn, screen). A person's write instead
+    /// needs the lease it names, and the status guards do not apply to it.
     fn write_guarded(
         &self,
+        origin: WriteOrigin,
         guard: Option<&InputGuard>,
         mut bytes_for: impl FnMut(&PaneState) -> Result<Vec<u8>, BackendError>,
     ) -> Result<(), BackendError> {
@@ -902,10 +901,15 @@ impl Pane {
         loop {
             let (bytes, written) = {
                 let mut st = self.lock_state()?;
-                match guard {
-                    Some(guard) => check_guard(&st, guard, &self.id)?,
-                    None if !st.live => return Err(finished(&self.id)),
-                    None => {}
+                if !st.live {
+                    return Err(finished(&self.id));
+                }
+                match origin {
+                    WriteOrigin::Bot => self.refuse_while_human(&st)?,
+                    WriteOrigin::Human { lease_id } => self.check_lease(&st, lease_id)?,
+                }
+                if let Some(guard) = guard {
+                    check_guard(&st, guard, &self.id)?;
                 }
                 let bytes = bytes_for(&st)?;
                 // Query replies go first and whole, so caller bytes never
@@ -1075,6 +1079,15 @@ impl Pane {
             st = self.wait_changed(st, (end - now).min(INTERRUPT_POLL))?;
         }
     }
+}
+
+/// Who is writing. A bot's write is refused while a person holds the lease or
+/// has a draft; a person's write needs the lease. Not defaulted, so the
+/// compiler finds every caller.
+#[derive(Clone, Copy)]
+enum WriteOrigin {
+    Bot,
+    Human { lease_id: u64 },
 }
 
 /// The guard's conditions, in the ADR §9 order.
@@ -1536,7 +1549,7 @@ impl TerminalBackend for NativeBackend {
         let input = pane.lock_input()?;
         pane.flush_replies();
         let mut at_send = (0, None);
-        pane.write_guarded(Some(guard), |st| {
+        pane.write_guarded(WriteOrigin::Bot, Some(guard), |st| {
             at_send = (st.tracker.turn(), st.tracker.state().cloned());
             Ok(paste_bytes(text, st.emu.bracketed_paste()))
         })?;
@@ -1547,7 +1560,7 @@ impl TerminalBackend for NativeBackend {
             expect_turn: Some(turn_at_send),
             ..guard.clone()
         };
-        pane.write_guarded(Some(&enter_guard), |st| {
+        pane.write_guarded(WriteOrigin::Bot, Some(&enter_guard), |st| {
             encode_key(&Key::Enter, st.emu.mode()).map(<[u8]>::to_vec)
         })
         .map_err(|err| crate::backend::pasted_unsubmitted(&pane.id, enter_refusal(&err)))?;
@@ -1576,7 +1589,7 @@ impl TerminalBackend for NativeBackend {
         // One guard check and one write for all keys, so a refusal means no
         // key was written.
         if !keys.is_empty() {
-            pane.write_guarded(Some(guard), |st| {
+            pane.write_guarded(WriteOrigin::Bot, Some(guard), |st| {
                 let mode = st.emu.mode();
                 let mut bytes = Vec::new();
                 for key in keys {
@@ -1609,7 +1622,7 @@ impl TerminalBackend for NativeBackend {
         let _input = pane.lock_input()?;
         pane.flush_replies();
         if !keys.is_empty() {
-            pane.write_guarded(Some(guard), |st| {
+            pane.write_guarded(WriteOrigin::Bot, Some(guard), |st| {
                 if st.emu.sync_open(Instant::now()) {
                     return Err(BackendError::new(
                         ErrorKind::ScreenRefused,
@@ -1683,7 +1696,7 @@ impl TerminalBackend for NativeBackend {
             (key, st.tracker.turn())
         };
         let fg0 = pane.host.fg_pgrp(&pane.id);
-        pane.write_guarded(None, |st| match &key {
+        pane.write_guarded(WriteOrigin::Bot, None, |st| match &key {
             // A program that never reported status may have left keyboard
             // flags pushed when it died; the line discipline makes SIGINT
             // only from the raw byte, so send that whatever the flags say.
@@ -1706,6 +1719,16 @@ impl TerminalBackend for NativeBackend {
         grace: Option<Duration>,
     ) -> Result<RemoveResult, BackendError> {
         let pane = self.inner.resolve(t)?;
+        // Ending a pane someone is typing into is a write of the worst kind,
+        // so it is refused like one. Under `input`, so no lease can be taken
+        // between the check and the kill. A finished pane is always removable.
+        let input = pane.lock_input()?;
+        {
+            let st = pane.lock_state()?;
+            if st.live {
+                pane.refuse_while_human(&st)?;
+            }
+        }
         let was_live = pane.is_live();
         // The host ends the pane and reaps the leader; its exit is reported
         // to the pane (the exit code) before this returns.
@@ -1714,6 +1737,7 @@ impl TerminalBackend for NativeBackend {
             .host
             .kill(&pane.id, grace.unwrap_or(KILL_GRACE))
             .is_some_and(|outcome: KillOutcome| outcome.killed);
+        drop(input);
         self.inner.table()?.panes.retain(|p| !Arc::ptr_eq(p, &pane));
         let exit_code = pane
             .state

@@ -308,6 +308,8 @@ for debugging; do not parse it.
 | `status_mismatch` | A backend-side input condition did not hold; nothing was sent |
 | `pane_finished` | The pane's program has ended |
 | `pane_replayed` | The pane was picked up by a new server after a restart and its screen is not yet trusted, so nothing was typed. Refused for `send_input`, `answer_dialog` and the routine's nudge. It clears when the program repaints; see [Restart survival](#restart-survival) |
+| `pane_human_controlled` | A person holds the pane's input lease, so nothing was typed. Refused for `send_input`, `send_keys`, `answer_dialog`, `interrupt_pane`, `remove_pane` and the routine's nudge, and never queued: look again later. `idle_secs` and `expires_in_secs` say how long the person has been quiet and when the lease ends if they stay so (300 s without input). No client can take a lease yet, so a server started as before never answers this |
+| `pane_draft_pending` | A person typed into the pane and has not pressed Enter, so nothing was typed. Refused for the same operations as `pane_human_controlled`, and never queued. Only a person's Enter clears it, not a turn advance and not time. A server restart under `hold` keeps it. No client can create a draft yet |
 | `terminal_changed` | The name pointed at a different pane while waiting for the pane lock; nothing was sent |
 | `refused` | `answer_dialog` refused; see [answer_dialog](#answer_dialog) |
 | `unavailable` | The backend cannot be reached |

@@ -4,6 +4,13 @@
 
 ### Added
 
+- Shared panes, step 1 (issue #77). The native backend now has an input lease and a draft flag per
+  pane, as the backend half of letting a person type into a pane a bot also drives. While a person holds
+  the lease, or has typed and not pressed Enter, `send_input`, `send_keys`, `answer_dialog`,
+  `interrupt_pane`, `remove_pane` and the routine's nudge are refused with the new errors
+  `pane_human_controlled` and `pane_draft_pending`, and are never queued. The draft is written to the
+  pane's meta before the person's first byte and survives a server restart under `hold`; a lease does not.
+  Nothing can take a lease yet, so a server started as before behaves as before. Refs #77.
 - Restart survival (issue #76). `openab-shepherd hold -- <server flags>` runs a holder that owns the
   panes and starts the server as a child. `SIGUSR2` on the holder restarts the server and the panes keep
   running; a new server adopts them, replays their output silently, and rebuilds each pane's agent kind,

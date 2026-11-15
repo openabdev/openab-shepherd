@@ -11,6 +11,7 @@
 use super::host::held::Held;
 use super::host::local::LocalHost;
 use super::host::{Attached, HostPane, KillOutcome, Spawned};
+use super::human::LeaseStatus;
 use super::meta::{load, PaneMeta};
 use super::replay::replay;
 use super::status::TrackerSnapshot;
@@ -46,6 +47,8 @@ enum Call {
         human_draft: bool,
     },
     Resize(u16, u16),
+    /// The pane was killed (remove).
+    Kill,
 }
 
 /// A [`LocalHost`] (with a tail) that logs the calls that change a pane, in
@@ -192,6 +195,7 @@ impl PtyHost for Rec {
         self.inner().signal(id, signal)
     }
     fn kill(&self, id: &str, grace: Duration) -> Option<KillOutcome> {
+        self.log(Call::Kill);
         self.inner().kill(id, grace)
     }
     fn fg_pgrp(&self, id: &str) -> Option<i32> {
@@ -236,9 +240,9 @@ impl PtyHost for Rec {
     }
 }
 
-fn front(host: &Arc<Rec>) -> NativeBackend {
+fn front_with(host: &Arc<Rec>, config: NativeConfig) -> NativeBackend {
     NativeBackend::with_host_meta(
-        NativeConfig::default(),
+        config,
         Box::new(|key| std::env::var_os(key)),
         Arc::clone(host),
         true,
@@ -250,13 +254,23 @@ fn front(host: &Arc<Rec>) -> NativeBackend {
 struct Split {
     host: Arc<Rec>,
     front: Option<NativeBackend>,
+    /// What every front of this split is built with.
+    config: NativeConfig,
 }
 
 impl Split {
     fn new(cap: usize) -> Self {
+        Self::with_config(cap, NativeConfig::default())
+    }
+
+    fn with_config(cap: usize, config: NativeConfig) -> Self {
         let host = Rec::new(cap);
-        let front = Some(front(&host));
-        Self { host, front }
+        let front = Some(front_with(&host, config.clone()));
+        Self {
+            host,
+            front,
+            config,
+        }
     }
 
     fn b(&self) -> &NativeBackend {
@@ -273,7 +287,7 @@ impl Split {
     fn new_front(&mut self) -> Adoption {
         assert!(self.front.is_none(), "kill the front first");
         self.host.connect();
-        let front = front(&self.host);
+        let front = front_with(&self.host, self.config.clone());
         let adoption = front.adopt().unwrap();
         self.front = Some(front);
         adoption
@@ -344,6 +358,24 @@ fn wait_wrapped(host: &Rec, info: &TerminalInfo) {
 
 fn default_guard() -> InputGuard {
     InputGuard::default()
+}
+
+/// A person's line into a pane, for the tests that need the pane to receive
+/// one: take the lease, write, let the lease go. The draft stays, as it does
+/// for a person who walks away (a line ending in LF is not an Enter). Issue
+/// #77 replaced the lease-less `human_input` with `human_write`, which needs a
+/// lease; every call site below goes through this one helper.
+trait HumanInput {
+    fn human_input(&self, t: &TerminalRef, bytes: &[u8]) -> Result<(), BackendError>;
+}
+
+impl HumanInput for NativeBackend {
+    fn human_input(&self, t: &TerminalRef, bytes: &[u8]) -> Result<(), BackendError> {
+        let grant = self.lease_acquire(t, "test-human", false)?;
+        let written = self.human_write(t, grant.id, bytes);
+        self.lease_release(t, grant.id)?;
+        written
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -781,6 +813,9 @@ fn a_wrapped_tail_adopts_as_replayed_and_refuses_every_guarded_write() {
     // A human line gets through (not guarded) and proves what the program
     // received: only that line, nothing from the refused calls.
     s.b().human_input(&t, b"x\n").unwrap();
+    // The line is a draft (LF is not an Enter), and a bot's write waits for
+    // the person; this test is about the replayed guard, so the draft goes.
+    s.b().draft_clear(&t).unwrap();
     let received = dir.path().join("received.txt");
     eventually("the line", || {
         (std::fs::read(&received).ok()? == b"x\n").then_some(())
@@ -1205,15 +1240,646 @@ fn a_flag_the_host_does_not_acknowledge_means_no_byte() {
 }
 
 #[test]
-fn human_input_needs_a_front_that_keeps_meta() {
+fn the_draft_works_in_memory_on_a_front_that_keeps_no_meta() {
+    // Issue #77: the bare command keeps no pane metadata. `human_input` used
+    // to be refused there; the draft is now held in memory and a bot is
+    // refused all the same.
     let b = NativeBackend::new(NativeConfig::default());
     let dir = TempDir::new("no-meta");
     let info = b.run(&sh("p", "cat > /dev/null", &dir)).unwrap();
-    assert!(matches!(
-        kind_of(b.human_input(&tref(&info), b"x")),
-        ErrorKind::Unsupported(_)
-    ));
+    b.human_input(&tref(&info), b"x").unwrap();
+    assert!(b.human_state(&tref(&info)).unwrap().draft);
+    assert_eq!(
+        kind_of(b.send(&tref(&info), "hi", &default_guard())),
+        ErrorKind::DraftPending
+    );
+    b.draft_clear(&tref(&info)).unwrap();
+    b.send(&tref(&info), "hi", &default_guard()).unwrap();
     b.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #77: the input lease and the draft
+// ---------------------------------------------------------------------------
+
+/// A lease clock a test moves by hand.
+#[derive(Clone)]
+struct TestClock {
+    base: Instant,
+    offset: Arc<Mutex<Duration>>,
+}
+
+impl TestClock {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            offset: Arc::new(Mutex::new(Duration::ZERO)),
+        }
+    }
+
+    fn config(&self) -> NativeConfig {
+        let clock = self.clone();
+        NativeConfig {
+            lease_clock: LeaseClock::new(move || clock.base + *clock.offset.lock().unwrap()),
+            ..NativeConfig::default()
+        }
+    }
+
+    fn advance(&self, by: Duration) {
+        *self.offset.lock().unwrap() += by;
+    }
+}
+
+fn is_human_controlled(kind: &ErrorKind) -> bool {
+    matches!(kind, ErrorKind::HumanControlled { .. })
+}
+
+fn draft_of(b: &NativeBackend, t: &TerminalRef) -> bool {
+    b.human_state(t).unwrap().draft
+}
+
+fn lease_of(b: &NativeBackend, t: &TerminalRef) -> bool {
+    b.human_state(t).unwrap().lease.is_some()
+}
+
+/// Acquire, write, and keep the lease; returns its id.
+fn typing(b: &NativeBackend, t: &TerminalRef, bytes: &[u8]) -> u64 {
+    let grant = b.lease_acquire(t, "person", false).unwrap();
+    b.human_write(t, grant.id, bytes).unwrap();
+    grant.id
+}
+
+#[test]
+fn a_lease_acquire_never_lands_between_a_bot_paste_and_its_enter() {
+    // Three panes at once, 67 rounds each: 201 acquires that race a bot's
+    // paste, its settle and its Enter. Few panes, because a macOS shell's
+    // default limit is 256 open files and every pane and link takes some.
+    let workers: Vec<_> = (0..3)
+        .map(|n| {
+            thread::spawn(move || {
+                let s = Split::new(1 << 20);
+                let (info, _dir) = s.run(&format!("p{n}"), "cat > /dev/null");
+                let t = tref(&info);
+                for round in 0..67 {
+                    let mark = s.host.mark();
+                    let (b, t2) = (s.b().clone(), t.clone());
+                    let sender = thread::spawn(move || {
+                        b.send(&t2, "hello", &default_guard()).unwrap();
+                    });
+                    eventually("the paste", || {
+                        s.host
+                            .writes_since(mark)
+                            .iter()
+                            .any(|w| w == b"hello")
+                            .then_some(())
+                    });
+                    let grant = s.b().lease_acquire(&t, "person", false).unwrap();
+                    // The acquire returned only after the bot's Enter.
+                    assert_eq!(
+                        s.host.writes_since(mark),
+                        [b"hello".to_vec(), b"\r".to_vec()],
+                        "pane {n} round {round}: the acquire landed inside the send"
+                    );
+                    s.b().human_write(&t, grant.id, b"X").unwrap();
+                    sender.join().unwrap();
+                    assert_eq!(
+                        s.host.writes_since(mark),
+                        [b"hello".to_vec(), b"\r".to_vec(), b"X".to_vec()],
+                        "pane {n} round {round}"
+                    );
+                    s.b().lease_release(&t, grant.id).unwrap();
+                    s.b().draft_clear(&t).unwrap();
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn what_the_program_receives_is_the_paste_the_enter_and_then_the_person() {
+    let s = Split::new(1 << 20);
+    let (info, dir) = s.run("p", "cat > received.txt");
+    let t = tref(&info);
+    let (b, t2) = (s.b().clone(), t.clone());
+    let mark = s.host.mark();
+    let sender = thread::spawn(move || {
+        b.send(&t2, "hello", &default_guard()).unwrap();
+    });
+    eventually("the paste", || {
+        s.host
+            .writes_since(mark)
+            .iter()
+            .any(|w| w == b"hello")
+            .then_some(())
+    });
+    let grant = s.b().lease_acquire(&t, "person", false).unwrap();
+    s.b().human_write(&t, grant.id, b"X\r").unwrap();
+    sender.join().unwrap();
+    eventually("both lines, in order", || {
+        (std::fs::read(dir.path().join("received.txt")).ok()? == b"hello\nX\n").then_some(())
+    });
+    assert!(!draft_of(s.b(), &t), "the person pressed Enter");
+}
+
+#[test]
+fn a_bot_is_refused_exactly_while_a_person_is_at_the_pane() {
+    // A model of the lease and the draft, against random operations from a
+    // fixed seed. Bot writes only, so no settle: 300 rounds are quick.
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut rand = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", "cat > /dev/null");
+    let t = tref(&info);
+    let b = s.b();
+    // The bytes a person types, and whether the draft is left set.
+    let typed: [(&[u8], bool); 7] = [
+        (b"x", true),
+        (b"\r", false),
+        (b"x\r", false),
+        (b"\r x", true),
+        (b"\n", true),
+        (b"\x1b[13u", false),
+        (b"\x15", true),
+    ];
+    let mut lease: Option<(&str, u64)> = None;
+    let mut draft = false;
+    let mut expected_writes: Vec<Vec<u8>> = Vec::new();
+    for round in 0..300 {
+        match rand(8) {
+            0 | 1 => {
+                let got = if rand(2) == 0 {
+                    b.keys(&t, &[Key::Enter], &default_guard()).map(drop)
+                } else {
+                    b.keys_if_screen(&t, &[Key::Enter], &default_guard(), &|_| Ok(()))
+                        .map(drop)
+                };
+                if lease.is_some() {
+                    assert!(is_human_controlled(&kind_of(got)), "round {round}");
+                } else if draft {
+                    assert_eq!(kind_of(got), ErrorKind::DraftPending, "round {round}");
+                } else {
+                    got.unwrap();
+                    expected_writes.push(b"\r".to_vec());
+                }
+            }
+            2 => {
+                let who = ["a", "b"][rand(2) as usize];
+                let got = b.lease_acquire(&t, who, false);
+                match lease {
+                    Some((holder, _)) if holder != who => {
+                        assert!(is_human_controlled(&kind_of(got)), "round {round}");
+                    }
+                    _ => {
+                        let grant = got.unwrap();
+                        if let Some((_, id)) = lease {
+                            assert_eq!(grant.id, id, "round {round}: a renewal keeps the lease");
+                        }
+                        lease = Some((who, grant.id));
+                    }
+                }
+            }
+            3 => {
+                let who = ["a", "b"][rand(2) as usize];
+                let grant = b.lease_acquire(&t, who, true).unwrap();
+                lease = Some((who, grant.id));
+            }
+            4 => {
+                let (bytes, left_set) = typed[rand(typed.len() as u64) as usize];
+                let id = lease.map_or(u64::MAX, |(_, id)| id);
+                let got = b.human_write(&t, id, bytes);
+                if lease.is_some() {
+                    got.unwrap();
+                    expected_writes.push(bytes.to_vec());
+                    draft = left_set;
+                } else {
+                    got.unwrap_err();
+                }
+            }
+            5 => {
+                if let Some((_, id)) = lease.take() {
+                    assert!(b.lease_release(&t, id).unwrap());
+                }
+            }
+            _ => {
+                assert_eq!(b.draft_clear(&t).unwrap(), draft, "round {round}");
+                draft = false;
+            }
+        }
+        let now = b.human_state(&t).unwrap();
+        assert_eq!(now.lease.is_some(), lease.is_some(), "round {round}");
+        assert_eq!(now.draft, draft, "round {round}");
+    }
+    assert_eq!(s.host.writes_since(0), expected_writes);
+}
+
+#[test]
+fn a_second_holder_is_refused_unless_it_preempts_and_the_old_one_is_then_lost() {
+    let s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", "cat > /dev/null");
+    let t = tref(&info);
+    let first = s.b().lease_acquire(&t, "one", false).unwrap();
+    assert!(is_human_controlled(&kind_of(
+        s.b().lease_acquire(&t, "two", false)
+    )));
+    let again = s.b().lease_acquire(&t, "one", false).unwrap();
+    assert_eq!(again.id, first.id);
+    let second = s.b().lease_acquire(&t, "two", true).unwrap();
+    assert_ne!(second.id, first.id);
+    assert_eq!(s.b().lease_status(&t, first.id).unwrap(), LeaseStatus::Lost);
+    assert!(matches!(
+        s.b().lease_status(&t, second.id).unwrap(),
+        LeaseStatus::Held { .. }
+    ));
+    let mark = s.host.mark();
+    s.b().human_write(&t, first.id, b"x").unwrap_err();
+    assert!(s.host.writes_since(mark).is_empty());
+    assert!(!draft_of(s.b(), &t), "a refused write sets no draft");
+    // Release ends the lease, never the draft.
+    s.b().human_write(&t, second.id, b"x").unwrap();
+    assert!(s.b().lease_release(&t, second.id).unwrap());
+    assert!(!s.b().lease_release(&t, second.id).unwrap());
+    assert!(!lease_of(s.b(), &t) && draft_of(s.b(), &t));
+}
+
+#[test]
+fn a_human_byte_sets_the_draft_and_a_bot_waits_for_an_enter_or_a_clear() {
+    let clock = TestClock::new();
+    let s = Split::with_config(1 << 20, clock.config());
+    let script = format!("printf '{IDLE}'; read go; printf '{WORKING}{IDLE}'; cat > /dev/null");
+    let (info, _dir) = s.run("p", &script);
+    let t = tref(&info);
+    eventually("idle", || {
+        state_is_idle(&s.b().get(&t).unwrap()).then_some(())
+    });
+    let turn0 = s.b().get(&t).unwrap().turn;
+    let id = typing(s.b(), &t, b"go\n");
+    s.b().lease_release(&t, id).unwrap();
+    // The program's turn advances: that is not the person finishing.
+    eventually("a new turn", || {
+        (s.b().get(&t).unwrap().turn > turn0).then_some(())
+    });
+    // Nor is time.
+    clock.advance(Duration::from_secs(3600));
+    let mark = s.host.mark();
+    assert_eq!(
+        kind_of(s.b().keys(&t, &[Key::Enter], &default_guard())),
+        ErrorKind::DraftPending
+    );
+    assert_eq!(
+        kind_of(s.b().send(&t, "hi", &default_guard())),
+        ErrorKind::DraftPending
+    );
+    assert!(s.host.writes_since(mark).is_empty());
+    assert!(draft_of(s.b(), &t));
+    // A person's Enter does.
+    let id = typing(s.b(), &t, b"\r");
+    s.b().lease_release(&t, id).unwrap();
+    assert!(!draft_of(s.b(), &t));
+    assert!(!load(&*s.host, &info.id).unwrap().human_draft);
+    s.b().keys(&t, &[Key::Enter], &default_guard()).unwrap();
+}
+
+#[test]
+fn only_an_enter_outside_a_paste_clears_the_draft() {
+    let s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", "cat > /dev/null");
+    let t = tref(&info);
+    let id = s.b().lease_acquire(&t, "person", false).unwrap().id;
+    let b = s.b();
+    for (name, chunks, clears) in [
+        ("LF", &[&b"x\n"[..]][..], false),
+        ("Shift+Enter", &[b"x\x1b[13;2u"], false),
+        ("Ctrl-U", &[b"x\x15"], false),
+        ("CR inside a paste", &[b"\x1b[200~a\rb\x1b[201~"], false),
+        (
+            "CR in a paste split over calls",
+            &[b"\x1b[200~a\r", b"b\r", b"c"],
+            false,
+        ),
+        ("CR", &[b"x\r"], true),
+        ("CSI 13 u", &[b"x\x1b[13u"], true),
+        ("CSI 13;1 u", &[b"x\x1b[13;1u"], true),
+        ("CR after a paste", &[b"\x1b[200~a\rb\x1b[201~\r"], true),
+        ("CR, then text", &[b"x\ry"], false),
+        ("CR, then CR", &[b"x\ry\r"], true),
+    ] {
+        for chunk in chunks {
+            b.human_write(&t, id, chunk).unwrap();
+        }
+        assert_eq!(!draft_of(b, &t), clears, "{name}");
+        // Back to a known state: the paste closed, the draft cleared.
+        b.human_write(&t, id, b"\x1b[201~\r").unwrap();
+        b.draft_clear(&t).unwrap();
+    }
+    // A paste that is still open when the lease ends does not leak into the
+    // next one.
+    b.human_write(&t, id, b"\x1b[200~").unwrap();
+    b.lease_release(&t, id).unwrap();
+    let id = b.lease_acquire(&t, "person", false).unwrap().id;
+    b.human_write(&t, id, b"x\r").unwrap();
+    assert!(!draft_of(b, &t), "a new lease starts outside a paste");
+}
+
+#[test]
+fn a_clear_the_host_does_not_acknowledge_keeps_the_draft_and_the_next_enter_retries() {
+    let s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", "cat > /dev/null");
+    let t = tref(&info);
+    let id = typing(s.b(), &t, b"x");
+    s.host.fail_meta.store(true, Ordering::SeqCst);
+    s.b().human_write(&t, id, b"\r").unwrap();
+    assert!(draft_of(s.b(), &t), "fail closed: the flag stays");
+    s.b().lease_release(&t, id).unwrap();
+    assert_eq!(
+        kind_of(s.b().keys(&t, &[Key::Enter], &default_guard())),
+        ErrorKind::DraftPending
+    );
+    // The host is back: the next Enter writes the flag again, then clears it.
+    s.host.fail_meta.store(false, Ordering::SeqCst);
+    let id = typing(s.b(), &t, b"\r");
+    assert!(!draft_of(s.b(), &t));
+    assert!(!load(&*s.host, &info.id).unwrap().human_draft);
+    s.b().lease_release(&t, id).unwrap();
+    s.b().keys(&t, &[Key::Enter], &default_guard()).unwrap();
+}
+
+#[test]
+fn draft_clear_clears_the_draft_and_leaves_the_lease() {
+    let s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", "cat > /dev/null");
+    let t = tref(&info);
+    let id = typing(s.b(), &t, b"x");
+    assert!(draft_of(s.b(), &t) && lease_of(s.b(), &t));
+    assert!(s.b().draft_clear(&t).unwrap());
+    assert!(!draft_of(s.b(), &t) && lease_of(s.b(), &t));
+    assert!(!load(&*s.host, &info.id).unwrap().human_draft);
+    assert!(
+        !s.b().draft_clear(&t).unwrap(),
+        "clearing nothing is not an error"
+    );
+    // The holder is not disturbed.
+    s.b().human_write(&t, id, b"y").unwrap();
+}
+
+#[test]
+fn a_flag_the_host_holds_for_a_byte_that_never_went_is_cleared_too() {
+    let s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", "cat > /dev/null");
+    let t = tref(&info);
+    let id = s.b().lease_acquire(&t, "person", false).unwrap().id;
+    s.host.fail_write.store(true, Ordering::SeqCst);
+    s.b().human_write(&t, id, b"x").unwrap_err();
+    s.host.fail_write.store(false, Ordering::SeqCst);
+    assert!(load(&*s.host, &info.id).unwrap().human_draft);
+    assert!(s.b().draft_clear(&t).unwrap());
+    assert!(!load(&*s.host, &info.id).unwrap().human_draft);
+}
+
+#[test]
+fn a_front_restart_drops_the_lease_and_keeps_the_draft() {
+    let mut s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", "cat > /dev/null");
+    let t = tref(&info);
+    typing(s.b(), &t, b"half a sent");
+    s.kill_front();
+    s.new_front();
+    let state = s.b().human_state(&t).unwrap();
+    assert!(state.lease.is_none(), "a lease is never carried over");
+    assert!(state.draft, "the draft is restored from the meta");
+    let mark = s.host.mark();
+    assert_eq!(
+        kind_of(s.b().keys(&t, &[Key::Enter], &default_guard())),
+        ErrorKind::DraftPending
+    );
+    assert!(s.host.writes_since(mark).is_empty());
+    // The person comes back, presses Enter, and the bot may write.
+    let id = s.b().lease_acquire(&t, "person", false).unwrap().id;
+    s.b().human_write(&t, id, b"\r").unwrap();
+    s.b().lease_release(&t, id).unwrap();
+    s.b().keys(&t, &[Key::Enter], &default_guard()).unwrap();
+}
+
+#[test]
+fn a_front_that_dies_after_the_flag_and_before_the_byte_adopts_with_the_draft() {
+    let mut s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", "cat > /dev/null");
+    let t = tref(&info);
+    let id = s.b().lease_acquire(&t, "person", false).unwrap().id;
+    s.host.fail_write.store(true, Ordering::SeqCst);
+    s.b().human_write(&t, id, b"x").unwrap_err();
+    s.kill_front();
+    s.host.fail_write.store(false, Ordering::SeqCst);
+    s.new_front();
+    assert!(draft_of(s.b(), &t));
+    assert_eq!(
+        kind_of(s.b().keys(&t, &[Key::Enter], &default_guard())),
+        ErrorKind::DraftPending
+    );
+}
+
+#[test]
+fn a_lease_idles_out_after_300_seconds_without_input() {
+    let clock = TestClock::new();
+    let s = Split::with_config(1 << 20, clock.config());
+    let (info, _dir) = s.run("p", "sleep 0.3; echo tick; cat > /dev/null");
+    let t = tref(&info);
+    let id = s.b().lease_acquire(&t, "person", false).unwrap().id;
+    // Output does not renew it.
+    wait_screen(s.b(), &info, "tick");
+    clock.advance(Duration::from_secs(299));
+    let kind = kind_of(s.b().keys(&t, &[Key::Enter], &default_guard()));
+    assert_eq!(
+        kind,
+        ErrorKind::HumanControlled {
+            idle_secs: 299,
+            expires_in_secs: 1
+        }
+    );
+    // Accepted input renews it.
+    s.b().human_write(&t, id, b"\x15").unwrap();
+    s.b().draft_clear(&t).unwrap();
+    clock.advance(Duration::from_secs(299));
+    assert!(is_human_controlled(&kind_of(s.b().keys(
+        &t,
+        &[Key::Enter],
+        &default_guard()
+    ))));
+    // So does an explicit acquire by the holder.
+    s.b().lease_acquire(&t, "person", false).unwrap();
+    clock.advance(Duration::from_secs(299));
+    assert!(lease_of(s.b(), &t));
+    // 300 s of silence ends it.
+    clock.advance(Duration::from_secs(1));
+    assert!(!lease_of(s.b(), &t));
+    assert_eq!(s.b().lease_status(&t, id).unwrap(), LeaseStatus::Idle);
+    let mark = s.host.mark();
+    s.b().human_write(&t, id, b"y").unwrap_err();
+    assert!(s.host.writes_since(mark).is_empty());
+    assert!(!draft_of(s.b(), &t), "a refused byte sets no draft");
+    s.b().keys(&t, &[Key::Enter], &default_guard()).unwrap();
+    // Another person may take it over without a preempt.
+    s.b().lease_acquire(&t, "other", false).unwrap();
+}
+
+#[test]
+fn an_idled_out_lease_leaves_the_draft_in_charge() {
+    let clock = TestClock::new();
+    let s = Split::with_config(1 << 20, clock.config());
+    let (info, _dir) = s.run("p", "cat > /dev/null");
+    let t = tref(&info);
+    typing(s.b(), &t, b"x");
+    clock.advance(Duration::from_secs(299));
+    assert!(is_human_controlled(&kind_of(s.b().keys(
+        &t,
+        &[Key::Enter],
+        &default_guard()
+    ))));
+    clock.advance(Duration::from_secs(2));
+    assert_eq!(
+        kind_of(s.b().keys(&t, &[Key::Enter], &default_guard())),
+        ErrorKind::DraftPending
+    );
+}
+
+#[test]
+fn refused_operations_are_never_queued() {
+    for scenario in ["lease", "lease and draft", "draft"] {
+        let s = Split::new(1 << 20);
+        let (info, _dir) = s.run("p", "cat > /dev/null");
+        let t = tref(&info);
+        let id = match scenario {
+            "lease" => s.b().lease_acquire(&t, "person", false).unwrap().id,
+            _ => typing(s.b(), &t, b"x"),
+        };
+        if scenario == "draft" {
+            s.b().lease_release(&t, id).unwrap();
+        }
+        let want_lease = scenario != "draft";
+        let g = default_guard();
+        let b = s.b();
+        let mark = s.host.mark();
+        let refused = [
+            ("send", kind_of(b.send(&t, "hi", &g))),
+            ("keys", kind_of(b.keys(&t, &[Key::Enter], &g))),
+            (
+                "keys_if_screen (the check allows)",
+                kind_of(b.keys_if_screen(&t, &[Key::Enter], &g, &|_| Ok(()))),
+            ),
+            (
+                "keys_if_screen (the check denies)",
+                kind_of(b.keys_if_screen(&t, &[Key::Esc], &g, &|_| Err("no".to_string()))),
+            ),
+            (
+                "interrupt",
+                kind_of(b.interrupt(&t, Some(Duration::from_millis(50)))),
+            ),
+            ("remove", kind_of(b.remove(&t, None))),
+        ];
+        for (op, kind) in refused {
+            if want_lease {
+                assert!(is_human_controlled(&kind), "{scenario}: {op}: {kind:?}");
+            } else {
+                assert_eq!(kind, ErrorKind::DraftPending, "{scenario}: {op}");
+            }
+        }
+        assert!(
+            s.host.writes_since(mark).is_empty() && !s.host.calls()[mark..].contains(&Call::Kill),
+            "{scenario}: {:?}",
+            &s.host.calls()[mark..]
+        );
+        assert!(b.get(&t).unwrap().live, "{scenario}: remove left it alone");
+        // Nothing waits to go out when the person leaves.
+        if want_lease {
+            b.lease_release(&t, id).unwrap();
+        }
+        thread::sleep(Duration::from_secs(1));
+        assert!(
+            s.host.writes_since(mark).is_empty(),
+            "{scenario}: something was queued"
+        );
+    }
+}
+
+#[test]
+fn a_refused_send_leaves_no_pasted_text() {
+    let s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", "cat");
+    let t = tref(&info);
+    typing(s.b(), &t, b"mine");
+    s.b().send(&t, "BOT-TEXT", &default_guard()).unwrap_err();
+    thread::sleep(Duration::from_millis(300));
+    let text = screen(s.b(), &info);
+    assert!(
+        text.contains("mine") && !text.contains("BOT-TEXT"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_finished_pane_is_removable_whatever_a_person_left_behind() {
+    let s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", "cat");
+    let t = tref(&info);
+    typing(s.b(), &t, b"x");
+    assert!(is_human_controlled(&kind_of(s.b().remove(&t, None))));
+    s.host.inner().signal(&info.id, 9).unwrap();
+    eventually("the exit", || (!s.b().get(&t).unwrap().live).then_some(()));
+    assert_eq!(
+        kind_of(s.b().keys(&t, &[Key::Enter], &default_guard())),
+        ErrorKind::Finished
+    );
+    s.b().remove(&t, None).unwrap();
+}
+
+#[test]
+fn the_programs_own_query_replies_are_never_refused() {
+    let s = Split::new(1 << 20);
+    let script = format!("printf '{IDLE}READY\\n'; read go; printf '\\033[5n'; cat > /dev/null");
+    let (info, _dir) = s.run("p", &script);
+    wait_screen(s.b(), &info, "READY");
+    let t = tref(&info);
+    let id = s.b().lease_acquire(&t, "person", false).unwrap().id;
+    s.b().send(&t, "hi", &default_guard()).unwrap_err();
+    let mark = s.host.mark();
+    s.b().human_write(&t, id, b"go\r").unwrap();
+    eventually("the reply to the program's query", || {
+        s.host
+            .writes_since(mark)
+            .iter()
+            .any(|w| w == b"\x1b[0n")
+            .then_some(())
+    });
+    assert!(lease_of(s.b(), &t), "the lease was held all along");
+}
+
+#[test]
+fn a_person_may_type_into_a_replayed_pane() {
+    let mut s = Split::new(2048);
+    let script = "yes 0123456789 | head -c 20000; echo READY; cat > /dev/null";
+    let (info, _dir) = s.run("p", script);
+    wait_screen(s.b(), &info, "READY");
+    wait_wrapped(&s.host, &info);
+    s.kill_front();
+    s.new_front();
+    let t = tref(&info);
+    assert!(is_replayed(s.b(), &info));
+    let mark = s.host.mark();
+    typing(s.b(), &t, b"x");
+    assert_eq!(s.host.writes_since(mark), [b"x".to_vec()]);
+    // A bot's refusal names the person, not the replay.
+    assert!(is_human_controlled(&kind_of(s.b().keys(
+        &t,
+        &[Key::Enter],
+        &default_guard()
+    ))));
 }
 
 /// Measurement, not a gate: `cargo test replay_time -- --ignored --nocapture`.
