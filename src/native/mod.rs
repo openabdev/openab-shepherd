@@ -26,9 +26,30 @@ mod tests;
 #[cfg(test)]
 mod tests_forged;
 #[cfg(test)]
+mod tests_link;
+#[cfg(test)]
 mod tests_output;
 #[cfg(test)]
 mod tests_replay;
+// The same suites again with each front reaching the host through a holder
+// over a socketpair link (issue #76, PR5). The module name ends in `_held`,
+// which `is_held` reads.
+#[cfg(test)]
+#[path = "tests.rs"]
+#[allow(clippy::duplicate_mod)]
+mod tests_held;
+#[cfg(test)]
+#[path = "tests_output.rs"]
+#[allow(clippy::duplicate_mod)]
+mod tests_output_held;
+#[cfg(test)]
+#[path = "tests.rs"]
+#[allow(clippy::duplicate_mod)]
+mod tests_readopt_held;
+#[cfg(test)]
+#[path = "tests_replay.rs"]
+#[allow(clippy::duplicate_mod)]
+mod tests_replay_held;
 #[cfg(test)]
 mod tests_tail;
 
@@ -55,7 +76,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use term::{Emulator, COLS, ROWS};
@@ -138,6 +159,11 @@ struct Inner {
     /// Dropping the last handle leaves the panes running in the host (the
     /// front is going away, not the panes) instead of ending them.
     leave_on_drop: AtomicBool,
+    /// Test rig: after each `run`, drop the pane from the table and adopt it
+    /// from the host again, as a front that restarted right after the spawn
+    /// would. Catches state that adoption forgets.
+    #[cfg(test)]
+    readopt: AtomicBool,
 }
 
 #[derive(Default)]
@@ -217,15 +243,6 @@ impl NativeBackend {
         Self::with_env(config, Box::new(|key| std::env::var_os(key)))
     }
 
-    /// A backend whose children see `lookup` as the parent environment.
-    #[cfg(test)]
-    pub(crate) fn with_env_lookup(
-        config: NativeConfig,
-        lookup: impl Fn(&str) -> Option<OsString> + Send + Sync + 'static,
-    ) -> Self {
-        Self::with_env(config, Box::new(lookup))
-    }
-
     fn with_env(config: NativeConfig, env: EnvLookup) -> Self {
         Self::with_host(config, env, Arc::new(LocalHost::new()))
     }
@@ -259,8 +276,19 @@ impl NativeBackend {
                 env,
                 keep_meta,
                 leave_on_drop: AtomicBool::new(false),
+                #[cfg(test)]
+                readopt: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// Drop the pane from the table and adopt it from the host again.
+    #[cfg(test)]
+    fn readopt(&self, id: &str) -> Result<(), BackendError> {
+        // Let the program say its first things, so there is a state to lose.
+        thread::sleep(Duration::from_millis(250));
+        self.inner.table()?.panes.retain(|p| p.id != id);
+        self.adopt().map(drop)
     }
 
     /// End every pane now, as dropping the last handle does: what Shepherd
@@ -1130,6 +1158,31 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
+/// Test support: whether the suite in module `module` (a `module_path!()`)
+/// runs its fronts over a holder link.
+#[cfg(test)]
+fn is_held(module: &str) -> bool {
+    module.ends_with("_held")
+}
+
+/// Test support: a front for the suite in module `module`: in process, or
+/// over a holder link that keeps its metadata like the front under `hold`.
+#[cfg(test)]
+fn test_front(module: &str, config: NativeConfig, env: EnvLookup) -> NativeBackend {
+    if is_held(module) {
+        let client = host::held::Held::new().connect();
+        let front = NativeBackend::with_host_meta(config, env, client, true);
+        // A module with `readopt` in its name adopts every pane at once.
+        front
+            .inner
+            .readopt
+            .store(module.contains("readopt"), Ordering::Relaxed);
+        front
+    } else {
+        NativeBackend::with_env(config, env)
+    }
+}
+
 /// What the host's threads tell the screen half. Finds the pane by id in the
 /// table; an id the table no longer has (a pane being ended or removed) is
 /// dropped, since nothing can observe its screen any more.
@@ -1146,7 +1199,10 @@ thread_local! {
     /// The pane the current host thread last resolved, with the epoch of the
     /// front it belongs to. A host thread serves one pane, so the table is
     /// entered once per thread, not once per chunk.
-    static RESOLVED: RefCell<Option<(u64, Arc<Pane>)>> = const { RefCell::new(None) };
+    ///
+    /// Weak, so a thread that outlives its front (the link's events thread)
+    /// does not keep the pane, and through it the host, alive.
+    static RESOLVED: RefCell<Option<(u64, Weak<Pane>)>> = const { RefCell::new(None) };
 }
 
 /// The sink of a host whose front is gone: the panes run on, the output
@@ -1167,8 +1223,9 @@ impl FrontEvents {
         if let Some(hit) = RESOLVED.with(|r| {
             r.borrow()
                 .as_ref()
-                .filter(|(epoch, p)| *epoch == self.epoch && p.id == id)
-                .map(|(_, p)| Arc::clone(p))
+                .filter(|(epoch, _)| *epoch == self.epoch)
+                .and_then(|(_, p)| p.upgrade())
+                .filter(|p| p.id == id)
         }) {
             return Some(hit);
         }
@@ -1181,7 +1238,9 @@ impl FrontEvents {
             .find(|p| p.id == id)
             .cloned();
         RESOLVED.with(|r| {
-            *r.borrow_mut() = found.clone().map(|pane| (self.epoch, pane));
+            *r.borrow_mut() = found
+                .as_ref()
+                .map(|pane| (self.epoch, Arc::downgrade(pane)));
         });
         found
     }
@@ -1374,7 +1433,16 @@ impl TerminalBackend for NativeBackend {
         let env = pty::child_env(&*self.inner.env, &extra)?;
         let cwd = self.cwd_for(spec.cwd.as_deref())?;
         check_room(&*self.inner.table()?, spec.name.as_deref())?;
-        self.insert(spec, argv, cwd, env)?.info()
+        let pane = self.insert(spec, argv, cwd, env)?;
+        let info = pane.info();
+        #[cfg(test)]
+        if self.inner.readopt.load(Ordering::Relaxed) {
+            let id = pane.id.clone();
+            drop(pane);
+            self.readopt(&id)?;
+            return self.inner.resolve(&TerminalRef::new(id))?.info();
+        }
+        info
     }
 
     fn get(&self, t: &TerminalRef) -> Result<TerminalInfo, BackendError> {
