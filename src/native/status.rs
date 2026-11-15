@@ -92,6 +92,51 @@ pub(crate) struct Applied {
     pub status_changed: bool,
 }
 
+/// Everything a [`Tracker`] needs to carry on exactly where it was: `apply`
+/// decides a turn from the previous state, so the turn count alone is not
+/// enough to restore it (a `working -> idle` pair that straddles the restore
+/// point would be missed, a `blocked` already counted would count again).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrackerSnapshot {
+    status: Option<(State, Option<String>)>,
+    reported: bool,
+    turn: u64,
+    status_ms: Option<u64>,
+}
+
+impl TrackerSnapshot {
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "state": self.status.as_ref().map(|(s, _)| s.as_str()),
+            "kind": self.status.as_ref().and_then(|(_, k)| k.as_deref()),
+            "reported": self.reported,
+            "turn": self.turn,
+            "status_ms": self.status_ms,
+        })
+    }
+
+    /// None when the value is not a snapshot this version wrote.
+    pub(crate) fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let state = match value.get("state")? {
+            serde_json::Value::Null => None,
+            word => Some(State::parse(word.as_str()?)),
+        };
+        let kind = match value.get("kind")? {
+            serde_json::Value::Null => None,
+            word => Some(word.as_str()?.to_string()),
+        };
+        Some(Self {
+            status: state.map(|state| (state, kind)),
+            reported: value.get("reported")?.as_bool()?,
+            turn: value.get("turn")?.as_u64()?,
+            status_ms: match value.get("status_ms")? {
+                serde_json::Value::Null => None,
+                ms => Some(ms.as_u64()?),
+            },
+        })
+    }
+}
+
 /// A pane's status, `reported`, `turn` and `status_ms`. The kind is kept raw
 /// (for turn comparison and the log) and exported through `dialog_kind`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -125,6 +170,25 @@ impl Tracker {
         Applied {
             turn_changed,
             status_changed,
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> TrackerSnapshot {
+        TrackerSnapshot {
+            status: self.status.clone(),
+            reported: self.reported,
+            turn: self.turn,
+            status_ms: self.status_ms,
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // adoption uses it next
+    pub(crate) fn restore(snapshot: TrackerSnapshot) -> Self {
+        Self {
+            status: snapshot.status,
+            reported: snapshot.reported,
+            turn: snapshot.turn,
+            status_ms: snapshot.status_ms,
         }
     }
 
@@ -456,5 +520,103 @@ mod tests {
         assert_eq!(entries[0].at_ms, 6);
         assert_eq!(entries[63].at_ms, 69);
         assert!(entries.iter().all(|e| e.body.len() == OSC_BODY_MAX));
+    }
+
+    /// A recorded run of reports: working/idle turns and a permission dialog.
+    fn reports() -> Vec<(State, Option<&'static str>)> {
+        vec![
+            (State::Working, None),
+            (State::Idle, None),
+            (State::Working, None),
+            (State::Blocked, Some("permission")),
+            (State::Blocked, Some("permission")),
+            (State::Working, None),
+            (State::Idle, None),
+            (State::Blocked, Some("question")),
+            (State::Done, None),
+        ]
+    }
+
+    fn run(tracker: &mut Tracker, reports: &[(State, Option<&'static str>)]) {
+        for (i, (state, kind)) in reports.iter().enumerate() {
+            tracker.apply(state.clone(), kind.map(str::to_string), 1000 + i as u64);
+        }
+    }
+
+    #[test]
+    fn a_restored_tracker_matches_the_uninterrupted_one_at_every_cut() {
+        let all = reports();
+        let mut whole = Tracker::default();
+        run(&mut whole, &all);
+        for cut in 0..=all.len() {
+            let mut before = Tracker::default();
+            run(&mut before, &all[..cut]);
+            // Through JSON, as the meta blob carries it.
+            let json = before.snapshot().to_json();
+            let snapshot = TrackerSnapshot::from_json(&json).expect("round trip");
+            let mut after = Tracker::restore(snapshot);
+            for (i, (state, kind)) in all[cut..].iter().enumerate() {
+                after.apply(
+                    state.clone(),
+                    kind.map(str::to_string),
+                    1000 + (cut + i) as u64,
+                );
+            }
+            assert_eq!(after, whole, "cut after {cut} reports");
+        }
+    }
+
+    #[test]
+    fn a_fresh_tracker_misses_what_the_snapshot_keeps() {
+        // The case the snapshot exists for: `working` before the cut, `idle`
+        // after it. Restored from the snapshot the turn counts; started
+        // fresh at the cut it does not.
+        let mut before = Tracker::default();
+        before.apply(State::Working, None, 1);
+        let mut restored = Tracker::restore(before.snapshot());
+        assert!(restored.apply(State::Idle, None, 2).turn_changed);
+        assert_eq!(restored.turn(), 1);
+        let mut fresh = Tracker::default();
+        assert!(!fresh.apply(State::Idle, None, 2).turn_changed);
+
+        // And a blocked dialog counted before the cut is not counted again.
+        let mut blocked = Tracker::default();
+        blocked.apply(State::Blocked, Some("permission".into()), 1);
+        assert_eq!(blocked.turn(), 1);
+        let mut restored = Tracker::restore(blocked.snapshot());
+        let again = restored.apply(State::Blocked, Some("permission".into()), 2);
+        assert!(!again.turn_changed);
+        assert_eq!(restored.turn(), 1);
+        let mut fresh = Tracker::default();
+        assert!(
+            fresh
+                .apply(State::Blocked, Some("permission".into()), 2)
+                .turn_changed
+        );
+    }
+
+    #[test]
+    fn a_snapshot_of_an_exited_or_empty_tracker_round_trips() {
+        let empty = Tracker::default();
+        let back = TrackerSnapshot::from_json(&empty.snapshot().to_json()).unwrap();
+        assert_eq!(Tracker::restore(back), empty);
+        let mut exited = Tracker::default();
+        exited.apply(State::Working, None, 5);
+        exited.on_exit();
+        let back = TrackerSnapshot::from_json(&exited.snapshot().to_json()).unwrap();
+        assert_eq!(Tracker::restore(back), exited);
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_snapshot_is_refused() {
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"state": 3, "kind": null, "reported": true, "turn": 1, "status_ms": null}),
+            serde_json::json!({"state": null, "kind": null, "reported": "yes", "turn": 1, "status_ms": null}),
+            serde_json::json!({"state": null, "kind": null, "reported": true, "turn": -1, "status_ms": null}),
+        ] {
+            assert!(TrackerSnapshot::from_json(&bad).is_none(), "{bad}");
+        }
     }
 }

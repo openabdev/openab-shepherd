@@ -17,6 +17,7 @@
 
 mod host;
 pub(crate) mod keys;
+mod meta;
 pub(crate) mod status;
 pub(crate) mod term;
 #[cfg(test)]
@@ -25,6 +26,8 @@ mod tests;
 mod tests_forged;
 #[cfg(test)]
 mod tests_output;
+#[cfg(test)]
+mod tests_tail;
 
 pub(crate) use host::pty::{default_signals_on_exec, effective_uid, SPAWN_LOCK};
 pub use keys::KeyboardMode;
@@ -40,6 +43,7 @@ use crate::input::MAX_INPUT_BYTES;
 use host::local::LocalHost;
 use host::{pty, HostEvents, KillOutcome, PtyHost, SpawnReq, KILL_GRACE};
 use keys::encode as encode_key;
+use meta::{MetaStore, PaneMeta};
 use status::{LogEntry, Report, StatusLog, Tracker};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -110,6 +114,9 @@ struct Inner {
     config: NativeConfig,
     /// Reads the parent's environment for the whitelist.
     env: EnvLookup,
+    /// Keep each pane's metadata in the host (see [`meta`]). Off for the
+    /// single-process server, which has no later front to read it.
+    keep_meta: bool,
 }
 
 #[derive(Default)]
@@ -133,6 +140,8 @@ struct Pane {
     changed: Condvar,
     /// Held for a whole write sequence (send, keys, interrupt, reply flush).
     input: Mutex<()>,
+    /// The only writer of this pane's host metadata, when kept.
+    meta: Option<MetaStore>,
 }
 
 struct PaneState {
@@ -169,6 +178,18 @@ impl NativeBackend {
 
     /// A backend over `host`, which gets this backend's table as its sink.
     fn with_host<H: PtyHost + 'static>(config: NativeConfig, env: EnvLookup, host: Arc<H>) -> Self {
+        Self::with_host_meta(config, env, host, false)
+    }
+
+    /// A backend over `host` that also keeps each pane's metadata there.
+    /// Nothing in the server builds one yet; the holder will.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn with_host_meta<H: PtyHost + 'static>(
+        config: NativeConfig,
+        env: EnvLookup,
+        host: Arc<H>,
+        keep_meta: bool,
+    ) -> Self {
         let table = Arc::new(Mutex::new(Table::default()));
         host.set_sink(Arc::new(FrontEvents {
             table: Arc::clone(&table),
@@ -181,6 +202,7 @@ impl NativeBackend {
                 host,
                 config,
                 env,
+                keep_meta,
             }),
         }
     }
@@ -293,6 +315,26 @@ impl NativeBackend {
             table.panes = rest;
             dropped = same;
         }
+        let meta = self.inner.keep_meta.then(|| {
+            let store = MetaStore::new(
+                Arc::clone(&self.inner.host),
+                spawned.id.clone(),
+                PaneMeta {
+                    name: spec.name.clone(),
+                    argv: argv.clone(),
+                    cwd: cwd.clone(),
+                    ..PaneMeta::default()
+                },
+            );
+            // Before the pane is in the table, so no output can write first.
+            if let Err(err) = store.update(|_| ()) {
+                eprintln!(
+                    "openab-shepherd: native: {}: meta write failed: {err}",
+                    spawned.id
+                );
+            }
+            store
+        });
         let pane = Arc::new(Pane {
             id: spawned.id,
             name: spec.name.clone(),
@@ -314,6 +356,7 @@ impl NativeBackend {
             }),
             changed: Condvar::new(),
             input: Mutex::new(()),
+            meta,
         });
         table.panes.push(Arc::clone(&pane));
         dropped.extend(evict_finished(&mut table));
@@ -467,11 +510,12 @@ impl Pane {
 
     /// Take one chunk of output (reader thread). False when the state is
     /// poisoned and the reader should stop.
-    fn ingest(&self, chunk: &[u8]) -> bool {
+    fn ingest(&self, seq: u64, chunk: &[u8]) -> bool {
         let Ok(mut guard) = self.state.lock() else {
             return false;
         };
         let st = &mut *guard;
+        let before = self.meta.as_ref().map(|_| st.tracker.snapshot());
         st.raw.extend(chunk);
         let excess = st.raw.len().saturating_sub(RAW_RING);
         st.raw.drain(..excess);
@@ -517,8 +561,23 @@ impl Pane {
             );
         }
         st.last_output = Instant::now();
+        let after = before.and_then(|before| {
+            let now = st.tracker.snapshot();
+            (now != before).then_some(now)
+        });
         drop(guard);
         self.changed.notify_all();
+        // Only a chunk that changed the tracker writes: the snapshot is exact
+        // at the end of this chunk. The chunk is already in the emulator, so
+        // a crash before this write only replays it once more.
+        if let (Some(meta), Some(snapshot)) = (&self.meta, after) {
+            if let Err(err) = meta.set_tracker(snapshot, seq + chunk.len() as u64) {
+                eprintln!(
+                    "openab-shepherd: native: {}: meta write failed: {err}",
+                    self.id
+                );
+            }
+        }
         true
     }
 
@@ -833,11 +892,11 @@ impl FrontEvents {
 }
 
 impl HostEvents for FrontEvents {
-    fn output(&self, id: &str, _seq: u64, bytes: &[u8]) -> bool {
+    fn output(&self, id: &str, seq: u64, bytes: &[u8]) -> bool {
         let Some(pane) = self.pane(id) else {
             return true;
         };
-        if !pane.ingest(bytes) {
+        if !pane.ingest(seq, bytes) {
             return false;
         }
         if let Ok(_input) = pane.input.try_lock() {

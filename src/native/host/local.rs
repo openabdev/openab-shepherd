@@ -8,8 +8,10 @@
 //! release `state`. The registry lock is held only to look a pane up or
 //! change the list, never across a call into the sink or a wait.
 
+use super::tail::TailRing;
 use super::{
-    procs, pty, HostEvents, HostPane, KillOutcome, PtyHost, SpawnReq, Spawned, KILL_GRACE,
+    procs, pty, Attached, HostEvents, HostPane, KillOutcome, PtyHost, SpawnReq, Spawned,
+    KILL_GRACE, META_CAP,
 };
 use crate::backend::{BackendError, ErrorKind};
 use crate::native::term::{COLS, ROWS};
@@ -52,9 +54,19 @@ struct Registry {
     panes: Vec<Arc<Proc>>,
 }
 
+/// Finished panes a host that keeps tails holds before it forgets the
+/// oldest: a backstop for a host nobody is attached to. The front's own cap
+/// (`MAX_FINISHED_PANES`) is the policy and is lower.
+const FINISHED_BACKSTOP: usize = 64;
+
 pub(crate) struct LocalHost {
     registry: Mutex<Registry>,
     sink: Mutex<Option<Arc<dyn HostEvents>>>,
+    /// The size of each pane's tail, or None for no tail. Off for the
+    /// single-process server, which has no later front to serve, so it pays
+    /// no memory and no copy per chunk.
+    tail_cap: Option<usize>,
+    finished_backstop: usize,
 }
 
 pub(crate) struct Proc {
@@ -78,6 +90,10 @@ pub(crate) struct Proc {
     /// lose a quick program's output; the reaper closes it at the exit.
     shutdown: AtomicBool,
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// The last output bytes, when the host keeps a tail.
+    tail: Option<Mutex<TailRing>>,
+    /// Opaque metadata the front keeps with the pane.
+    meta: Mutex<Vec<u8>>,
 }
 
 pub(crate) struct ProcState {
@@ -105,6 +121,39 @@ impl LocalHost {
         Self {
             registry: Mutex::new(Registry::default()),
             sink: Mutex::new(None),
+            tail_cap: None,
+            finished_backstop: FINISHED_BACKSTOP,
+        }
+    }
+
+    /// A host that keeps the last `cap` bytes of each pane's output, for the
+    /// holder (with [`super::tail::TAIL_CAP`]) and for tests.
+    #[cfg_attr(not(test), allow(dead_code))] // the holder uses it later
+    pub(crate) fn with_tail(cap: usize) -> Self {
+        Self {
+            tail_cap: Some(cap),
+            ..Self::new()
+        }
+    }
+
+    /// Test hook: forget the oldest finished pane beyond `n` at a spawn.
+    #[cfg(test)]
+    pub(crate) fn with_finished_backstop(mut self, n: usize) -> Self {
+        self.finished_backstop = n;
+        self
+    }
+
+    /// With a tail kept, make room for one more finished pane: forget the
+    /// oldest finished ones beyond the backstop.
+    fn evict_finished(&self) {
+        if self.tail_cap.is_none() {
+            return;
+        }
+        let panes = self.registry().panes.clone();
+        let finished: Vec<&Arc<Proc>> = panes.iter().filter(|p| p.has_exited()).collect();
+        let excess = finished.len().saturating_sub(self.finished_backstop);
+        for pane in finished.into_iter().take(excess) {
+            self.forget(&pane.id);
         }
     }
 
@@ -145,6 +194,7 @@ impl PtyHost for LocalHost {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .ok_or_else(|| BackendError::new(ErrorKind::Other, "native: the host has no sink"))?;
+        self.evict_finished();
         let pty::Spawned {
             master,
             slave,
@@ -174,6 +224,8 @@ impl PtyHost for LocalHost {
             stopping: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             reader: Mutex::new(None),
+            tail: self.tail_cap.map(|cap| Mutex::new(TailRing::new(cap))),
+            meta: Mutex::new(Vec::new()),
         });
         registry.panes.push(Arc::clone(&pane));
         drop(registry);
@@ -348,6 +400,39 @@ impl PtyHost for LocalHost {
         }
     }
 
+    fn attach(&self, id: &str) -> io::Result<Attached> {
+        let pane = self.find(id).ok_or_else(|| Self::unknown(id))?;
+        let tail = pane
+            .tail
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "this host keeps no tail"))?;
+        let ring = tail.lock().unwrap_or_else(PoisonError::into_inner);
+        let tail_start = ring.start();
+        Ok(Attached {
+            tail_start,
+            tail_end: ring.end(),
+            bytes: ring.read_from(tail_start).unwrap_or_default(),
+        })
+    }
+
+    fn meta_set(&self, id: &str, bytes: &[u8]) -> io::Result<()> {
+        let pane = self.find(id).ok_or_else(|| Self::unknown(id))?;
+        if bytes.len() > META_CAP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("meta of {} bytes exceeds {META_CAP}", bytes.len()),
+            ));
+        }
+        *pane.meta.lock().unwrap_or_else(PoisonError::into_inner) = bytes.to_vec();
+        Ok(())
+    }
+
+    fn meta_get(&self, id: &str) -> io::Result<Vec<u8>> {
+        let pane = self.find(id).ok_or_else(|| Self::unknown(id))?;
+        let meta = pane.meta.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(meta.clone())
+    }
+
     fn survives_restart(&self) -> bool {
         false
     }
@@ -501,6 +586,13 @@ fn read_loop(pane: Arc<Proc>, sink: Arc<dyn HostEvents>) {
             Ok(None) => sink.idle(&pane.id),
             Ok(Some(0)) => break,
             Ok(Some(n)) => {
+                // The tail first, so a front that attaches after hearing of
+                // this chunk finds it there.
+                if let Some(tail) = &pane.tail {
+                    tail.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(&buf[..n]);
+                }
                 if !sink.output(&pane.id, seq, &buf[..n]) {
                     break;
                 }

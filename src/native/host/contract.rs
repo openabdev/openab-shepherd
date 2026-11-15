@@ -3,7 +3,7 @@
 //! on [`LocalHost`] here; a host reached over a link must pass the same list.
 
 use super::local::LocalHost;
-use super::{pty, HostEvents, HostPane, PtyHost, SpawnReq};
+use super::{pty, HostEvents, HostPane, PtyHost, SpawnReq, META_CAP};
 use crate::backend::{BackendError, Capabilities, TerminalBackend};
 use crate::native::{NativeBackend, NativeConfig};
 use crate::testutil::TempDir;
@@ -352,6 +352,171 @@ const SCENARIOS: &[Scenario] = &[
     ),
 ];
 
+/// The tail size of the host the tail scenarios run on.
+const TAIL_TEST_CAP: usize = 4096;
+
+/// Every output byte of a pane, as the sink heard it.
+fn heard(rig: &Rig, id: &str) -> Vec<u8> {
+    let ev = rig.sink.events.lock().unwrap();
+    ev.output
+        .get(id)
+        .into_iter()
+        .flatten()
+        .flat_map(|(_, chunk)| chunk.iter().copied())
+        .collect()
+}
+
+/// A pane that has printed `n` bytes with no newline (so the terminal adds
+/// nothing) and exited; the attach is made after the exit.
+fn print_exactly(rig: &Rig, n: usize) -> String {
+    let pane = rig.sh(&format!("printf '%0{n}d' 0"));
+    rig.sink.wait_exit(&pane.id);
+    assert_eq!(heard(rig, &pane.id).len(), n);
+    pane.id
+}
+
+/// Below the cap the tail is everything, from offset 0.
+fn attach_below_the_cap_is_complete(rig: &Rig) {
+    let id = print_exactly(rig, 1000);
+    let at = rig.host.attach(&id).unwrap();
+    assert_eq!((at.tail_start, at.tail_end), (0, 1000));
+    assert_eq!(at.bytes, heard(rig, &id));
+}
+
+/// Exactly the cap still starts at 0; one byte more drops exactly one.
+fn attach_at_the_cap_boundary(rig: &Rig) {
+    let id = print_exactly(rig, TAIL_TEST_CAP);
+    let at = rig.host.attach(&id).unwrap();
+    assert_eq!((at.tail_start, at.tail_end), (0, TAIL_TEST_CAP as u64));
+    assert_eq!(at.bytes, heard(rig, &id));
+
+    let id = print_exactly(rig, TAIL_TEST_CAP + 1);
+    let at = rig.host.attach(&id).unwrap();
+    assert_eq!((at.tail_start, at.tail_end), (1, TAIL_TEST_CAP as u64 + 1));
+    assert_eq!(at.bytes, heard(rig, &id)[1..]);
+}
+
+/// Far past the cap the tail is the last `cap` bytes, offsets exact. A first
+/// output larger than the cap starts above 0.
+fn attach_after_a_wrap(rig: &Rig) {
+    let pane = rig.sh("yes 0123456789 | head -c 100000; printf done-marker");
+    rig.sink.wait_exit(&pane.id);
+    let all = heard(rig, &pane.id);
+    assert!(all.len() > 100_000);
+    let at = rig.host.attach(&pane.id).unwrap();
+    assert_eq!(at.tail_end, all.len() as u64);
+    assert_eq!(at.tail_start, (all.len() - TAIL_TEST_CAP) as u64);
+    assert_eq!(at.tail_end - at.tail_start, at.bytes.len() as u64);
+    assert_eq!(at.bytes, all[all.len() - TAIL_TEST_CAP..]);
+}
+
+/// An attach made while the pane is writing is a consistent cut: its bytes
+/// are exactly the stream between its two offsets.
+fn attach_is_atomic_under_output(rig: &Rig) {
+    let pane = rig.sh("yes 0123456789abcdef | head -c 3000000");
+    let mut cuts = Vec::new();
+    while !rig
+        .sink
+        .events
+        .lock()
+        .unwrap()
+        .exited
+        .contains_key(&pane.id)
+    {
+        if let Ok(at) = rig.host.attach(&pane.id) {
+            cuts.push(at);
+        }
+    }
+    let all = heard(rig, &pane.id);
+    assert!(
+        cuts.len() > 5,
+        "only {} attaches overlapped the output",
+        cuts.len()
+    );
+    for at in cuts {
+        assert_eq!(at.tail_end - at.tail_start, at.bytes.len() as u64);
+        assert!(at.bytes.len() <= TAIL_TEST_CAP);
+        assert_eq!(
+            at.bytes,
+            all[at.tail_start as usize..at.tail_end as usize],
+            "attach at {}..{}",
+            at.tail_start,
+            at.tail_end
+        );
+    }
+}
+
+/// A pane that exited keeps its tail and its place until `kill`, which
+/// forgets it.
+fn an_exited_pane_keeps_its_tail_until_kill(rig: &Rig) {
+    let pane = rig.sh("printf last-words; exit 3");
+    assert_eq!(rig.sink.wait_exit(&pane.id), Some(3));
+    std::thread::sleep(Duration::from_millis(300));
+    let at = rig.host.attach(&pane.id).unwrap();
+    assert!(String::from_utf8_lossy(&at.bytes).contains("last-words"));
+    assert!(rig.host.list().iter().any(|p| p.id == pane.id && p.exited));
+    rig.host.kill(&pane.id, Duration::ZERO).unwrap();
+    let err = rig.host.attach(&pane.id).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert_eq!(
+        rig.host.attach("n:999999").unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+}
+
+/// `meta` is opaque bytes kept as set, replaced as a whole, empty before the
+/// first set, bounded, and gone with the pane.
+fn meta_is_kept_as_set(rig: &Rig) {
+    let pane = rig.spawn(&["sleep", "30"]);
+    assert_eq!(rig.host.meta_get(&pane.id).unwrap(), Vec::<u8>::new());
+    let blob: Vec<u8> = (0..=255u8).collect();
+    rig.host.meta_set(&pane.id, &blob).unwrap();
+    assert_eq!(rig.host.meta_get(&pane.id).unwrap(), blob);
+    rig.host.meta_set(&pane.id, b"second").unwrap();
+    assert_eq!(rig.host.meta_get(&pane.id).unwrap(), b"second");
+
+    let full = vec![7u8; META_CAP];
+    rig.host.meta_set(&pane.id, &full).unwrap();
+    assert_eq!(rig.host.meta_get(&pane.id).unwrap(), full);
+    let err = rig
+        .host
+        .meta_set(&pane.id, &vec![7u8; META_CAP + 1])
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        rig.host.meta_get(&pane.id).unwrap(),
+        full,
+        "a refused set changes nothing"
+    );
+
+    for err in [
+        rig.host.meta_set("n:999999", b"x").unwrap_err(),
+        rig.host.meta_get("n:999999").unwrap_err(),
+    ] {
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+    rig.host.kill(&pane.id, Duration::ZERO).unwrap();
+    assert!(rig.host.meta_get(&pane.id).is_err());
+}
+
+const TAIL_SCENARIOS: &[Scenario] = &[
+    (
+        "attach below the cap is complete",
+        attach_below_the_cap_is_complete,
+    ),
+    ("attach at the cap boundary", attach_at_the_cap_boundary),
+    ("attach after a wrap", attach_after_a_wrap),
+    (
+        "attach is atomic under output",
+        attach_is_atomic_under_output,
+    ),
+    (
+        "an exited pane keeps its tail until kill",
+        an_exited_pane_keeps_its_tail_until_kill,
+    ),
+    ("meta is kept as set", meta_is_kept_as_set),
+];
+
 /// Run every scenario on a fresh host from `make`.
 fn run_contract(make: impl Fn() -> Arc<dyn PtyHost>) {
     for (name, scenario) in SCENARIOS {
@@ -365,6 +530,25 @@ fn run_contract(make: impl Fn() -> Arc<dyn PtyHost>) {
 #[test]
 fn local_host_meets_the_host_contract() {
     run_contract(|| Arc::new(LocalHost::new()));
+}
+
+#[test]
+fn local_host_with_a_tail_meets_the_host_contract() {
+    run_contract(|| Arc::new(LocalHost::with_tail(TAIL_TEST_CAP)));
+}
+
+/// The scenarios for a host that keeps a tail of `TAIL_TEST_CAP` bytes.
+#[test]
+fn local_host_with_a_tail_meets_the_tail_contract() {
+    for (name, scenario) in TAIL_SCENARIOS {
+        eprintln!("tail contract: {name}");
+        let rig = Rig::new(
+            Arc::new(LocalHost::with_tail(TAIL_TEST_CAP)),
+            "tail-contract",
+        );
+        scenario(&rig);
+        rig.host.end_all();
+    }
 }
 
 #[test]
@@ -403,6 +587,15 @@ impl PtyHost for SurvivingHost {
     }
     fn forget(&self, _id: &str) {}
     fn end_all(&self) {}
+    fn attach(&self, _id: &str) -> io::Result<super::Attached> {
+        unimplemented!()
+    }
+    fn meta_set(&self, _id: &str, _bytes: &[u8]) -> io::Result<()> {
+        unimplemented!()
+    }
+    fn meta_get(&self, _id: &str) -> io::Result<Vec<u8>> {
+        unimplemented!()
+    }
     fn survives_restart(&self) -> bool {
         true
     }
