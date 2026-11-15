@@ -224,8 +224,10 @@ The trust model (one account, pane programs trusted) and the non-goals are in
   and fully detaches (new session, no terminal, parents gone) within the 250 ms
   between looks at the process table is never seen and survives. macOS has no
   unprivileged way to close this gap; a Linux subreaper is a follow-up.
-- **Panes do not survive a server restart.** Native panes are children of Shepherd
-  and end with it.
+- **Panes survive a server restart only under `hold`.** A bare `openab-shepherd` owns
+  its panes and they end with it. `openab-shepherd hold -- <server flags>` runs a holder
+  that owns the panes and restarts the server (`SIGUSR2`), but stopping the holder ends
+  them. See [Restart survival](docs/operations.md#restart-survival).
 
 The full list, including the output filter's limits,
 is in [docs/operations.md](docs/operations.md#known-limits-mvp-scope).

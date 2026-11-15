@@ -45,7 +45,7 @@ Facts about kiro-cli 3.1.0 (V3) this design relies on:
 | Wait | `Condvar` on the pane state (`status`, `turn`, `live`, pending send). |
 | Child env | `env_clear()`, then only `HOME`, `PATH`, `USER`, `LANG`, `TERM=xterm-256color`, plus code-supplied extra env. |
 | Process lifetime | Each pane is its own session and process group (`setsid`, so pgid = pid). Shepherd also tracks the pane's descendants by pid and start time (§11, issue #10). Removal sends SIGHUP and SIGTERM to the group and the descendants, then SIGSTOP and SIGKILL to all of them after 2 s, while the output is still read; the leader is always reaped and its status recorded. |
-| Restart | Panes do not survive a Shepherd restart. `survives_restart = false`. |
+| Restart | Panes do not survive a Shepherd restart. `survives_restart = false`. (Changed by #76: under `openab-shepherd hold` the host is the holder and `survives_restart` is true; see [restart-survival-and-shared-panes.md](restart-survival-and-shared-panes.md) and [operations.md](../operations.md#restart-survival).) |
 | Selection | `OPENAB_SHEPHERD_BACKEND=native\|hc`. The default becomes `native` only if the real-Kiro probe passes; otherwise it stays `hc`. |
 
 Technology stack (locked once this ADR is approved): Rust 2021, std threads and `std::sync` (no async runtime), `libc` 0.2, `vt100` =0.18.1, and the existing `serde_json` and `tiny_http`. No other new dependencies.
@@ -372,7 +372,7 @@ Nothing else passes, by construction (`env_clear()` first). In particular, `OPEN
   - At most 8 live panes (`MAX_LIVE_PANES`); a `run` beyond that gives `ErrorKind::Other`, detail `native: 8 panes are running; the limit is 8`.
   - At most 32 finished panes are retained (`MAX_FINISHED_PANES`), and the oldest finished one is evicted first. Eviction runs the hard stop (normally a no-op: the reaper already ended a finished pane's processes).
   - A `run` whose name matches a finished pane evicts that finished pane, the same way. Names are unique among **live** panes, which is hc's rule (schema: "unique among live terminals"). A taken name gives `NameTaken`.
-- **Restart.** Panes live in memory and die with Shepherd. `survives_restart = false`. This is documented in the README and MVP-REPORT known limits.
+- **Restart.** Panes live in memory and die with Shepherd. `survives_restart = false`. This is documented in the README and MVP-REPORT known limits. (Superseded for `hold` by #76; see [operations.md](../operations.md#restart-survival).)
 
 ## 12. The remaining trait methods
 

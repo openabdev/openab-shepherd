@@ -4,6 +4,8 @@ For a human at a macOS terminal (zsh). It drives a real Shepherd server with rea
 
 Run the scripts from this directory (`docs/operator-e2e` in a clone of the repository). The scripts use `stat -f`, so they target macOS.
 
+The scripts for restart survival (`hold`, SIGUSR2, service restarts, the routine after a restart) are a separate set, described in [restart-survival.md](restart-survival.md).
+
 Validated against `origin/main` commit `afd73c9`; see [Known results](#known-results) and [Verified against](#verified-against).
 
 ## Safety rules

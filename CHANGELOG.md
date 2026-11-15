@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- Restart survival (issue #76). `openab-shepherd hold -- <server flags>` runs a holder that owns the
+  panes and starts the server as a child. `SIGUSR2` on the holder restarts the server and the panes keep
+  running; a new server adopts them, replays their output silently, and rebuilds each pane's agent kind,
+  `answered` flag and routine watch. A pane whose output exceeded the holder's 1 MiB tail is refused typed
+  input with the new error `pane_replayed` until it repaints. `survives_restart` is true under `hold`.
+  The bare command is unchanged. See "Restart survival" in `docs/operations.md`. Operator scripts for the
+  real-server scenarios are in `docs/operator-e2e/restart-survival.md`; `examples/record_tail.rs` records
+  replay fixtures by hand. Refs #76.
+
 ### Changed
 
 - Container image: the default command is now `openab-shepherd hold -- --host 127.0.0.1 --port 8765`
