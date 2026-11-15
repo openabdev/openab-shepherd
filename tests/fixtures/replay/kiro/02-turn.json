@@ -1,0 +1,14 @@
+{
+  "command": "kiro-cli",
+  "ended_by": "quiet after the last step",
+  "gaps": 0,
+  "live_at_end": true,
+  "raw_bytes": 100808,
+  "status": {
+    "kind": null,
+    "state": "done"
+  },
+  "steps": 1,
+  "steps_done": 1,
+  "turn": 1
+}

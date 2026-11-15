@@ -1,0 +1,119 @@
+ • Reply with only OK            +
+
+  ┃                                                                                                                                                             Reply with only OK
+  ┃  Reply with only the word OK. Do not use any tools.
+  ┃                                                                                                                                                             Context
+                                                                                                                                                                5,967 tokens
+     OK                                                                                                                                                         3% used
+
+     Build · Big Pickle · 1.2s · 2.5 tok/s                                                                                                                      MCP
+                                                                                                                                                                • github                        Error
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · Big Pickle OpenCode
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  /home/user/scratches/replay-opencode.oAAorD                                                                                     6.0K (3%)  ctrl+p commands    /…/xxxxxxxxx…/T/replay-opencode.oAAorD

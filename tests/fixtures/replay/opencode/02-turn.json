@@ -1,0 +1,14 @@
+{
+  "command": "opencode",
+  "ended_by": "quiet after the last step",
+  "gaps": 0,
+  "live_at_end": true,
+  "raw_bytes": 132850,
+  "status": {
+    "kind": null,
+    "state": "idle"
+  },
+  "steps": 1,
+  "steps_done": 1,
+  "turn": 1
+}

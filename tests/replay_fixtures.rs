@@ -1,13 +1,13 @@
 //! The recorded replay fixtures of issue #76 (`tests/fixtures/replay/<agent>/`), made by
 //! `examples/record_tail.rs` through `docs/operator-e2e/record-replay-fixture.sh`.
 //!
-//! Ignored until the user has recorded them: the recordings need a logged-in CLI per
-//! agent, and closing #76 waits for them, not the merge of any code. Run with
-//! `cargo test --test replay_fixtures -- --ignored`.
+//! Only kiro and opencode are recorded; claude and codex are on hold (issue #93). This test
+//! checks the files; replaying each tail into a fresh emulator and comparing the final screen
+//! is `native::tests_replay_fixtures` (the emulator is crate-private).
 
 use std::path::PathBuf;
 
-const AGENTS: [&str; 4] = ["claude", "codex", "kiro", "opencode"];
+const AGENTS: [&str; 2] = ["kiro", "opencode"];
 
 fn dir(agent: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -16,7 +16,6 @@ fn dir(agent: &str) -> PathBuf {
 }
 
 #[test]
-#[ignore = "waits for the user's recordings (issue #76)"]
 fn every_agent_has_complete_recordings() {
     for agent in AGENTS {
         let raws: Vec<_> = std::fs::read_dir(dir(agent))
@@ -24,7 +23,7 @@ fn every_agent_has_complete_recordings() {
             .map(|e| e.expect("entry").path())
             .filter(|p| p.extension().is_some_and(|x| x == "raw"))
             .collect();
-        assert!(!raws.is_empty(), "{agent}: no .raw recording");
+        assert!(raws.len() >= 3, "{agent}: expected 3 .raw recordings");
         for raw in raws {
             assert!(
                 std::fs::metadata(&raw).unwrap().len() > 0,

@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! record_tail --out DIR --name NAME [--cwd DIR] [--quiet-ms 4000] [--max-secs 300]
-//!             [--send TEXT | --key KEY]... -- COMMAND [ARG]...
+//!             [--pass-env NAME]... [--send TEXT | --key KEY]... -- COMMAND [ARG]...
 //! ```
 //!
 //! It starts COMMAND on a native pane (200 columns by 120 rows, the same environment as
@@ -25,6 +25,11 @@
 //! no overlap, the recorder counts a gap and says so; record again with fewer or slower
 //! steps. Replay itself needs the last 1 MiB only, and a test truncates a longer
 //! recording to that.
+//!
+//! `--pass-env NAME` copies the variable NAME from the caller's environment into the
+//! pane's environment, as a Shepherd profile does for an agent's key. The value is never
+//! printed or written, and the recorder refuses to write (exit 3) when the exact value
+//! appears in the recorded bytes or the screen.
 //!
 //! Before writing anything it replaces the home directory with `/home/user` and refuses
 //! to write when the bytes look like a credential (a `Bearer` header, an `sk-` or `ghp_`
@@ -58,13 +63,14 @@ struct Options {
     quiet: Duration,
     max: Duration,
     steps: Vec<Step>,
+    pass_env: Vec<String>,
     command: Vec<String>,
 }
 
 fn usage() -> ExitCode {
     eprintln!(
         "usage: record_tail --out DIR --name NAME [--cwd DIR] [--quiet-ms N] [--max-secs N] \
-         [--send TEXT | --key enter|esc|up|down|ctrl-c]... -- COMMAND [ARG]..."
+         [--pass-env NAME]... [--send TEXT | --key enter|esc|up|down|ctrl-c]... -- COMMAND [ARG]..."
     );
     ExitCode::from(2)
 }
@@ -76,6 +82,7 @@ fn parse(args: &[String]) -> Option<Options> {
     let mut quiet = Duration::from_millis(4000);
     let mut max = Duration::from_secs(300);
     let mut steps = Vec::new();
+    let mut pass_env = Vec::new();
     let mut iter = args.iter();
     let mut command = Vec::new();
     while let Some(arg) = iter.next() {
@@ -89,6 +96,13 @@ fn parse(args: &[String]) -> Option<Options> {
             "--cwd" => cwd = PathBuf::from(iter.next()?),
             "--quiet-ms" => quiet = Duration::from_millis(iter.next()?.parse().ok()?),
             "--max-secs" => max = Duration::from_secs(iter.next()?.parse().ok()?),
+            "--pass-env" => {
+                let var = iter.next()?.clone();
+                if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return None;
+                }
+                pass_env.push(var);
+            }
             "--send" => steps.push(Step::Send(iter.next()?.clone())),
             "--key" => steps.push(Step::Key(match iter.next()?.as_str() {
                 "enter" => Key::Enter,
@@ -113,6 +127,7 @@ fn parse(args: &[String]) -> Option<Options> {
         quiet,
         max,
         steps,
+        pass_env,
         command,
     })
 }
@@ -187,6 +202,29 @@ fn looks_secret(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Whether the bytes show a login prompt, which means the agent is not authenticated.
+fn login_prompt(bytes: &[u8]) -> Option<&'static str> {
+    let text = String::from_utf8_lossy(bytes).to_lowercase();
+    [
+        ("not logged in", "not logged in"),
+        ("login now", "login now"),
+        ("auth portal", "auth portal"),
+        ("https://app.kiro.dev/signin", "login URL"),
+        ("/signin", "login URL"),
+    ]
+    .into_iter()
+    .find(|(needle, _)| text.contains(needle))
+    .map(|(_, what)| what)
+}
+
+/// The index of the first passed value that appears verbatim in `bytes`. Empty values
+/// never match.
+fn leaks_value(bytes: &[u8], values: &[Vec<u8>]) -> Option<usize> {
+    values
+        .iter()
+        .position(|v| !v.is_empty() && bytes.windows(v.len()).any(|w| w == v.as_slice()))
+}
+
 /// Replaces every occurrence of `from` with `to`.
 fn replace(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     if from.is_empty() {
@@ -209,10 +247,19 @@ fn replace(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 fn run(opts: &Options) -> Result<ExitCode, String> {
     let native = NativeBackend::new(NativeConfig::default());
     let pane = TerminalRef::new(PANE);
+    // The values stay in memory only: never printed, logged or written.
+    let mut passed: Vec<(String, String)> = Vec::new();
+    for name in &opts.pass_env {
+        match std::env::var(name) {
+            Ok(v) if !v.is_empty() => passed.push((name.clone(), v)),
+            _ => return Err(format!("--pass-env {name}: the variable is not set")),
+        }
+    }
     let spec = RunSpec {
         argv: Some(opts.command.clone()),
         cwd: Some(opts.cwd.to_string_lossy().into_owned()),
         name: Some(PANE.to_string()),
+        env: passed.clone(),
         ..RunSpec::default()
     };
     native
@@ -277,9 +324,25 @@ fn run(opts: &Options) -> Result<ExitCode, String> {
     let scrub = |bytes: &[u8]| replace(bytes, home.as_bytes(), b"/home/user");
     let raw = scrub(&stitch.all);
     let screen = scrub(screen.as_bytes());
+    if let Some(what) = login_prompt(&raw).or_else(|| login_prompt(&screen)) {
+        eprintln!("record_tail: ABORTED: the program asks to log in ({what}); nothing was written");
+        return Ok(ExitCode::FAILURE);
+    }
+
     for (what, bytes) in [("output", &raw), ("screen", &screen)] {
         if let Some(kind) = looks_secret(bytes) {
             eprintln!("record_tail: REFUSED: the {what} contains {kind}; nothing was written");
+            return Ok(ExitCode::from(3));
+        }
+    }
+
+    let values: Vec<Vec<u8>> = passed.iter().map(|(_, v)| v.clone().into_bytes()).collect();
+    for (what, bytes) in [("output", &raw), ("screen", &screen)] {
+        if let Some(i) = leaks_value(bytes, &values) {
+            eprintln!(
+                "record_tail: REFUSED: the {what} contains the value of {}; nothing was written",
+                passed[i].0
+            );
             return Ok(ExitCode::from(3));
         }
     }
@@ -380,6 +443,51 @@ mod tests {
         assert!(looks_secret(b"?token=abcdefghij").is_some());
         assert!(looks_secret(b"the task-list and a disk-usage line, token= x").is_none());
         assert!(looks_secret(b"Bearer: none").is_none());
+    }
+
+    #[test]
+    fn a_login_prompt_is_found() {
+        assert!(login_prompt(b"You are not logged in. Login now?").is_some());
+        assert!(login_prompt(b"Opening Auth Portal").is_some());
+        assert!(login_prompt(b"Ready. Ask a question.").is_none());
+    }
+
+    #[test]
+    fn a_passed_value_in_the_output_is_refused() {
+        let values = vec![b"dummy-value-123".to_vec(), Vec::new()];
+        assert_eq!(leaks_value(b"x dummy-value-123 y", &values), Some(0));
+        assert_eq!(leaks_value(b"dummy-value-12", &values), None);
+        assert_eq!(leaks_value(b"nothing here", &values), None);
+        assert_eq!(leaks_value(b"anything", &[Vec::new()]), None);
+    }
+
+    #[test]
+    fn pass_env_takes_a_variable_name_only() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let ok = parse(&v(&[
+            "--out",
+            "d",
+            "--name",
+            "n",
+            "--pass-env",
+            "A_B1",
+            "--",
+            "sh",
+        ]))
+        .unwrap();
+        assert_eq!(ok.pass_env, vec!["A_B1".to_string()]);
+        assert!(parse(&v(&[
+            "--out",
+            "d",
+            "--name",
+            "n",
+            "--pass-env",
+            "A=b",
+            "--",
+            "sh"
+        ]))
+        .is_none());
+        assert!(parse(&v(&["--out", "d", "--name", "n", "--pass-env"])).is_none());
     }
 
     #[test]
