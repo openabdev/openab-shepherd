@@ -167,12 +167,12 @@ fn main() -> ExitCode {
             }));
             let handle = Some(native.clone());
             let mut shepherd = tools::Shepherd::with_policy(native, policy);
-            // Before the watchdog starts, so its nudges are recorded too.
+            // Before the routine starts, so its nudges are recorded too.
             if let Some(audit) = audit {
                 shepherd = shepherd.with_audit(audit);
             }
-            // No thread, and nothing to watch, when no profile sets a watchdog.
-            shepherd.spawn_watchdog();
+            // No thread, and nothing to watch, when no profile sets a routine.
+            shepherd.spawn_routine();
             (shepherd, handle)
         }
     };

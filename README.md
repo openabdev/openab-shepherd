@@ -31,12 +31,14 @@ which answers a permission dialog may receive.
   `bypass`). Caller-chosen commands are off
   unless the file sets `"allow_arbitrary_command": true`, and such panes never get
   a profile's environment. Without a profiles file, `start_pane` starts nothing.
-- **Watchdog (optional, per profile).** A profile's `watchdog` section makes
+- **Routine (optional, per profile).** A proactive in-process client for an
+  unattended agent that ends a turn with work left while no MCP client
+  supervises it (see [docs/routine.md](docs/routine.md)). A profile's `routine` section makes
   Shepherd check its panes every 5 s and type the profile's `nudge_text` —
   through the same path and refusal rules as `send_input` — when a pane's
   finished turn sits untouched for `idle_timeout_secs` and, when the profile
   sets `todo_file`, that file still has an unchecked item. At most
-  `max_consecutive_nudges` nudges go in without progress the watchdog did
+  `max_consecutive_nudges` nudges go in without progress the routine did
   not itself cause (the turns a nudge produces do not reset the count),
   a blocked pane is never nudged, and a pane whose lock another call holds
   is skipped for that check. A `nudge_text` that is a bare answer such as
@@ -134,6 +136,9 @@ Every variable, profile field, tool argument, error code and bound is described 
 
 How the operator signs in to the coding CLI or supplies its key is described in
 [docs/credentials.md](docs/credentials.md).
+
+The routine (a timer-driven nudge for unattended panes) is described in
+[docs/routine.md](docs/routine.md).
 
 Notes on using Shepherd from a human terminal client, including a proposed
 pairing with openab-pty, are in
