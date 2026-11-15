@@ -1,0 +1,14 @@
+{
+  "command": "opencode",
+  "ended_by": "--max-secs reached",
+  "gaps": 0,
+  "live_at_end": true,
+  "raw_bytes": 303590,
+  "status": {
+    "kind": "permission",
+    "state": "blocked"
+  },
+  "steps": 1,
+  "steps_done": 1,
+  "turn": 1
+}

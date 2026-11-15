@@ -47,6 +47,8 @@ mod tests_output_held;
 #[allow(clippy::duplicate_mod)]
 mod tests_readopt_held;
 #[cfg(test)]
+mod tests_replay_fixtures;
+#[cfg(test)]
 #[path = "tests_replay.rs"]
 #[allow(clippy::duplicate_mod)]
 mod tests_replay_held;

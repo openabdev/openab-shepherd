@@ -1,0 +1,20 @@
+
+          ⣀⣤⣤⣶⣶⣤⣤⣄⡀
+        ⢠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣄
+        ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄
+       ⢸⣿⣿⣿⣿⣿⣿⠁⢹⣿⠁⢹⣿⣿⣧        Welcome to Kiro CLI V3
+       ⢸⣿⣿⣿⣿⣿⣿⣄⣼⣿⣄⣼⣿⣿⣿        Learn more: https://kiro.dev/docs/cli/v3/
+       ⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+      ⢰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿        kiro-cli --v2   Launch the previous experience instead
+      ⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃
+        ⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁
+         ⠙⠛⠛⠛⠋⠁⠙⠛⠛⠉
+
+
+▸ What's new   ctrl+o to expand
+  Approve for me, cloud sessions, memory, local sandbox and specs.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+probe · claude-haiku-5.5 · thinking · medium · ◔ 3%                                                                          /home/user/scratches/replay-kiro
+
+›  ask a question or describe a task ↵

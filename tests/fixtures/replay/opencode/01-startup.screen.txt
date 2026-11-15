@@ -1,0 +1,119 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                  ▄
+                                                                                 █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█
+                                                                                 █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀
+                                                                                 ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀
+
+                                                                                        /update to install v2.3.0
+
+                                                               ┃
+                                                               ┃  Ask anything… "Fix broken tests"
+                                                               ┃
+                                                               ┃  Build · Big Pickle OpenCode
+                                                               ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                               /…/xxxxxxxxxxx…/T/replay-opencode.oAAorD  shift+tab agents  ctrl+p commands
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ⊙ 1 MCP failed /mcps  ⊙ 1 plugin failed /plugins                                                                                                                                               2.2.7
