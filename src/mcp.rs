@@ -147,16 +147,14 @@ fn call_tool(
         }
         return Ok(tool_result(Err(denied.to_tool_error())));
     }
-    let pending = match audit {
-        Some(audit) => match audit.before(caller.client(), name, &args) {
-            Ok(pending) => Some(pending),
-            Err(unavailable) => return Ok(tool_result(Err(unavailable.to_tool_error()))),
-        },
-        None => None,
-    };
+    if let Some(audit) = audit {
+        if let Err(unavailable) = audit.before(caller.client(), name, &args) {
+            return Ok(tool_result(Err(unavailable.to_tool_error())));
+        }
+    }
     let outcome = tools::call(sh, name, &args);
-    if let (Some(audit), Some(pending)) = (audit, pending) {
-        audit.after(caller.client(), name, &args, pending, &outcome);
+    if let Some(audit) = audit {
+        audit.after(caller.client(), name, &args, &outcome);
     }
     Ok(tool_result(outcome))
 }
@@ -938,7 +936,7 @@ mod issue4_pr1_mcp {
     }
 
     #[test]
-    fn the_intent_line_is_written_before_any_backend_call() {
+    fn the_call_line_is_written_before_any_backend_call() {
         let dir = TempDir::new("i4-order");
         for (tool, arguments) in state_changing(dir.path()) {
             let fake = dialog_fake();
@@ -948,8 +946,6 @@ mod issue4_pr1_mcp {
                     fake: fake.clone(),
                     seen: seen.clone(),
                 }),
-                0,
-                false,
                 fixed_clock(1_700_000_000),
             );
             let sh = shepherd(&fake, dir.path(), false).with_audit(Arc::new(audit));
@@ -958,20 +954,14 @@ mod issue4_pr1_mcp {
             assert!(!fake.calls().is_empty(), "{tool} did reach the backend");
             let seen = seen.lock().unwrap().clone();
             let first = &seen[0];
-            assert!(
-                first.0 == "intent" || first.0 == "call",
-                "{tool}: first line is {first:?}"
-            );
+            assert_eq!(first.0, "call", "{tool}: first line is {first:?}");
             assert_eq!(
                 first.1, 0,
                 "{tool}: the first line came after a backend call"
             );
-            if tool == "answer_dialog" || tool == "start_pane" {
-                assert_eq!(first.0, "intent", "{tool}");
-                let last = seen.last().unwrap();
-                assert_eq!(last.0, "outcome", "{tool}");
-                assert!(last.1 > 0, "{tool}: the outcome came before the work");
-            }
+            let last = seen.last().unwrap();
+            assert_eq!(last.0, "outcome", "{tool}");
+            assert!(last.1 > 0, "{tool}: the outcome came before the work");
         }
     }
 
@@ -1135,12 +1125,8 @@ mod issue4_pr1_mcp {
             );
         }
         // Names are fine, and the shape is one JSON object per line.
-        let mut last = 0;
         for line in bytes.lines() {
             let record: Value = serde_json::from_str(line).unwrap();
-            let seq = record["seq"].as_u64().unwrap();
-            assert!(seq > last);
-            last = seq;
             assert_eq!(record["client"], "legacy");
         }
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -1157,12 +1143,12 @@ mod issue4_pr1_mcp {
         let fake = idle_fake();
         let (audit, sink) = memory_audit();
         let sh = shepherd(&fake, dir.path(), true).with_audit(Arc::new(audit));
-        let caller = caller_with(&[Scope::Observe], &[]);
+        let caller = caller_with(&[Scope::Read], &[]);
         // Arguments that claim an identity change nothing.
         let out = run(
             &sh,
             &caller,
-            "get_status",
+            "read_output",
             json!({"terminal": "work", "client": "root", "actor": "system:watchdog"}),
         );
         assert_eq!(out["isError"], false, "{out}");
