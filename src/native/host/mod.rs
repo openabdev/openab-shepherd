@@ -10,21 +10,20 @@
 //! (`n:N`), so the id means the same to anyone who later reaches the same
 //! host.
 
-#[cfg_attr(not(test), allow(dead_code))] // the `hold` subcommand uses it (PR6)
 pub(super) mod client;
 #[cfg(test)]
 mod contract;
+pub(super) mod front;
 #[cfg(test)]
 pub(super) mod held;
 pub(super) mod local;
 pub(super) mod procs;
 pub(super) mod pty;
-#[cfg_attr(not(test), allow(dead_code))] // the `hold` subcommand uses it (PR6)
 pub(super) mod server;
+pub(super) mod supervisor;
 pub(super) mod tail;
 #[cfg(test)]
 pub(super) mod tests_link;
-#[cfg_attr(not(test), allow(dead_code))] // used by the client and the server
 pub(super) mod wire;
 
 use crate::backend::BackendError;

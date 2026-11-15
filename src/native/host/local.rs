@@ -139,7 +139,6 @@ impl LocalHost {
 
     /// A host that keeps the last `cap` bytes of each pane's output, for the
     /// holder (with [`super::tail::TAIL_CAP`]) and for tests.
-    #[cfg_attr(not(test), allow(dead_code))] // the holder uses it later
     pub(crate) fn with_tail(cap: usize) -> Self {
         Self {
             tail_cap: Some(cap),

@@ -10,7 +10,6 @@
 use std::collections::VecDeque;
 
 /// The size of a pane's tail in a host that keeps one.
-#[cfg_attr(not(test), allow(dead_code))] // the holder enables the ring with it later
 pub(crate) const TAIL_CAP: usize = 1024 * 1024;
 
 pub(crate) struct TailRing {

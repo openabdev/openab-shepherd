@@ -37,6 +37,7 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
+    #[cfg_attr(not(test), allow(dead_code))] // the contract tests build frames with it
     pub(crate) fn new(header: Value, payload: Vec<u8>) -> Self {
         Self { header, payload }
     }
