@@ -15,6 +15,7 @@ mod contract;
 pub(super) mod local;
 pub(super) mod procs;
 pub(super) mod pty;
+pub(super) mod tail;
 
 use crate::backend::BackendError;
 use std::ffi::OsString;
@@ -25,6 +26,10 @@ use std::time::Duration;
 /// How long a stop gives a pane's processes to exit after SIGHUP and SIGTERM
 /// before SIGKILL.
 pub(crate) const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// The most bytes of opaque metadata a pane's `meta` holds. The front's own
+/// blob is a kilobyte or two; this only bounds a bug.
+pub(crate) const META_CAP: usize = 64 * 1024;
 
 /// What to start: a non-empty argv, an absolute working directory, and
 /// exactly the child's environment.
@@ -60,6 +65,19 @@ pub(crate) struct HostPane {
     pub rows: u16,
     /// The leader has exited (the pane stays listed until `kill` or `forget`).
     pub exited: bool,
+}
+
+/// What a host that keeps a tail hands a front that starts later: the offsets
+/// of the bytes it still has and the bytes themselves, read together so they
+/// describe the same moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // adoption uses it next
+pub(crate) struct Attached {
+    /// Offset of the first byte in `bytes`; 0 means nothing was dropped.
+    pub tail_start: u64,
+    /// Offset after the last byte in `bytes`.
+    pub tail_end: u64,
+    pub bytes: Vec<u8>,
 }
 
 /// The process half. Every method names its pane by the id [`spawn`] gave.
@@ -106,6 +124,21 @@ pub(crate) trait PtyHost: Send + Sync {
 
     /// End every pane, as a clean shutdown does: one shared grace for all.
     fn end_all(&self);
+
+    /// The pane's tail with its offsets, atomically. `NotFound` for an
+    /// unknown id, `Unsupported` for a host that keeps no tail.
+    #[cfg_attr(not(test), allow(dead_code))] // adoption uses it next
+    fn attach(&self, id: &str) -> io::Result<Attached>;
+
+    /// Replace the pane's metadata: opaque bytes the host never reads, at
+    /// most [`META_CAP`]. It lives as long as the pane, so it survives the
+    /// front, and is returned unchanged by `meta_get`.
+    #[cfg_attr(not(test), allow(dead_code))] // the front's meta store uses it
+    fn meta_set(&self, id: &str, bytes: &[u8]) -> io::Result<()>;
+
+    /// The pane's metadata; empty when none was set.
+    #[cfg_attr(not(test), allow(dead_code))] // adoption uses it next
+    fn meta_get(&self, id: &str) -> io::Result<Vec<u8>>;
 
     /// Whether panes outlive the process that asked for them.
     fn survives_restart(&self) -> bool;
