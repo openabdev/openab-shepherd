@@ -61,7 +61,7 @@ pub fn handle_message_as(sh: &Shepherd, caller: &Caller, message: &Value) -> Opt
 /// tools themselves run unchanged. Not compiled into the server.
 #[cfg(test)]
 pub fn handle_message(sh: &Shepherd, message: &Value) -> Option<Value> {
-    handle_message_as(sh, &Caller::legacy(), message)
+    handle_message_as(sh, &Caller::default_client(), message)
 }
 
 fn dispatch(
@@ -663,14 +663,14 @@ mod issue4_pr1_mcp {
         ] {
             let reply = handle_message_as(
                 &sh,
-                &Caller::legacy(),
+                &Caller::default_client(),
                 &msg(name, json!({"terminal": "work", "text": "x"})),
             )
             .unwrap();
             assert_eq!(reply["error"]["code"], -32602, "{name:?}: {reply}");
         }
         // An empty name is a malformed request, not a call.
-        let reply = handle_message_as(&sh, &Caller::legacy(), &msg("", json!({}))).unwrap();
+        let reply = handle_message_as(&sh, &Caller::default_client(), &msg("", json!({}))).unwrap();
         assert!(reply.get("error").is_some(), "{reply}");
         assert!(fake.calls().is_empty());
     }
@@ -750,7 +750,7 @@ mod issue4_pr1_mcp {
         let sh = shepherd(&fake, dir.path(), false);
         let out = run(
             &sh,
-            &Caller::legacy(),
+            &Caller::default_client(),
             "start_pane",
             json!({"argv": ["true"]}),
         );
@@ -828,8 +828,8 @@ mod issue4_pr1_mcp {
         let sh = shepherd(&fake, dir.path(), true);
         let caller = caller_with(&[Scope::Observe], &[]);
         let call = msg("remove_pane", json!({"terminal": "work"}));
-        // A batch, even of one call, even as a legacy caller.
-        for who in [&caller, &Caller::legacy()] {
+        // A batch, even of one call, even as the default caller.
+        for who in [&caller, &Caller::default_client()] {
             let reply = handle_message_as(&sh, who, &json!([call.clone(), call.clone()])).unwrap();
             assert_eq!(reply["error"]["code"], -32600, "{reply}");
             let reply = handle_message_as(&sh, who, &json!([])).unwrap();
@@ -850,16 +850,16 @@ mod issue4_pr1_mcp {
         ] {
             let message = json!({"jsonrpc": "2.0", "id": 1, "method": method,
                 "params": {"name": "remove_pane", "arguments": {"terminal": "work"}}});
-            let reply = handle_message_as(&sh, &Caller::legacy(), &message).unwrap();
+            let reply = handle_message_as(&sh, &Caller::default_client(), &message).unwrap();
             assert_eq!(reply["error"]["code"], -32601, "{method:?}: {reply}");
         }
         // A tools/call that is a notification (no id) gets no reply and no call.
         let notification = json!({"jsonrpc": "2.0", "method": "tools/call",
             "params": {"name": "remove_pane", "arguments": {"terminal": "work"}}});
-        assert!(handle_message_as(&sh, &Caller::legacy(), &notification).is_none());
+        assert!(handle_message_as(&sh, &Caller::default_client(), &notification).is_none());
         // A reply-shaped message is ignored.
         let reply_like = json!({"jsonrpc": "2.0", "id": 1, "result": {"name": "remove_pane"}});
-        assert!(handle_message_as(&sh, &Caller::legacy(), &reply_like).is_none());
+        assert!(handle_message_as(&sh, &Caller::default_client(), &reply_like).is_none());
         assert!(fake.calls().is_empty(), "{:?}", fake.calls());
         // Malformed params never reach a tool either.
         for params in [
@@ -871,19 +871,19 @@ mod issue4_pr1_mcp {
         ] {
             let message =
                 json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params});
-            let reply = handle_message_as(&sh, &Caller::legacy(), &message).unwrap();
+            let reply = handle_message_as(&sh, &Caller::default_client(), &message).unwrap();
             assert!(reply.get("error").is_some(), "{params}: {reply}");
         }
         assert!(fake.calls().is_empty());
     }
 
     #[test]
-    fn the_legacy_caller_sees_every_tool_and_the_old_wrapper_agrees() {
-        let dir = TempDir::new("i4-legacy");
+    fn the_default_caller_sees_every_tool_and_the_old_wrapper_agrees() {
+        let dir = TempDir::new("i4-default");
         let fake = idle_fake();
         let sh = shepherd(&fake, dir.path(), true);
         let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
-        let reply = handle_message_as(&sh, &Caller::legacy(), &list).unwrap();
+        let reply = handle_message_as(&sh, &Caller::default_client(), &list).unwrap();
         let names: Vec<&str> = reply["result"]["tools"]
             .as_array()
             .unwrap()
@@ -893,9 +893,9 @@ mod issue4_pr1_mcp {
         assert_eq!(names, tools::TOOL_NAMES);
         assert_eq!(handle_message(&sh, &list), Some(reply));
         // Every tool the old suites call is allowed for it, whatever the args.
-        let dir2 = TempDir::new("i4-legacy-table");
+        let dir2 = TempDir::new("i4-default-table");
         for (tool, arguments, _) in table(dir2.path()) {
-            let out = run(&sh, &Caller::legacy(), tool, arguments);
+            let out = run(&sh, &Caller::default_client(), tool, arguments);
             assert_ne!(code(&out), "forbidden", "{tool}: {out}");
         }
     }
@@ -949,7 +949,7 @@ mod issue4_pr1_mcp {
                 fixed_clock(1_700_000_000),
             );
             let sh = shepherd(&fake, dir.path(), false).with_audit(Arc::new(audit));
-            let out = run(&sh, &Caller::legacy(), tool, arguments);
+            let out = run(&sh, &Caller::default_client(), tool, arguments);
             assert_ne!(code(&out), "audit_unavailable", "{tool}");
             assert!(!fake.calls().is_empty(), "{tool} did reach the backend");
             let seen = seen.lock().unwrap().clone();
@@ -971,7 +971,7 @@ mod issue4_pr1_mcp {
         for (tool, arguments) in state_changing(dir.path()) {
             let fake = dialog_fake();
             let sh = shepherd(&fake, dir.path(), false).with_audit(Arc::new(failing_audit()));
-            let out = run(&sh, &Caller::legacy(), tool, arguments);
+            let out = run(&sh, &Caller::default_client(), tool, arguments);
             assert_eq!(out["isError"], true, "{tool}");
             assert_eq!(code(&out), "audit_unavailable", "{tool}: {out}");
             let state = fake.state.lock().unwrap();
@@ -990,7 +990,7 @@ mod issue4_pr1_mcp {
         ] {
             let fake = idle_fake();
             let sh = shepherd(&fake, dir.path(), false).with_audit(Arc::new(failing_audit()));
-            let out = run(&sh, &Caller::legacy(), tool, arguments);
+            let out = run(&sh, &Caller::default_client(), tool, arguments);
             assert_eq!(out["isError"], false, "{tool}: {out}");
         }
         // interrupt_pane reaches the backend (the fake does not implement it,
@@ -999,7 +999,7 @@ mod issue4_pr1_mcp {
         let sh = shepherd(&fake, dir.path(), false).with_audit(Arc::new(failing_audit()));
         let out = run(
             &sh,
-            &Caller::legacy(),
+            &Caller::default_client(),
             "interrupt_pane",
             json!({"terminal": "work"}),
         );
@@ -1049,7 +1049,7 @@ mod issue4_pr1_mcp {
             )
         };
         let (sh, fake) = sh_idle;
-        let who = Caller::legacy();
+        let who = Caller::default_client();
         // Typed text.
         let out = run(
             &sh,
@@ -1127,7 +1127,7 @@ mod issue4_pr1_mcp {
         // Names are fine, and the shape is one JSON object per line.
         for line in bytes.lines() {
             let record: Value = serde_json::from_str(line).unwrap();
-            assert_eq!(record["client"], "legacy");
+            assert_eq!(record["client"], "default");
         }
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);

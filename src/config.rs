@@ -73,9 +73,9 @@ impl fmt::Display for AllowedHost {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// The legacy bearer token; empty when a clients file is set without one.
+    /// The single bearer token; empty when a clients file is set.
     pub token: String,
-    /// Who may call: the clients file, or the legacy token as client `legacy`.
+    /// Who may call: the clients file, or the single token as client `default`.
     pub clients: Clients,
     /// `OPENAB_SHEPHERD_AUDIT_FILE`; the binary opens it. Always set when a
     /// clients file is.
@@ -202,9 +202,9 @@ fn non_empty(value: Option<String>) -> Option<String> {
 }
 
 /// The token(s), the clients and the audit path. Without a clients file this is
-/// today's single token, as client `legacy`. With one, the audit path is
-/// required, `OPENAB_SHEPHERD_TOKEN` is refused, and a legacy token file is
-/// refused unless the clients file sets `allow_legacy_token`.
+/// today's single token, as client `default`. With one, the audit path is
+/// required and both token variables are a startup error: a token beside a
+/// clients file would hold every scope and undo the narrower tokens.
 fn load_identity<F>(
     lookup: &F,
     project_dir: &Path,
@@ -220,13 +220,15 @@ where
     }
     let Some(clients_path) = non_empty(lookup(CLIENTS_ENV)) else {
         let token = load_token(lookup, project_dir)?;
-        let clients = Clients::legacy_only(&token);
+        let clients = Clients::single_token(&token);
         return Ok((token, clients, audit_file));
     };
-    if non_empty(lookup(TOKEN_ENV)).is_some() {
-        return Err(ConfigError(format!(
-            "{TOKEN_ENV} cannot be used beside {CLIENTS_ENV}: put the token in the clients file, or use {TOKEN_FILE_ENV} with \"allow_legacy_token\": true"
-        )));
+    for var in [TOKEN_ENV, TOKEN_FILE_ENV] {
+        if non_empty(lookup(var)).is_some() {
+            return Err(ConfigError(format!(
+                "{var} cannot be used beside {CLIENTS_ENV}: unset {var} and give the client its own entry (token_sha256) in the clients file, or unset {CLIENTS_ENV} to use the single token as client \"default\""
+            )));
+        }
     }
     if audit_file.is_none() {
         return Err(ConfigError(format!(
@@ -234,12 +236,7 @@ where
         )));
     }
     let clients = Clients::load(Path::new(&clients_path), project_dir)?;
-    if non_empty(lookup(TOKEN_FILE_ENV)).is_none() {
-        return Ok((String::new(), clients, audit_file));
-    }
-    let token = load_token(lookup, project_dir)?;
-    let clients = clients.with_legacy_token(&token)?;
-    Ok((token, clients, audit_file))
+    Ok((String::new(), clients, audit_file))
 }
 
 fn load_token<F>(lookup: &F, project_dir: &Path) -> Result<String, ConfigError>
@@ -737,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn without_a_clients_file_the_token_is_client_legacy() {
+    fn without_a_clients_file_the_token_is_client_default() {
         let dir = TempDir::new("legacy-clients");
         let config = load_config(
             env_from(&[(TOKEN_ENV, GOOD_TOKEN)]),
@@ -746,7 +743,7 @@ mod tests {
             dir.path(),
         )
         .unwrap();
-        assert_eq!(config.clients, Clients::legacy_only(GOOD_TOKEN));
+        assert_eq!(config.clients, Clients::single_token(GOOD_TOKEN));
         assert_eq!(config.audit_file, None);
     }
 
@@ -781,12 +778,11 @@ mod tests {
         ])
         .unwrap();
         assert!(config.token.is_empty());
-        assert!(!config.clients.has_legacy());
     }
 }
 
 /// Issue #4, PR 1: the startup checks for the clients file, the audit path and
-/// the legacy token beside it. Run with `cargo test issue4_pr1`.
+/// the single token. Run with `cargo test issue4_pr1`.
 #[cfg(test)]
 mod issue4_pr1_loader {
     use super::*;
@@ -908,50 +904,22 @@ mod issue4_pr1_loader {
     }
 
     #[test]
-    fn a_legacy_token_file_beside_a_clients_file_needs_the_flag() {
+    fn a_token_file_or_env_beside_a_clients_file_is_a_startup_error_naming_the_fix() {
         let dir = TempDir::new("i4-loader-legacy");
         let project = TempDir::new("i4-loader-project");
         let token = write(dir.path(), "token", &format!("{LEGACY}\n"), 0o600);
         let plain = write(dir.path(), "c.json", &file(json!([client("a")])), 0o600);
-        let err = load(&plain, project.path(), &[(TOKEN_FILE_ENV, token.as_str())]).unwrap_err();
-        assert!(err.0.contains("allow_legacy_token"), "{err}");
-        let flagged = write(
-            dir.path(),
-            "f.json",
-            &json!({"version": 1, "allow_legacy_token": true, "clients": [client("a")]})
-                .to_string(),
-            0o600,
-        );
-        let config = load(
-            &flagged,
-            project.path(),
-            &[(TOKEN_FILE_ENV, token.as_str())],
-        )
-        .unwrap();
-        assert!(config.clients.has_legacy());
+        for (var, value) in [(TOKEN_FILE_ENV, token.as_str()), (TOKEN_ENV, LEGACY)] {
+            let err = load(&plain, project.path(), &[(var, value)]).unwrap_err();
+            assert!(err.0.contains(var), "{err}");
+            assert!(err.0.contains("token_sha256"), "{err}");
+            assert!(err.0.contains(CLIENTS_ENV), "{err}");
+            assert!(!err.0.contains(LEGACY), "the token is not echoed: {err}");
+        }
+        // The clients file alone adds no default client.
+        let config = load(&plain, project.path(), &[]).unwrap();
         let header = format!("Bearer {LEGACY}");
-        let caller = config.clients.authenticate(Some(&header), 0).unwrap();
-        assert_eq!(caller.client(), "legacy");
-        // The flag without a token file adds no legacy token.
-        let config = load(&flagged, project.path(), &[]).unwrap();
-        assert!(!config.clients.has_legacy());
         assert!(config.clients.authenticate(Some(&header), 0).is_err());
-    }
-
-    #[test]
-    fn the_token_in_the_environment_is_refused_beside_a_clients_file_even_with_the_flag() {
-        let dir = TempDir::new("i4-loader-env");
-        let project = TempDir::new("i4-loader-project");
-        let flagged = write(
-            dir.path(),
-            "f.json",
-            &json!({"version": 1, "allow_legacy_token": true, "clients": [client("a")]})
-                .to_string(),
-            0o600,
-        );
-        let err = load(&flagged, project.path(), &[(TOKEN_ENV, LEGACY)]).unwrap_err();
-        assert!(err.0.contains(TOKEN_ENV), "{err}");
-        assert!(!err.0.contains(LEGACY), "the token is not echoed: {err}");
     }
 
     #[test]
@@ -985,7 +953,7 @@ mod issue4_pr1_loader {
         assert_eq!(config.audit_file, None);
         let header = format!("Bearer {LEGACY}");
         let caller = config.clients.authenticate(Some(&header), 0).unwrap();
-        assert_eq!(caller.client(), "legacy");
+        assert_eq!(caller.client(), "default");
         for scope in Scope::ALL {
             assert!(caller.has(scope), "{scope}");
         }

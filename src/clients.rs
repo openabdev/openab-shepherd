@@ -12,9 +12,15 @@
 //! is denied. Client policy only narrows what the server and the profile
 //! already allow: `start:arbitrary` does not turn on `allow_arbitrary_command`.
 //!
+//! The file is read once at startup. A key repeated inside one JSON object
+//! follows `serde_json`: the last value wins.
+//!
+//! Without a clients file, the single bearer token is the client `default`
+//! with every scope. With one, a token file or env token is a startup error
+//! (see `config.rs`).
+//!
 //! Not here yet (later phases of issue #4): pane ownership, reload without a
-//! restart, `dialog:deny`, a token CLI. [`Caller::pane_policy`] is the seam
-//! for the ownership work.
+//! restart, `dialog:deny`, a token CLI.
 
 use crate::config::{check_outside_repo, ConfigError};
 use crate::tools::{Args, ToolError};
@@ -24,33 +30,24 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 /// The path of the clients file.
 pub const CLIENTS_ENV: &str = "OPENAB_SHEPHERD_CLIENTS";
-/// The id of the client made from the single legacy token.
-pub const LEGACY_ID: &str = "legacy";
-/// Printed at startup when a legacy token runs beside a clients file.
-pub const LEGACY_WARNING: &str =
-    "the legacy token is accepted beside the clients file (allow_legacy_token): it holds every scope";
+/// The id of the client made from the single bearer token (no clients file).
+pub const DEFAULT_ID: &str = "default";
 pub const TOKEN_PREFIX: &str = "osh_";
 const SECRET_HEX_LEN: usize = 64;
 const MAX_ID_LEN: usize = 32;
 const MAX_TOKEN_LEN: usize = TOKEN_PREFIX.len() + MAX_ID_LEN + 1 + SECRET_HEX_LEN;
-/// Longest bearer value hashed at all. A legacy token may be longer than an
-/// `osh_` token (the legacy loader only sets a minimum), so this is generous.
+/// Longest bearer value hashed at all. The single token may be longer than an
+/// `osh_` token (its loader only sets a minimum), so this is generous.
 const MAX_BEARER_LEN: usize = 4096;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
-const MAX_CLIENTS: usize = 256;
-const MAX_PROFILES: usize = 64;
 const MAX_PROFILE_LEN: usize = 128;
 /// Longest piece of a claimed id that an authentication failure reports.
 pub const ID_PREFIX_LEN: usize = 16;
-/// Compared against when the id is unknown, so the id's existence does not
-/// show in the time a lookup takes.
-const DUMMY_DIGEST: [u8; 32] = [0x5a; 32];
-
 /// What a client may do. Nothing implies anything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
@@ -107,7 +104,7 @@ impl fmt::Display for Scope {
 /// The launch profiles a client may start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileAccess {
-    /// Any profile: the legacy client only.
+    /// Any profile: the `default` client only.
     Any,
     /// Exactly these; an empty list allows none.
     Only(Vec<String>),
@@ -122,7 +119,7 @@ impl ProfileAccess {
     }
 }
 
-/// One record of the clients file, or the legacy client.
+/// One record of the clients file, or the `default` client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Client {
     pub id: String,
@@ -133,19 +130,12 @@ pub struct Client {
     pub expires: Option<u64>,
 }
 
-/// Per-pane limits of a client. Empty in PR 1: pane ownership (`own` or
-/// `all`) and a live-pane cap arrive here later, without a change to the
-/// signature of anything that takes a [`Caller`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PanePolicy {}
-
 /// Who is calling: the matched client, never anything the request claims.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
     client: String,
     scopes: BTreeSet<Scope>,
     profiles: ProfileAccess,
-    pane_policy: PanePolicy,
 }
 
 impl Caller {
@@ -158,13 +148,12 @@ impl Caller {
             client: client.into(),
             scopes: scopes.into_iter().collect(),
             profiles,
-            pane_policy: PanePolicy::default(),
         }
     }
 
     /// The caller of a deployment with one token: every scope, any profile.
-    pub fn legacy() -> Self {
-        Self::new(LEGACY_ID, Scope::ALL, ProfileAccess::Any)
+    pub fn default_client() -> Self {
+        Self::new(DEFAULT_ID, Scope::ALL, ProfileAccess::Any)
     }
 
     fn from_client(client: &Client) -> Self {
@@ -172,7 +161,6 @@ impl Caller {
             client: client.id.clone(),
             scopes: client.scopes.clone(),
             profiles: client.profiles.clone(),
-            pane_policy: PanePolicy::default(),
         }
     }
 
@@ -186,11 +174,6 @@ impl Caller {
 
     pub fn has(&self, scope: Scope) -> bool {
         self.scopes.contains(&scope)
-    }
-
-    /// The seam for per-pane policy (ownership, limits). Nothing reads it yet.
-    pub fn pane_policy(&self) -> &PanePolicy {
-        &self.pane_policy
     }
 
     /// Whether `tools/list` should show `tool` to this caller. A convenience
@@ -308,39 +291,18 @@ pub struct AuthFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clients {
     clients: Vec<Client>,
-    legacy: Option<Client>,
-    allow_legacy_token: bool,
+    /// The single bearer token as client `default`; set only without a
+    /// clients file.
+    single: Option<Client>,
 }
 
 impl Clients {
-    /// A deployment with the single legacy token and no clients file.
-    pub fn legacy_only(token: &str) -> Self {
+    /// A deployment with one token and no clients file: client `default`.
+    pub fn single_token(token: &str) -> Self {
         Self {
             clients: Vec::new(),
-            legacy: Some(legacy_client(token)),
-            allow_legacy_token: false,
+            single: Some(default_client(token)),
         }
-    }
-
-    /// Add the legacy token to a clients file's table. Refused unless the
-    /// file says `"allow_legacy_token": true`: the legacy token holds every
-    /// scope, so it would undo the narrower tokens.
-    pub fn with_legacy_token(mut self, token: &str) -> Result<Self, ConfigError> {
-        if !self.allow_legacy_token {
-            return Err(ConfigError(format!(
-                "a legacy token is set beside {CLIENTS_ENV}: remove it, or set \"allow_legacy_token\": true in the clients file"
-            )));
-        }
-        self.legacy = Some(legacy_client(token));
-        Ok(self)
-    }
-
-    pub fn allow_legacy_token(&self) -> bool {
-        self.allow_legacy_token
-    }
-
-    pub fn has_legacy(&self) -> bool {
-        self.legacy.is_some()
     }
 
     pub fn clients(&self) -> &[Client] {
@@ -349,7 +311,7 @@ impl Clients {
 
     /// Read and validate the clients file. The path is resolved first, must be
     /// outside the project folder and every git repository, a regular file
-    /// owned by this user, with no group or other bits (it holds hashes).
+    /// with no group or other bits (it holds hashes).
     pub fn load(path: &Path, project_dir: &Path) -> Result<Self, ConfigError> {
         let canonical = fs::canonicalize(path)
             .map_err(|err| ConfigError(format!("cannot read clients file: {err}")))?;
@@ -359,8 +321,7 @@ impl Clients {
         let meta = file
             .metadata()
             .map_err(|err| ConfigError(format!("cannot read clients file: {err}")))?;
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        check_file_meta(&meta, unsafe { libc::geteuid() })?;
+        check_file_meta(&meta)?;
         let mut text = String::new();
         (&mut file)
             .take(MAX_FILE_BYTES + 1)
@@ -376,30 +337,22 @@ impl Clients {
         }
         let root: Value = serde_json::from_str(text)
             .map_err(|e| err(&format!("clients file is not valid JSON: {e}")))?;
-        reject_duplicate_keys(text)?;
         let root = root
             .as_object()
             .ok_or_else(|| err("clients file must be a JSON object"))?;
-        known_keys(
-            root,
-            &["version", "allow_legacy_token", "clients"],
-            "clients file",
-        )?;
+        if root.contains_key("allow_legacy_token") {
+            return Err(err(
+                "clients file: allow_legacy_token was removed; delete it. To use a single token, unset OPENAB_SHEPHERD_CLIENTS; to keep the clients file, put each token's SHA-256 in it",
+            ));
+        }
+        known_keys(root, &["version", "clients"], "clients file")?;
         if root.get("version").and_then(Value::as_u64) != Some(1) {
             return Err(err("clients file: version must be 1"));
         }
-        let allow_legacy_token = match root.get("allow_legacy_token") {
-            None => false,
-            Some(Value::Bool(flag)) => *flag,
-            Some(_) => return Err(err("allow_legacy_token must be true or false")),
-        };
         let list = root
             .get("clients")
             .and_then(Value::as_array)
             .ok_or_else(|| err("clients file: clients must be an array"))?;
-        if list.len() > MAX_CLIENTS {
-            return Err(err(&format!("at most {MAX_CLIENTS} clients")));
-        }
         let mut clients: Vec<Client> = Vec::new();
         for (index, item) in list.iter().enumerate() {
             let client = parse_client(item, index)?;
@@ -410,33 +363,26 @@ impl Clients {
         }
         Ok(Self {
             clients,
-            legacy: None,
-            allow_legacy_token,
+            single: None,
         })
     }
 
     /// Authenticate an `Authorization` header value (`Bearer <token>`).
     /// `now` is Unix seconds, from the caller's clock.
     pub fn authenticate(&self, header: Option<&str>, now: u64) -> Result<Caller, AuthFailure> {
-        self.check(header, now).0
-    }
-
-    /// [`Clients::authenticate`], plus how many digest compares ran, so a test
-    /// can show that an unknown id costs the same as a known one.
-    fn check(&self, header: Option<&str>, now: u64) -> (Result<Caller, AuthFailure>, usize) {
         let fail = |reason: &'static str, id_prefix: String| AuthFailure { reason, id_prefix };
         let Some(header) = header else {
-            return (Err(fail("missing", String::new())), 0);
+            return Err(fail("missing", String::new()));
         };
         let Some(token) = header.strip_prefix("Bearer ") else {
-            return (Err(fail("malformed", String::new())), 0);
+            return Err(fail("malformed", String::new()));
         };
         if token.is_empty() || token.len() > MAX_BEARER_LEN {
-            return (Err(fail("malformed", String::new())), 0);
+            return Err(fail("malformed", String::new()));
         }
         let digest = sha256(token.as_bytes());
         // Only an `osh_` token has a bounded shape; a longer value can still be
-        // the legacy token, so it skips the id lookup instead of failing here.
+        // the single token, so it skips the id lookup instead of failing here.
         let claimed = if token.len() > MAX_TOKEN_LEN {
             None
         } else {
@@ -444,20 +390,15 @@ impl Clients {
         };
         let id_prefix = claimed.map(id_prefix).unwrap_or_default();
         let record = claimed.and_then(|id| self.clients.iter().find(|c| c.id == id));
-        let expected = record.map_or(&DUMMY_DIGEST, |c| &c.token_sha256);
-        let mut compares = 1;
-        let matched = digest_eq(&digest, expected) && record.is_some();
-        if matched {
-            let client = record.expect("matched implies a record");
+        if let Some(client) = record.filter(|c| digest_eq(&digest, &c.token_sha256)) {
             if client.expires.is_some_and(|expires| now >= expires) {
-                return (Err(fail("expired", id_prefix)), compares);
+                return Err(fail("expired", id_prefix));
             }
-            return (Ok(Caller::from_client(client)), compares);
+            return Ok(Caller::from_client(client));
         }
-        if let Some(legacy) = &self.legacy {
-            compares += 1;
-            if digest_eq(&digest, &legacy.token_sha256) {
-                return (Ok(Caller::from_client(legacy)), compares);
+        if let Some(single) = &self.single {
+            if digest_eq(&digest, &single.token_sha256) {
+                return Ok(Caller::from_client(single));
             }
         }
         let reason = match (claimed, record) {
@@ -465,61 +406,13 @@ impl Clients {
             (Some(_), None) => "unknown_id",
             (Some(_), Some(_)) => "bad_secret",
         };
-        (Err(fail(reason, id_prefix)), compares)
+        Err(fail(reason, id_prefix))
     }
 }
 
-/// Fail on a key repeated inside one JSON object (serde_json keeps the last).
-/// The text has already parsed as JSON, so this only tracks nesting and strings.
-fn reject_duplicate_keys(text: &str) -> Result<(), ConfigError> {
-    // One entry per open container: Some(keys seen, next string is a key) for an object.
-    let mut stack: Vec<Option<(BTreeSet<String>, bool)>> = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => stack.push(Some((BTreeSet::new(), true))),
-            b'[' => stack.push(None),
-            b'}' | b']' => {
-                stack.pop();
-            }
-            b',' => {
-                if let Some(Some((_, expect_key))) = stack.last_mut() {
-                    *expect_key = true;
-                }
-            }
-            b'"' => {
-                let start = i;
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                if let Some(Some((keys, expect_key))) = stack.last_mut() {
-                    if *expect_key {
-                        *expect_key = false;
-                        let key: String = serde_json::from_str(
-                            &text[start..=i.min(bytes.len() - 1)],
-                        )
-                        .map_err(|e| err(&format!("clients file is not valid JSON: {e}")))?;
-                        if !keys.insert(key.clone()) {
-                            return Err(err(&format!("clients file: duplicate key {key:?}")));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    Ok(())
-}
-
-fn legacy_client(token: &str) -> Client {
+fn default_client(token: &str) -> Client {
     Client {
-        id: LEGACY_ID.to_string(),
+        id: DEFAULT_ID.to_string(),
         token_sha256: sha256(token.as_bytes()),
         scopes: Scope::ALL.into_iter().collect(),
         profiles: ProfileAccess::Any,
@@ -545,15 +438,10 @@ fn known_keys(
     }
 }
 
-/// The file's own rules, given the user it must belong to.
-fn check_file_meta(meta: &fs::Metadata, euid: u32) -> Result<(), ConfigError> {
+/// The file's own rules: a regular file with no group or other bits.
+fn check_file_meta(meta: &fs::Metadata) -> Result<(), ConfigError> {
     if !meta.is_file() {
         return Err(err("clients file must be a regular file"));
-    }
-    if meta.uid() != euid {
-        return Err(err(
-            "clients file must be owned by the user running Shepherd",
-        ));
     }
     if meta.permissions().mode() & 0o077 != 0 {
         return Err(err(
@@ -588,9 +476,6 @@ fn parse_client(item: &Value, index: usize) -> Result<Client, ConfigError> {
             "id must be 1 to {MAX_ID_LEN} characters of a-z, 0-9 and '-'"
         )));
     }
-    if id == LEGACY_ID {
-        return Err(at("the id \"legacy\" is reserved"));
-    }
     let hash = object
         .get("token_sha256")
         .and_then(Value::as_str)
@@ -617,9 +502,6 @@ fn parse_client(item: &Value, index: usize) -> Result<Client, ConfigError> {
     let profiles = match object.get("profiles") {
         None => Vec::new(),
         Some(Value::Array(list)) => {
-            if list.len() > MAX_PROFILES {
-                return Err(at(&format!("at most {MAX_PROFILES} profiles")));
-            }
             let mut names: Vec<String> = Vec::new();
             for name in list {
                 let name = name
@@ -838,26 +720,26 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tool_is_denied_even_for_the_legacy_caller() {
-        let denied = authorize(&Caller::legacy(), "format_disk", &Args::new()).unwrap_err();
+    fn unknown_tool_is_denied_even_for_the_default_caller() {
+        let denied = authorize(&Caller::default_client(), "format_disk", &Args::new()).unwrap_err();
         assert_eq!(denied.scope, None);
         assert_eq!(denied.to_tool_error().data["error"], "forbidden");
     }
 
     #[test]
-    fn legacy_caller_holds_every_scope_and_any_profile() {
-        let legacy = Caller::legacy();
-        assert_eq!(legacy.client(), "legacy");
+    fn default_caller_holds_every_scope_and_any_profile() {
+        let caller = Caller::default_client();
+        assert_eq!(caller.client(), "default");
         for tool in TOOL_NAMES {
             assert!(
-                authorize(&legacy, tool, &sample_args(tool)).is_ok(),
+                authorize(&caller, tool, &sample_args(tool)).is_ok(),
                 "{tool}"
             );
         }
         let arbitrary = args(json!({"argv": ["ls"]}));
-        assert!(authorize(&legacy, "start_pane", &arbitrary).is_ok());
+        assert!(authorize(&caller, "start_pane", &arbitrary).is_ok());
         let other = args(json!({"profile": "anything"}));
-        assert!(authorize(&legacy, "start_pane", &other).is_ok());
+        assert!(authorize(&caller, "start_pane", &other).is_ok());
     }
 
     #[test]
@@ -934,7 +816,6 @@ mod tests {
         assert!(caller.may_list("start_pane"));
         assert!(!caller.may_list("answer_dialog"));
         assert!(!caller.may_list("nope"));
-        assert_eq!(caller.pane_policy(), &PanePolicy::default());
     }
 
     // ---- authenticate ----
@@ -984,30 +865,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_id_costs_the_same_compares_as_a_known_one() {
-        let t = table();
-        let (_, known) = t.check(Some(&bearer(&token("alice", SECRET_A))), 5);
-        let (_, unknown) = t.check(Some(&bearer(&token("mallory", SECRET_A))), 5);
-        assert_eq!(known, 1);
-        assert_eq!(unknown, known);
-        let with_legacy = Clients::parse(&file_text(json!([client_json(
-            "a",
-            SECRET_A,
-            &["observe"]
-        )])))
-        .unwrap();
-        let with_legacy = Clients {
-            allow_legacy_token: true,
-            ..with_legacy
-        }
-        .with_legacy_token("a-long-legacy-token-value-0123456789")
-        .unwrap();
-        let (_, a) = with_legacy.check(Some(&bearer(&token("a", SECRET_B))), 5);
-        let (_, b) = with_legacy.check(Some(&bearer(&token("zz", SECRET_B))), 5);
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn id_prefix_is_filtered_and_capped() {
         let t = table();
         let id = format!("{}-{}", "a".repeat(20), "b");
@@ -1031,35 +888,35 @@ mod tests {
     }
 
     #[test]
-    fn a_long_legacy_token_still_authenticates() {
+    fn a_long_single_token_still_authenticates() {
         let long = "L".repeat(200);
-        let t = Clients::legacy_only(&long);
+        let t = Clients::single_token(&long);
         let caller = t.authenticate(Some(&bearer(&long)), 0).unwrap();
-        assert_eq!(caller, Caller::legacy());
+        assert_eq!(caller, Caller::default_client());
         let wrong = "L".repeat(199);
         assert!(t.authenticate(Some(&bearer(&wrong)), 0).is_err());
     }
 
     #[test]
-    fn legacy_token_authenticates_as_legacy_with_every_scope() {
-        let t = Clients::legacy_only("a-long-legacy-token-value-0123456789");
+    fn single_token_authenticates_as_default_with_every_scope() {
+        let t = Clients::single_token("a-long-single-token-value-0123456789");
         let caller = t
-            .authenticate(Some("Bearer a-long-legacy-token-value-0123456789"), 0)
+            .authenticate(Some("Bearer a-long-single-token-value-0123456789"), 0)
             .unwrap();
-        assert_eq!(caller, Caller::legacy());
+        assert_eq!(caller, Caller::default_client());
         assert!(t
-            .authenticate(Some("Bearer a-long-legacy-token-value-012345678"), 0)
+            .authenticate(Some("Bearer a-long-single-token-value-012345678"), 0)
             .is_err());
         assert!(t
-            .authenticate(Some("Bearer a-long-legacy-token-value-01234567890"), 0)
+            .authenticate(Some("Bearer a-long-single-token-value-01234567890"), 0)
             .is_err());
         assert!(t.authenticate(Some("Bearer "), 0).is_err());
     }
 
     #[test]
-    fn a_table_without_legacy_refuses_a_legacy_looking_token() {
+    fn a_clients_table_refuses_a_token_that_is_not_osh_shaped() {
         let failure = table()
-            .authenticate(Some("Bearer a-long-legacy-token-value-0123456789"), 0)
+            .authenticate(Some("Bearer a-long-single-token-value-0123456789"), 0)
             .unwrap_err();
         assert_eq!(failure.reason, "malformed");
     }
@@ -1077,7 +934,6 @@ mod tests {
         let ci = &t.clients()[0];
         assert_eq!(ci.expires, Some(1000));
         assert_eq!(ci.profiles, ProfileAccess::Only(vec!["ci".to_string()]));
-        assert!(!t.allow_legacy_token() && !t.has_legacy());
     }
 
     #[test]
@@ -1090,17 +946,6 @@ mod tests {
         let mut bad = good.clone();
         bad["token"] = json!("osh_x");
         assert!(parse_err(&file_text(json!([bad]))).contains("unknown field"));
-    }
-
-    #[test]
-    fn rejects_duplicate_json_keys() {
-        let dup_top = r#"{"version":1,"version":1,"clients":[]}"#;
-        assert!(parse_err(dup_top).contains("duplicate key"));
-        let dup_scopes = r#"{"version":1,"clients":[{"id":"a","token_sha256":"x","scopes":["read"],"scopes":["remove"]}]}"#;
-        assert!(parse_err(dup_scopes).contains("duplicate key"));
-        // The same key in two sibling objects, and a key text inside a value, are fine.
-        let ok = r#"{"version":1,"clients":[{"id":"a, \"id\""},{"id":"b"}]}"#;
-        assert!(!parse_err(ok).contains("duplicate key"));
     }
 
     #[test]
@@ -1119,7 +964,6 @@ mod tests {
             "a.b",
             "é",
             "a".repeat(33).as_str(),
-            "legacy",
         ] {
             let mut c = client_json("a", SECRET_A, &["observe"]);
             c["id"] = json!(id);
@@ -1175,10 +1019,13 @@ mod tests {
         assert!(parse_err("[]").contains("object"));
         assert!(parse_err("nope").contains("JSON"));
         assert!(parse_err(&json!({"version": 1, "clients": {}}).to_string()).contains("array"));
-        assert!(parse_err(
-            &json!({"version": 1, "clients": [], "allow_legacy_token": "yes"}).to_string()
-        )
-        .contains("allow_legacy_token"));
+        let removed = parse_err(
+            &json!({"version": 1, "clients": [], "allow_legacy_token": true}).to_string(),
+        );
+        assert!(
+            removed.contains("allow_legacy_token was removed") && removed.contains("delete it"),
+            "{removed}"
+        );
     }
 
     #[test]
@@ -1194,35 +1041,6 @@ mod tests {
             t.clients()[0].profiles,
             ProfileAccess::Only(vec!["x".to_string()])
         );
-    }
-
-    #[test]
-    fn too_many_clients_is_refused() {
-        let list: Vec<Value> = (0..=MAX_CLIENTS)
-            .map(|i| client_json(&format!("c{i}"), SECRET_A, &["observe"]))
-            .collect();
-        assert!(parse_err(&file_text(json!(list))).contains("at most"));
-    }
-
-    // ---- legacy beside a clients file ----
-
-    #[test]
-    fn legacy_token_beside_a_clients_file_needs_the_flag() {
-        let plain = table();
-        let refused = plain.with_legacy_token("a-long-legacy-token-value-0123456789");
-        assert!(refused.unwrap_err().0.contains("allow_legacy_token"));
-        let allowed = Clients::parse(
-            &json!({"version": 1, "allow_legacy_token": true, "clients": []}).to_string(),
-        )
-        .unwrap();
-        assert!(allowed.allow_legacy_token());
-        let merged = allowed
-            .with_legacy_token("a-long-legacy-token-value-0123456789")
-            .unwrap();
-        assert!(merged.has_legacy());
-        assert!(merged
-            .authenticate(Some("Bearer a-long-legacy-token-value-0123456789"), 0)
-            .is_ok());
     }
 
     // ---- load ----
@@ -1255,19 +1073,6 @@ mod tests {
             let message = Clients::load(&path, project.path()).unwrap_err().0;
             assert!(message.contains("chmod 600"), "{mode:o}: {message}");
         }
-    }
-
-    #[test]
-    fn load_refuses_a_file_owned_by_someone_else() {
-        let dir = TempDir::new("clients-owner");
-        let path = write_file(dir.path(), "c.json", &file_text(json!([])), 0o600);
-        let meta = fs::metadata(&path).unwrap();
-        let someone_else = meta.uid().wrapping_add(1);
-        assert!(check_file_meta(&meta, someone_else)
-            .unwrap_err()
-            .0
-            .contains("owned by"));
-        assert!(check_file_meta(&meta, meta.uid()).is_ok());
     }
 
     #[test]
