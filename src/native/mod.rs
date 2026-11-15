@@ -1237,6 +1237,110 @@ impl HostEvents for FrontEvents {
     }
 }
 
+/// The tools layer's record of each pane lives in the pane's host metadata,
+/// through the pane's [`MetaStore`], so a front that starts later gets the
+/// agent kind, the routine's counters and the answered flag back. A front
+/// that keeps no metadata records nothing and reads nothing.
+impl crate::registry::PaneRegistry for NativeBackend {
+    fn set_agent(
+        &self,
+        pane_id: &str,
+        agent: Option<&str>,
+        profile: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<(), BackendError> {
+        self.meta_update(pane_id, |m| {
+            m.agent = agent.map(str::to_string);
+            m.profile = profile.map(str::to_string);
+            if let Some(cwd) = cwd {
+                m.cwd = cwd.to_string();
+            }
+        })
+    }
+
+    fn set_answered(&self, pane_id: &str, answered: bool) -> Result<(), BackendError> {
+        self.meta_update(pane_id, |m| m.answered = answered)
+    }
+
+    fn set_routine(
+        &self,
+        pane_id: &str,
+        routine: Option<&crate::registry::RoutineState>,
+    ) -> Result<(), BackendError> {
+        self.meta_update(pane_id, |m| {
+            m.routine = routine.map(|r| meta::RoutineMeta {
+                consecutive: r.consecutive,
+                gave_up: r.gave_up,
+                nudge_allowance: r.nudge_allowance,
+            });
+        })
+    }
+
+    fn forget(&self, pane_id: &str) -> Result<(), BackendError> {
+        self.meta_update(pane_id, |m| {
+            m.agent = None;
+            m.profile = None;
+            m.answered = false;
+            m.routine = None;
+        })
+    }
+
+    fn registered(&self) -> Vec<crate::registry::RegisteredPane> {
+        let panes: Vec<Arc<Pane>> = match self.inner.table() {
+            Ok(table) => table.panes.clone(),
+            Err(_) => return Vec::new(),
+        };
+        panes
+            .iter()
+            .filter_map(|pane| {
+                let meta = pane.meta.as_ref()?.get();
+                if meta.agent.is_none() && meta.routine.is_none() {
+                    return None;
+                }
+                Some(crate::registry::RegisteredPane {
+                    pane_id: pane.id.clone(),
+                    name: pane.name.clone(),
+                    cwd: pane.cwd.clone(),
+                    agent: meta.agent,
+                    profile: meta.profile,
+                    answered: meta.answered,
+                    routine: meta.routine.map(|r| crate::registry::RoutineState {
+                        consecutive: r.consecutive,
+                        gave_up: r.gave_up,
+                        nudge_allowance: r.nudge_allowance,
+                    }),
+                    live: pane.is_live(),
+                })
+            })
+            .collect()
+    }
+}
+
+impl NativeBackend {
+    /// Change one pane's metadata through its store. A pane that is not in
+    /// the table, or a front that keeps no metadata, is not an error: there
+    /// is nothing to keep it in.
+    fn meta_update(
+        &self,
+        pane_id: &str,
+        change: impl FnOnce(&mut PaneMeta),
+    ) -> Result<(), BackendError> {
+        let pane = match self.inner.resolve(&TerminalRef::new(pane_id)) {
+            Ok(pane) if pane.id == pane_id => pane,
+            _ => return Ok(()),
+        };
+        let Some(store) = pane.meta.as_ref() else {
+            return Ok(());
+        };
+        store.update(change).map_err(|err| {
+            BackendError::new(
+                ErrorKind::Other,
+                format!("native: {pane_id}: cannot write the pane metadata: {err}"),
+            )
+        })
+    }
+}
+
 impl TerminalBackend for NativeBackend {
     fn capabilities(&self) -> Capabilities {
         Capabilities {

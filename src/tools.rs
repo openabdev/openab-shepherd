@@ -28,6 +28,7 @@ use crate::input::{validate_input, validate_name};
 use crate::opencode_dialog;
 use crate::panelock::{PaneGuard, PaneLocks};
 use crate::profiles::{CwdError, LaunchPolicy, RoutineConfig};
+use crate::registry::{PaneRegistry, RoutineState};
 use crate::routine::{self, PaneWatch, Todo, WatchEvent};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -98,6 +99,10 @@ pub struct Shepherd {
     /// Where calls are recorded, when the operator set an audit file. `None`
     /// records nothing.
     audit: Option<Arc<Audit>>,
+    /// Where the agent kind, routine counters and answered flag are kept so
+    /// a front that starts after its panes gets them back. `None` keeps them
+    /// in memory only, as before.
+    registry: Option<Arc<dyn PaneRegistry>>,
 }
 
 /// What this process knows about a pane a profile started, keyed by pane name.
@@ -134,6 +139,133 @@ impl Shepherd {
             routine: Arc::new(Mutex::new(HashMap::new())),
             routine_lock_wait: routine::LOCK_WAIT,
             audit: None,
+            registry: None,
+        }
+    }
+
+    /// Keep each pane's agent kind, profile, routine counters and answered
+    /// flag in `registry`, and write them there as they change. After the
+    /// backend has adopted its panes, [`Shepherd::adopt_registry`] reads them
+    /// back.
+    pub fn with_registry(mut self, registry: Arc<dyn PaneRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// Run a registry write. A failure is logged and the call goes on: the
+    /// pane works either way, only a later restart would miss the record.
+    /// True when the write landed or there is no registry to write to.
+    fn registry_write(
+        &self,
+        pane_id: &str,
+        what: &str,
+        write: impl FnOnce(&dyn PaneRegistry) -> Result<(), BackendError>,
+    ) -> bool {
+        let Some(registry) = &self.registry else {
+            return true;
+        };
+        match write(&**registry) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!(
+                    "openab-shepherd: pane {pane_id}: cannot keep the {what} for a restart: {}",
+                    err.detail
+                );
+                false
+            }
+        }
+    }
+
+    fn persist_routine(&self, pane_id: &str, state: &RoutineState) -> bool {
+        self.registry_write(pane_id, "routine state", |r| {
+            r.set_routine(pane_id, Some(state))
+        })
+    }
+
+    /// Rebuild what this process knew about its panes from the registry:
+    /// each pane's agent (so `answer_dialog` has its dialect), the pending
+    /// answer, and the routine's watch with its counters. Call it once the
+    /// backend has adopted its panes and before [`Shepherd::spawn_routine`].
+    ///
+    /// The routine's configuration is read from the current profile, so a
+    /// profile edited before the restart takes effect. A pane whose profile
+    /// is gone, or no longer has a routine, is not watched (one log line).
+    /// A record that names no usable agent resurrects nothing.
+    pub fn adopt_registry(&self) {
+        let Some(registry) = &self.registry else {
+            return;
+        };
+        let mut found = registry.registered();
+        // A live pane wins a name a finished one also carries.
+        found.sort_by_key(|pane| pane.live);
+        for pane in found {
+            // A registry that does not know names (one with no backend of
+            // its own) is asked of the backend, by pane id.
+            let looked_up;
+            let name = match pane.name.as_deref() {
+                Some(name) => name,
+                None => match self.backend.get(&TerminalRef::new(pane.pane_id.as_str())) {
+                    Ok(info) if info.id == pane.pane_id && info.name.is_some() => {
+                        looked_up = info.name.unwrap_or_default();
+                        looked_up.as_str()
+                    }
+                    _ => continue,
+                },
+            };
+            let agent = match pane.agent.as_deref().map(|text| (text, Agent::parse(text))) {
+                Some((_, Some(agent))) => agent,
+                Some((text, None)) => {
+                    eprintln!(
+                        "openab-shepherd: pane {name}: the record names the agent {text:?}, \
+                         which this build does not know; not restoring it"
+                    );
+                    continue;
+                }
+                None => continue,
+            };
+            self.panes().insert(
+                name.to_string(),
+                PaneAgent {
+                    agent,
+                    pane_id: Some(pane.pane_id.clone()),
+                    answered: pane.answered,
+                },
+            );
+            let Some(state) = pane.routine.as_ref().filter(|_| pane.live) else {
+                self.forget_routine(name);
+                continue;
+            };
+            let config = pane
+                .profile
+                .as_deref()
+                .and_then(|p| self.policy.profile(p))
+                .and_then(|p| p.routine.clone());
+            let Some(config) = config else {
+                eprintln!(
+                    "openab-shepherd: routine: pane {name}: its profile is gone or has no \
+                     routine now, so the routine does not watch this pane"
+                );
+                self.forget_routine(name);
+                continue;
+            };
+            if pane.cwd.is_empty() {
+                eprintln!(
+                    "openab-shepherd: routine: pane {name}: the record has no working \
+                     directory, so the routine does not watch this pane"
+                );
+                self.forget_routine(name);
+                continue;
+            }
+            self.routine_map().insert(
+                name.to_string(),
+                PaneWatch::restored(
+                    config,
+                    PathBuf::from(&pane.cwd),
+                    agent,
+                    pane.pane_id.clone(),
+                    state,
+                ),
+            );
         }
     }
 
@@ -182,8 +314,22 @@ impl Shepherd {
     }
 
     fn mark_answered(&self, name: &str) {
-        if let Some(pane) = self.panes().get_mut(name) {
-            pane.answered = true;
+        self.set_answered(name, true);
+    }
+
+    /// Set the pending-answer flag and, when it changed, keep it for a restart.
+    fn set_answered(&self, name: &str, answered: bool) {
+        let changed = {
+            let mut panes = self.panes();
+            panes.get_mut(name).and_then(|pane| {
+                let before = std::mem::replace(&mut pane.answered, answered);
+                (before != answered).then(|| pane.pane_id.clone())
+            })
+        };
+        if let Some(Some(pane_id)) = changed {
+            self.registry_write(&pane_id, "answered flag", |r| {
+                r.set_answered(&pane_id, answered)
+            });
         }
     }
 
@@ -194,9 +340,7 @@ impl Shepherd {
 
     /// Forget the pending answer. Called once the pane reached a final outcome.
     fn clear_answer(&self, name: &str) {
-        if let Some(pane) = self.panes().get_mut(name) {
-            pane.answered = false;
-        }
+        self.set_answered(name, false);
     }
 
     fn forget_agent(&self, name: &str) {
@@ -307,6 +451,22 @@ impl Shepherd {
         }
     }
 
+    /// Apply `change` to the watch of `name` when it is still pane
+    /// `pane_id`'s, then keep its counters for a restart.
+    fn settle_routine(&self, name: &str, pane_id: &str, change: impl FnOnce(&mut PaneWatch)) {
+        let state = {
+            let mut map = self.routine_map();
+            match map.get_mut(name).filter(|w| w.pane_id() == pane_id) {
+                Some(watch) => {
+                    change(watch);
+                    watch.state()
+                }
+                None => return,
+            }
+        };
+        self.persist_routine(pane_id, &state);
+    }
+
     fn routine_check(&self, name: &str, clock: &dyn Fn() -> Instant) {
         let now = clock();
         let (config, work_dir, todo_rel, pane_id, finished_state) = {
@@ -348,7 +508,7 @@ impl Shepherd {
             Some(rel) => routine::read_todo_in(&work_dir, rel),
             None => Todo::NotConfigured,
         };
-        let (event, idle_secs) = {
+        let (event, idle_secs, observed) = {
             let mut map = self.routine_map();
             let Some(watch) = map.get_mut(name) else {
                 return;
@@ -366,8 +526,15 @@ impl Shepherd {
                 );
             }
             let idle = watch.idle_for(now).map(|d| d.as_secs());
-            (watch.observe(&info, todo, now), idle)
+            let before = watch.state();
+            let event = watch.observe(&info, todo, now);
+            // The observation moved a counter (progress, or a give-up): keep it.
+            let moved = (watch.state() != before).then(|| watch.state());
+            (event, idle, moved)
         };
+        if let Some(state) = observed {
+            self.persist_routine(&pane_id, &state);
+        }
         match event {
             WatchEvent::None => {}
             WatchEvent::GaveUp => {
@@ -391,6 +558,22 @@ impl Shepherd {
                     expect_turn: info.turn,
                     ..InputGuard::default()
                 };
+                // The counter goes to the registry before the bytes go to the
+                // pane: a crash in between over-counts one nudge, never loses
+                // one. The outcome below writes the real counters again.
+                let pending = {
+                    let map = self.routine_map();
+                    map.get(name)
+                        .filter(|watch| watch.pane_id() == pane_id)
+                        .map(PaneWatch::state_after_nudge)
+                };
+                // When the counter cannot be kept the nudge is not sent: the
+                // next tick tries again, and nothing is typed uncounted.
+                if let Some(pending) = &pending {
+                    if !self.persist_routine(&pane_id, pending) {
+                        return;
+                    }
+                }
                 // The pane lock is waited for only briefly: a pane whose lock
                 // is held for long (a slow send or wait) is skipped for this
                 // tick instead of stalling every other watched pane.
@@ -408,11 +591,7 @@ impl Shepherd {
                         // time, not the observation time, or a slow send
                         // would eat into (or erase) the cooldown.
                         let sent_at = clock();
-                        if let Some(watch) = self.routine_map().get_mut(name) {
-                            if watch.pane_id() == pane_id {
-                                watch.note_nudged(sent_at);
-                            }
-                        }
+                        self.settle_routine(name, &pane_id, |watch| watch.note_nudged(sent_at));
                         eprintln!(
                             "openab-shepherd: routine nudge: pane {name} (turn {turn}, \
                              idle {}s): {}",
@@ -423,6 +602,21 @@ impl Shepherd {
                     Err(err) if err.data["error"] == "pane_busy" => {
                         // Nothing was sent and nothing is counted: the next
                         // tick looks again.
+                        self.settle_routine(name, &pane_id, |_| ());
+                    }
+                    Err(err) if err.data["error"] == "pane_replayed" => {
+                        // The pane was picked up after a restart and its
+                        // screen is not trusted yet. Nothing was sent, so
+                        // this is a skip, not a failed nudge: it counts
+                        // toward neither the cooldown nor the cap.
+                        let mut first = false;
+                        self.settle_routine(name, &pane_id, |watch| first = watch.note_replayed());
+                        if first {
+                            eprintln!(
+                                "openab-shepherd: routine: pane {name}: not nudging a replayed \
+                                 pane until it has repainted"
+                            );
+                        }
                     }
                     Err(err) => {
                         // Any other refusal or failure (a `terminal_changed`
@@ -437,15 +631,13 @@ impl Shepherd {
                         let pasted_unsubmitted = err.data["backend_detail"]
                             .as_str()
                             .is_some_and(crate::backend::is_pasted_unsubmitted);
-                        if let Some(watch) = self.routine_map().get_mut(name) {
-                            if watch.pane_id() == pane_id {
-                                if pasted_unsubmitted {
-                                    watch.note_pasted_unsubmitted(failed_at);
-                                } else {
-                                    watch.note_failed(failed_at);
-                                }
+                        self.settle_routine(name, &pane_id, |watch| {
+                            if pasted_unsubmitted {
+                                watch.note_pasted_unsubmitted(failed_at);
+                            } else {
+                                watch.note_failed(failed_at);
                             }
-                        }
+                        });
                         if pasted_unsubmitted {
                             eprintln!(
                                 "openab-shepherd: routine: pane {name}: the nudge text was \
@@ -701,7 +893,17 @@ fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     }
     if let Some(name) = info.name.as_deref() {
         match profile_agent {
-            Some(agent) => sh.remember_agent(name, agent, Some(info.id.clone())),
+            Some(agent) => {
+                sh.remember_agent(name, agent, Some(info.id.clone()));
+                sh.registry_write(&info.id, "agent", |r| {
+                    r.set_agent(
+                        &info.id,
+                        Some(agent.as_str()),
+                        spec.profile.as_deref(),
+                        spec.cwd.as_deref(),
+                    )
+                });
+            }
             // A pane this profile did not start must not inherit an agent that an
             // earlier pane with the same name had.
             None => sh.forget_agent(name),
@@ -715,7 +917,8 @@ fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
             .and_then(|p| p.routine.clone().map(|config| (config, p.agent)));
         match (watched, spec.cwd.as_deref()) {
             (Some((config, agent)), Some(cwd)) => {
-                sh.register_routine(name, config, PathBuf::from(cwd), agent, info.id.clone())
+                sh.register_routine(name, config, PathBuf::from(cwd), agent, info.id.clone());
+                sh.persist_routine(&info.id, &RoutineState::default());
             }
             (Some(_), None) => {
                 eprintln!(
@@ -1380,6 +1583,7 @@ fn remove_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     // mode-switch refusal for it.
     sh.forget_agent_if(&terminal, pane.as_str());
     sh.forget_routine_if(&terminal, pane.as_str());
+    sh.registry_write(pane.as_str(), "removal", |r| r.forget(pane.as_str()));
     Ok(json!({
         "name": terminal,
         "was_live": removed.was_live,
@@ -4229,5 +4433,414 @@ mod tests {
         std::fs::remove_file(&cwd).unwrap();
         std::fs::rename(&moved, &cwd).unwrap();
         assert_eq!(sent, 0, "the routine followed the swapped symlink");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #76: the agent kind, the routine's counters and the answered
+    // flag survive a front restart through the registry.
+    // -----------------------------------------------------------------
+
+    use crate::registry::{MemoryRegistry, RegisteredPane};
+
+    const RESTART_ROUTINE: fn() -> Value = || {
+        json!({"idle_timeout_secs": 10, "cooldown_secs": 1,
+               "max_consecutive_nudges": 2, "nudge_text": "continue"})
+    };
+
+    /// A registry that notes how many sends the fake had seen when each
+    /// routine write arrived, and can refuse the writes.
+    struct Spy {
+        inner: MemoryRegistry,
+        fake: FakeBackend,
+        routine_writes: Mutex<Vec<(u32, usize)>>,
+        refuse_routine: std::sync::atomic::AtomicBool,
+    }
+
+    impl Spy {
+        fn new(fake: &FakeBackend) -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryRegistry::default(),
+                fake: fake.clone(),
+                routine_writes: Mutex::new(Vec::new()),
+                refuse_routine: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl PaneRegistry for Spy {
+        fn set_agent(
+            &self,
+            pane_id: &str,
+            agent: Option<&str>,
+            profile: Option<&str>,
+            cwd: Option<&str>,
+        ) -> Result<(), BackendError> {
+            self.inner.set_agent(pane_id, agent, profile, cwd)
+        }
+        fn set_answered(&self, pane_id: &str, answered: bool) -> Result<(), BackendError> {
+            self.inner.set_answered(pane_id, answered)
+        }
+        fn set_routine(
+            &self,
+            pane_id: &str,
+            routine: Option<&RoutineState>,
+        ) -> Result<(), BackendError> {
+            if self
+                .refuse_routine
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(BackendError::new(ErrorKind::Other, "injected"));
+            }
+            if let Some(r) = routine {
+                let sent = self.fake.state.lock().unwrap().sent.len();
+                self.routine_writes
+                    .lock()
+                    .unwrap()
+                    .push((r.consecutive, sent));
+            }
+            self.inner.set_routine(pane_id, routine)
+        }
+        fn forget(&self, pane_id: &str) -> Result<(), BackendError> {
+            self.inner.forget(pane_id)
+        }
+        fn registered(&self) -> Vec<RegisteredPane> {
+            self.inner.registered()
+        }
+    }
+
+    /// A front over a runnable fake with `registry`, and pane `work` started
+    /// from the routine profile, finished at turn 3.
+    fn registered_pane(
+        registry: Arc<dyn PaneRegistry>,
+        fake: &FakeBackend,
+        dir: &crate::testutil::TempDir,
+    ) -> Shepherd {
+        fake.state.lock().unwrap().runnable = true;
+        let sh = Shepherd::with_policy(fake.clone(), routine_policy(dir.path(), RESTART_ROUTINE()))
+            .with_registry(registry);
+        fake.state.lock().unwrap().locks = Some(Arc::clone(sh.pane_locks()));
+        call(
+            &sh,
+            "start_pane",
+            &args(json!({"profile": "kiro", "name": "work"})),
+        )
+        .unwrap();
+        let mut state = fake.state.lock().unwrap();
+        state.panes[0].status = Some(ProgramStatus {
+            state: State::Done,
+            kind: None,
+        });
+        state.panes[0].turn = Some(3);
+        drop(state);
+        sh
+    }
+
+    /// A new front over the same backend and registry: nothing in memory,
+    /// then `adopt_registry`.
+    fn restarted(
+        registry: Arc<dyn PaneRegistry>,
+        fake: &FakeBackend,
+        policy: LaunchPolicy,
+    ) -> Shepherd {
+        let sh = Shepherd::with_policy(fake.clone(), policy).with_registry(registry);
+        fake.state.lock().unwrap().locks = Some(Arc::clone(sh.pane_locks()));
+        assert_eq!(sh.agent_of("work"), None, "a new front starts empty");
+        sh.adopt_registry();
+        sh
+    }
+
+    fn sent_count(fake: &FakeBackend) -> usize {
+        fake.state.lock().unwrap().sent.len()
+    }
+
+    #[test]
+    fn a_profile_start_records_agent_profile_and_an_unspent_routine() {
+        let dir = crate::testutil::TempDir::new("tools-registry-start");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        let _sh = registered_pane(reg.clone(), &fake, &dir);
+        let rec = reg.get("id-work").expect("the start was recorded");
+        assert_eq!(rec.agent.as_deref(), Some("kiro"));
+        assert_eq!(rec.profile.as_deref(), Some("kiro"));
+        assert_eq!(rec.routine, Some(RoutineState::default()));
+        assert!(!rec.answered);
+    }
+
+    #[test]
+    fn a_restarted_front_gets_the_agent_and_the_watch_back() {
+        let dir = crate::testutil::TempDir::new("tools-registry-restore");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        let old = registered_pane(reg.clone(), &fake, &dir);
+        drop(old);
+        let policy = routine_policy(dir.path(), RESTART_ROUTINE());
+        let sh = restarted(reg, &fake, policy);
+        assert_eq!(sh.agent_of("work"), Some(Agent::Kiro));
+        assert_eq!(
+            sh.routine_map()
+                .get("work")
+                .map(|w| w.pane_id().to_string()),
+            Some("id-work".to_string())
+        );
+    }
+
+    #[test]
+    fn the_nudge_cap_and_a_give_up_hold_across_a_restart() {
+        let dir = crate::testutil::TempDir::new("tools-registry-cap");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        let sh = registered_pane(reg.clone(), &fake, &dir);
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
+        sh.routine_tick_at(t0 + Duration::from_secs(13));
+        assert_eq!(sent_count(&fake), 2);
+        sh.routine_tick_at(t0 + Duration::from_secs(15));
+        assert_eq!(
+            reg.get("id-work").unwrap().routine,
+            Some(RoutineState {
+                consecutive: 2,
+                gave_up: true,
+                nudge_allowance: routine::NUDGE_TURN_ALLOWANCE,
+            })
+        );
+        drop(sh);
+        // The same stalled pane, a front that remembers nothing but the record.
+        let sh = restarted(reg, &fake, routine_policy(dir.path(), RESTART_ROUTINE()));
+        let t1 = Instant::now();
+        for secs in [0, 11, 100, 10_000] {
+            sh.routine_tick_at(t1 + Duration::from_secs(secs));
+        }
+        assert_eq!(sent_count(&fake), 2, "a routine that gave up was rearmed");
+    }
+
+    #[test]
+    fn the_idle_clock_restarts_but_the_counter_carries_on() {
+        let dir = crate::testutil::TempDir::new("tools-registry-clock");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        let sh = registered_pane(reg.clone(), &fake, &dir);
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
+        assert_eq!(sent_count(&fake), 1);
+        drop(sh);
+        let sh = restarted(
+            reg.clone(),
+            &fake,
+            routine_policy(dir.path(), RESTART_ROUTINE()),
+        );
+        let t1 = Instant::now();
+        // The pane has been finished for ages, but the clock starts now.
+        sh.routine_tick_at(t1);
+        sh.routine_tick_at(t1 + Duration::from_secs(5));
+        assert_eq!(sent_count(&fake), 1, "an adopted pane was nudged at once");
+        sh.routine_tick_at(t1 + Duration::from_secs(11));
+        assert_eq!(sent_count(&fake), 2);
+        assert_eq!(reg.get("id-work").unwrap().routine.unwrap().consecutive, 2);
+    }
+
+    #[test]
+    fn a_profile_that_lost_its_routine_means_no_watch() {
+        let dir = crate::testutil::TempDir::new("tools-registry-noroutine");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        drop(registered_pane(reg.clone(), &fake, &dir));
+        // Same profile name, no routine block any more.
+        let sh = restarted(reg, &fake, kiro_policy(dir.path(), false));
+        assert_eq!(sh.agent_of("work"), Some(Agent::Kiro));
+        assert!(sh.routine_map().is_empty());
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(3600));
+        assert_eq!(sent_count(&fake), 0);
+    }
+
+    #[test]
+    fn a_profile_that_is_gone_means_no_watch() {
+        let dir = crate::testutil::TempDir::new("tools-registry-noprofile");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        drop(registered_pane(reg.clone(), &fake, &dir));
+        let sh = restarted(reg, &fake, LaunchPolicy::default());
+        assert!(sh.routine_map().is_empty());
+        assert_eq!(sh.agent_of("work"), Some(Agent::Kiro));
+    }
+
+    #[test]
+    fn a_record_for_another_pane_id_never_nudges_the_pane_that_has_the_name() {
+        let dir = crate::testutil::TempDir::new("tools-registry-mismatch");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        drop(registered_pane(reg.clone(), &fake, &dir));
+        // The record is for a pane that no longer exists under that id.
+        reg.forget("id-work").unwrap();
+        reg.insert(RegisteredPane {
+            pane_id: "id-ghost".to_string(),
+            name: Some("work".to_string()),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            agent: Some("kiro".to_string()),
+            profile: Some("kiro".to_string()),
+            answered: false,
+            routine: Some(RoutineState::default()),
+            live: true,
+        });
+        let sh = restarted(reg, &fake, routine_policy(dir.path(), RESTART_ROUTINE()));
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(3600));
+        assert_eq!(sent_count(&fake), 0);
+    }
+
+    #[test]
+    fn a_record_that_names_no_usable_agent_resurrects_nothing() {
+        let dir = crate::testutil::TempDir::new("tools-registry-stale");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        for (agent, routine) in [
+            (Some("someday-agent"), Some(RoutineState::default())),
+            (None, Some(RoutineState::default())),
+        ] {
+            reg.insert(RegisteredPane {
+                pane_id: "id-work".to_string(),
+                name: Some("work".to_string()),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                agent: agent.map(str::to_string),
+                profile: Some("kiro".to_string()),
+                answered: true,
+                routine,
+                live: true,
+            });
+            let sh = restarted(
+                reg.clone(),
+                &fake,
+                routine_policy(dir.path(), RESTART_ROUTINE()),
+            );
+            assert_eq!(sh.agent_of("work"), None);
+            assert!(!sh.answer_pending("work"));
+            assert!(sh.routine_map().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_finished_pane_gets_its_agent_but_no_watch() {
+        let dir = crate::testutil::TempDir::new("tools-registry-finished");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        drop(registered_pane(reg.clone(), &fake, &dir));
+        let mut rec = reg.get("id-work").unwrap();
+        rec.live = false;
+        reg.insert(rec);
+        let sh = restarted(reg, &fake, routine_policy(dir.path(), RESTART_ROUTINE()));
+        assert_eq!(sh.agent_of("work"), Some(Agent::Kiro));
+        assert!(sh.routine_map().is_empty());
+    }
+
+    #[test]
+    fn a_replayed_pane_is_skipped_not_counted_as_a_failed_nudge() {
+        let dir = crate::testutil::TempDir::new("tools-registry-replayed");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        let sh = registered_pane(reg.clone(), &fake, &dir);
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        fake.state.lock().unwrap().send_error =
+            Some(BackendError::new(ErrorKind::Replayed, "replayed"));
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
+        assert_eq!(sent_count(&fake), 0);
+        assert_eq!(
+            sh.routine_map().get("work").unwrap().state(),
+            RoutineState::default(),
+            "a replayed refusal counted toward the cap"
+        );
+        assert_eq!(
+            reg.get("id-work").unwrap().routine,
+            Some(RoutineState::default()),
+            "the pending count was not taken back"
+        );
+        // No cooldown either: the next tick nudges as soon as the pane is trusted.
+        sh.routine_tick_at(t0 + Duration::from_secs(12));
+        assert_eq!(sent_count(&fake), 1);
+    }
+
+    #[test]
+    fn the_count_is_kept_before_the_nudge_is_typed() {
+        let dir = crate::testutil::TempDir::new("tools-registry-order");
+        let fake = FakeBackend::new(true);
+        let spy = Spy::new(&fake);
+        let sh = registered_pane(spy.clone(), &fake, &dir);
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
+        assert_eq!(sent_count(&fake), 1);
+        let writes = spy.routine_writes.lock().unwrap().clone();
+        // (consecutive, sends seen at the time of the write): the register
+        // write, the count before the bytes, the count after.
+        assert_eq!(writes, [(0, 0), (1, 0), (1, 1)], "{writes:?}");
+    }
+
+    #[test]
+    fn a_count_that_cannot_be_kept_means_the_nudge_is_not_typed() {
+        let dir = crate::testutil::TempDir::new("tools-registry-refused");
+        let fake = FakeBackend::new(true);
+        let spy = Spy::new(&fake);
+        let sh = registered_pane(spy.clone(), &fake, &dir);
+        spy.refuse_routine
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
+        assert_eq!(sent_count(&fake), 0);
+        assert_eq!(
+            sh.routine_map().get("work").unwrap().state(),
+            RoutineState::default()
+        );
+        // The registry comes back: the next tick nudges.
+        spy.refuse_routine
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        sh.routine_tick_at(t0 + Duration::from_secs(12));
+        assert_eq!(sent_count(&fake), 1);
+    }
+
+    #[test]
+    fn the_answered_flag_is_kept_and_restored() {
+        let dir = crate::testutil::TempDir::new("tools-registry-answered");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        let sh = registered_pane(reg.clone(), &fake, &dir);
+        sh.mark_answered("work");
+        assert!(reg.get("id-work").unwrap().answered);
+        drop(sh);
+        let sh = restarted(
+            reg.clone(),
+            &fake,
+            routine_policy(dir.path(), RESTART_ROUTINE()),
+        );
+        assert!(sh.answer_pending("work"));
+        sh.clear_answer("work");
+        assert!(!reg.get("id-work").unwrap().answered);
+    }
+
+    #[test]
+    fn removing_a_pane_clears_its_record() {
+        let dir = crate::testutil::TempDir::new("tools-registry-remove");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        let sh = registered_pane(reg.clone(), &fake, &dir);
+        call(&sh, "remove_pane", &args(json!({"terminal": "work"}))).unwrap();
+        assert_eq!(reg.get("id-work"), None);
+    }
+
+    #[test]
+    fn a_shepherd_without_a_registry_behaves_as_before() {
+        let (sh, fake, _dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
+            "tools-registry-none",
+        );
+        sh.adopt_registry();
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
+        assert_eq!(sent_count(&fake), 1);
     }
 }

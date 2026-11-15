@@ -16,6 +16,7 @@
 use crate::agent::Agent;
 use crate::backend::{State, TerminalInfo};
 use crate::profiles::RoutineConfig;
+use crate::registry::RoutineState;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -315,6 +316,9 @@ pub struct PaneWatch {
     consecutive: u32,
     last_nudge: Option<Instant>,
     gave_up: bool,
+    /// Whether the last refusal was `pane_replayed`, so the skip is logged
+    /// once and not on every tick.
+    replayed_noted: bool,
 }
 
 impl PaneWatch {
@@ -336,7 +340,55 @@ impl PaneWatch {
             consecutive: 0,
             last_nudge: None,
             gave_up: false,
+            replayed_noted: false,
         }
+    }
+
+    /// A watch for a pane a front adopted: the counters come from what the
+    /// previous front kept, the configuration from the current profile. The
+    /// idle clock restarts (nothing of it is kept, so adoption can delay a
+    /// nudge but never cause an extra one) and `last_turn` is primed by the
+    /// first observation, so turns that passed while no front ran are not
+    /// mistaken for progress.
+    pub fn restored(
+        config: RoutineConfig,
+        cwd: PathBuf,
+        agent: Agent,
+        pane_id: String,
+        state: &RoutineState,
+    ) -> Self {
+        let mut watch = Self::new(config, cwd, agent, pane_id);
+        watch.consecutive = state.consecutive;
+        watch.gave_up = state.gave_up;
+        watch.nudge_allowance = state.nudge_allowance;
+        watch
+    }
+
+    /// The counters a restart must not lose.
+    pub fn state(&self) -> RoutineState {
+        RoutineState {
+            consecutive: self.consecutive,
+            gave_up: self.gave_up,
+            nudge_allowance: self.nudge_allowance,
+        }
+    }
+
+    /// What [`PaneWatch::state`] will be once a nudge that is about to be
+    /// typed is recorded. Written before the bytes go in: a crash in between
+    /// counts one nudge that was never sent, the safe side.
+    pub fn state_after_nudge(&self) -> RoutineState {
+        RoutineState {
+            consecutive: self.consecutive + 1,
+            gave_up: self.gave_up,
+            nudge_allowance: NUDGE_TURN_ALLOWANCE,
+        }
+    }
+
+    /// Record that a nudge was refused because the pane is `replayed`
+    /// (nothing was sent, nothing is counted). True the first time, so the
+    /// caller logs it once.
+    pub fn note_replayed(&mut self) -> bool {
+        !std::mem::replace(&mut self.replayed_noted, true)
     }
 
     pub fn config(&self) -> &RoutineConfig {
@@ -439,6 +491,7 @@ impl PaneWatch {
             self.finished_turn = None;
             self.finished_seen = false;
             self.finished_since = None;
+            self.replayed_noted = false;
         }
         if self.gave_up || !finished {
             return WatchEvent::None;
@@ -473,6 +526,7 @@ impl PaneWatch {
         self.consecutive += 1;
         self.last_nudge = Some(now);
         self.nudge_allowance = NUDGE_TURN_ALLOWANCE;
+        self.replayed_noted = false;
     }
 
     /// Record that a nudge was refused or failed at `now`. A failed attempt

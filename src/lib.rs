@@ -20,6 +20,7 @@ pub mod native;
 pub mod opencode_dialog;
 pub mod panelock;
 pub mod profiles;
+pub mod registry;
 pub mod routine;
 pub mod tools;
 
