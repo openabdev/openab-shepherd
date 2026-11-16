@@ -66,7 +66,7 @@ Technology stack (locked once this ADR is approved): Rust 2021, std threads and 
 
 **Chosen: libc + std.** The child env must be exactly the whitelist (§10). portable-pty injects `SHELL`, and its cwd fallback hides a caller error. We need about 40 lines of unsafe glue, and this crate keeps its dependencies minimal (two today). `std::process::Command` already gives us `env_clear`, a PATH search through the *child's* `PATH` once it is set explicitly, `current_dir`, SIGPIPE reset and the child signal-mask reset. `Child::wait` gives us reaping.
 
-**Spawn procedure** (`src/native/pty.rs`):
+**Spawn procedure** (`src/native/host/pty.rs`):
 
 1. Take the global `SPAWN_LOCK` (`static Mutex<()>`). It is held from `openpty` until `spawn` returns. Reason: `openpty` returns descriptors without `FD_CLOEXEC`. A concurrent `run` on another thread could fork in that window, and its child would inherit this pane's master. That would let one pane read another's terminal, and it would keep the slave open after Shepherd dies. Shepherd forks nowhere else after startup: `config.rs` runs `git` before any backend exists, and tiny_http does not fork. The lock covers only spawns in `pty.rs`: any future code that forks after startup must take it too (review N7).
 2. Call `libc::openpty(&mut master, &mut slave, null, null, &winsize{rows: 120, cols: 200})`. Set `FD_CLOEXEC` on both descriptors. Set `O_NONBLOCK` on the master.
@@ -460,7 +460,7 @@ Nothing is logged per chunk or per call.
 **Crate layout (decided).** The probe must link the backend, so the crate gains `src/lib.rs`. It holds `pub mod` for `ansi`, `backend`, `config`, `dialog`, `hc`, `http`, `input`, `mcp`, `native`, `panelock` and `tools`, plus `#[cfg(test)] mod testutil`. `main.rs` keeps only the argument parsing and startup, using `openab_shepherd::…`. No behavior changes. New files:
 
 - `src/native/mod.rs`: `NativeBackend`, the table, ref resolution, bounds, and the trait impl.
-- `src/native/pty.rs`: openpty, spawn, `child_env`, poll read and write, `killpg`, `tcgetpgrp`.
+- `src/native/host/pty.rs`: openpty, spawn, `child_env`, poll read and write, `killpg`, `tcgetpgrp`.
 - `src/native/term.rs`: the `vt100::Parser<Hooks>` wrapper, the query replies, kitty stacks, sync tracking and screen and history reads.
 - `src/native/status.rs`: the OSC 7501 body parser and the turn tracker (pure; no I/O).
 - `src/native/keys.rs`: `KeyboardMode` and `encode(key, mode)` (pure).

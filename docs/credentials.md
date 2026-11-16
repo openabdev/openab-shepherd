@@ -130,7 +130,7 @@ Checked by reading code and tests only (no run). Details in
 
 Verified, env passthrough:
 - The child environment is cleared, then set from HOME, PATH, USER, LANG, TERM and
-  the profile's extras (`src/native/pty.rs`). A profile extra with the same name
+  the profile's extras (`src/native/host/pty.rs`). A profile extra with the same name
   replaces the baseline value.
 - A profile `env` is the only route for a credential. Names must be valid and at most
   32. At load, a profile `env` is refused if it sets `TERM`, `PATH`, `SHEPHERD_PANE`, a `DYLD_*` or
@@ -138,7 +138,7 @@ Verified, env passthrough:
   a Devin profile it is also refused if it sets `DEVIN_PERMISSION_MODE`. `HOME`,
   `USER` and `LANG` are not refused there. The caller's per-run `env` (arbitrary
   commands only) is refused for all of `HOME`, `PATH`, `USER`, `LANG`, `TERM`,
-  `DYLD_*` and `LD_*` (`src/native/pty.rs`).
+  `DYLD_*` and `LD_*` (`src/native/host/pty.rs`).
 - Panes started with a caller `argv` or `line` get no profile env
   (`src/native/mod.rs`).
 - `list_panes` has no env field. `Secret` prints `<redacted>` in Debug output.
