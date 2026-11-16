@@ -44,7 +44,7 @@ const KEYCHAIN_POLL: Duration = Duration::from_millis(20);
 const KEYCHAIN_MAX_BYTES: u64 = 64 * 1024;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_PROFILES: usize = 64;
-const MAX_ARGV: usize = 256;
+pub const MAX_ARGV: usize = 256;
 const MAX_CWDS: usize = 32;
 /// Bounds on a profile's `routine` seconds fields.
 const ROUTINE_MIN_IDLE_TIMEOUT_SECS: u64 = 10;

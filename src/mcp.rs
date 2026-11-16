@@ -1203,6 +1203,179 @@ mod issue4_pr1_mcp {
         assert_eq!(mode, 0o600);
     }
 
+    const FLAG_CANARY: &str = "CANARY-flag-b72c";
+
+    /// The call-level flags a trusted client sends: a secret glued to a short option,
+    /// one after `=`, one as the next element, and the one flag worth recording.
+    fn canary_flags() -> Value {
+        json!([
+            format!("-pSECRET{FLAG_CANARY}"),
+            format!("--api-key={FLAG_CANARY}"),
+            "--api-key",
+            FLAG_CANARY,
+            "-a",
+        ])
+    }
+
+    #[test]
+    fn extra_args_values_never_reach_the_audit_file_and_flags_are_allowlisted() {
+        let dir = TempDir::new("i4-xa-canary");
+        let audit_dir = TempDir::new("i4-xa-canary-audit");
+        std::fs::set_permissions(audit_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = audit_dir.path().join("audit.jsonl");
+        let audit = Audit::open_file(&path, dir.path(), fixed_clock(1_700_000_000)).unwrap();
+        let fake = idle_fake();
+        let sh = shepherd(&fake, dir.path(), true).with_audit(Arc::new(audit));
+        let trusted = caller_with(
+            &[Scope::Start, Scope::StartArgs, Scope::StartArbitrary],
+            &["ci"],
+        );
+        let plain = caller_with(&[Scope::Start], &["ci"]);
+        // A profile start with flags, one denied for lack of the scope, one without flags.
+        let out = run(
+            &sh,
+            &trusted,
+            "start_pane",
+            json!({"profile": "ci", "cwd": dir.path(), "name": "p1", "extra_args": canary_flags()}),
+        );
+        assert_eq!(out["isError"], false, "{out}");
+        let out = run(
+            &sh,
+            &plain,
+            "start_pane",
+            json!({"profile": "ci", "cwd": dir.path(), "name": "p2", "extra_args": canary_flags()}),
+        );
+        assert_eq!(code(&out), "forbidden");
+        let out = run(
+            &sh,
+            &plain,
+            "start_pane",
+            json!({"profile": "ci", "cwd": dir.path(), "name": "p3"}),
+        );
+        assert_eq!(out["isError"], false, "{out}");
+        // argv and line starts carry the same values.
+        let mut argv = vec![json!("/usr/local/bin/kiro-cli"), json!("chat")];
+        argv.extend(canary_flags().as_array().unwrap().iter().cloned());
+        let out = run(
+            &sh,
+            &trusted,
+            "start_pane",
+            json!({"argv": argv, "agent": "kiro", "name": "a1"}),
+        );
+        assert_eq!(out["isError"], false, "{out}");
+        let out = run(
+            &sh,
+            &trusted,
+            "start_pane",
+            json!({"line": format!("kiro-cli chat -pSECRET{FLAG_CANARY} --api-key={FLAG_CANARY}"), "name": "l1"}),
+        );
+        assert_eq!(out["isError"], false, "{out}");
+        // A refusal that echoes the offending flag back to the caller still records no value.
+        let out = run(
+            &sh,
+            &trusted,
+            "start_pane",
+            json!({"profile": "ci", "cwd": dir.path(), "name": "p4",
+                   "extra_args": [format!("--auto-{FLAG_CANARY}"), "x"], "agent": "kiro"}),
+        );
+        assert_eq!(code(&out), "invalid_input", "{out}");
+
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !bytes.contains(FLAG_CANARY),
+            "a canary reached the audit file:\n{bytes}"
+        );
+        assert!(!bytes.contains("SECRET"), "{bytes}");
+        assert!(!bytes.contains("chat"), "{bytes}");
+        let records: Vec<Value> = bytes
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let call = |name: &str| {
+            records
+                .iter()
+                .find(|r| r["pane"] == name && r["phase"] == "call")
+                .unwrap_or_else(|| panic!("no call record for {name}:\n{bytes}"))
+        };
+        let p1 = call("p1");
+        assert_eq!(p1["launch"], "profile+args");
+        assert_eq!(p1["extra_args_n"], 5);
+        assert_eq!(p1["flags"], json!(["--api-key", "-a"]));
+        assert_eq!(p1["profile"], "ci");
+        let a1 = call("a1");
+        assert_eq!(a1["launch"], "argv");
+        assert_eq!(a1["argv0"], "kiro-cli");
+        assert_eq!(a1["agent"], "kiro");
+        assert_eq!(a1["flags"], json!(["--api-key", "-a"]));
+        assert!(a1.get("extra_args_n").is_none());
+        let l1 = call("l1");
+        assert_eq!(l1["launch"], "line");
+        assert!(l1.get("flags").is_none() && l1.get("argv0").is_none());
+        // The denied call is recorded the way every denial is: client, scope, flag names.
+        let denied = records.iter().find(|r| r["phase"] == "denied").unwrap();
+        assert_eq!(denied["launch"], "profile+args");
+        assert!(denied["reason"].as_str().unwrap().contains("start:args"));
+        // A plain profile start keeps the record it always had.
+        let p3 = call("p3");
+        for key in ["launch", "extra_args_n", "flags", "agent", "argv0"] {
+            assert!(p3.get(key).is_none(), "{key}: {p3}");
+        }
+        // The outcome of the refused call is its code only.
+        let refused = records
+            .iter()
+            .find(|r| r["pane"] == "p4" && r["phase"] == "outcome")
+            .unwrap();
+        assert_eq!(refused["outcome"], "error:invalid_input");
+    }
+
+    #[test]
+    fn start_args_is_what_lets_a_client_pass_flags_and_nothing_else_does() {
+        let dir = TempDir::new("i4-xa-scope");
+        let fake = idle_fake();
+        let sh = shepherd(&fake, dir.path(), true);
+        let body = |name: &str| json!({"profile": "ci", "cwd": dir.path(), "name": name, "extra_args": ["-a"]});
+        for caller in [
+            caller_with(&[Scope::Start], &["ci"]),
+            caller_with(&[Scope::Start, Scope::StartArbitrary], &["ci"]),
+            without(Scope::StartArgs),
+            Caller::default_client(),
+        ] {
+            let out = run(&sh, &caller, "start_pane", body("n"));
+            assert_eq!(code(&out), "forbidden", "{out}");
+            assert_eq!(out["structuredContent"]["scope"], "start:args", "{out}");
+        }
+        assert!(fake.state.lock().unwrap().runs.is_empty());
+        // `null` and `[]` are no flags: no scope needed, and nothing is added.
+        let start = caller_with(&[Scope::Start], &["ci"]);
+        for (i, extra) in [json!(null), json!([])].into_iter().enumerate() {
+            let out = run(
+                &sh,
+                &start,
+                "start_pane",
+                json!({"profile": "ci", "cwd": dir.path(), "name": format!("e{i}"), "extra_args": extra}),
+            );
+            assert_eq!(out["isError"], false, "{out}");
+        }
+        // With the scope the flags are appended; the client's profile list still applies.
+        let trusted = caller_with(&[Scope::Start, Scope::StartArgs], &["ci"]);
+        let out = run(&sh, &trusted, "start_pane", body("ok"));
+        assert_eq!(out["isError"], false, "{out}");
+        let runs = fake.state.lock().unwrap().runs.clone();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[2].argv.as_ref().unwrap().last().unwrap(), "-a");
+        assert_eq!(runs[1].argv.as_ref().unwrap().len(), 1, "[] added nothing");
+        let out = run(
+            &sh,
+            &trusted,
+            "start_pane",
+            json!({"profile": "other", "cwd": dir.path(), "name": "o", "extra_args": ["-a"]}),
+        );
+        assert_eq!(code(&out), "forbidden");
+        assert_eq!(fake.state.lock().unwrap().runs.len(), 3);
+        // tools/list shows start_pane to a holder of start:args alone.
+        assert!(caller_with(&[Scope::StartArgs], &[]).may_list("start_pane"));
+    }
+
     fn text_canary(out: &Value, canary: &str) -> bool {
         out.to_string().contains(canary)
     }

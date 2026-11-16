@@ -28,7 +28,9 @@ use crate::dialog::Choice;
 use crate::input::{validate_input, validate_name};
 use crate::opencode_dialog;
 use crate::panelock::{PaneGuard, PaneLocks};
-use crate::profiles::{CwdError, DynamicRoutines, LaunchPolicy, RoutineConfig};
+use crate::profiles::{
+    check_agent_argv, CwdError, DynamicRoutines, LaunchPolicy, Profile, RoutineConfig, MAX_ARGV,
+};
 use crate::registry::{PaneRegistry, RegisteredPane, RoutineSet, RoutineState};
 use crate::routine::{self, PaneWatch, Todo, WatchEvent};
 use crate::routine_model::{Invalid, Routine, Trigger};
@@ -1353,7 +1355,7 @@ pub fn definitions() -> Value {
     json!([
         {
             "name": "start_pane",
-            "description": "Start a program in a new pane. Give profile: the name of one of the operator's launch profiles (list_panes lists them with the directories each allows); the profile fixes the program, its arguments and its environment. cwd, when given, must be one of the profile's directories or below one (after resolving symlinks); without it the profile's first directory is used. argv (a program and its arguments) or line (a shell line run by sh -c) instead of profile work only when the operator allows arbitrary commands (list_panes: allow_arbitrary_command), and such a pane never gets a profile's environment. With argv or line, agent (kiro, devin or opencode) says which agent the pane runs, so answer_dialog and the agent's other guards apply to it; it is the caller's claim, recorded in the audit and not checked against the program. A pane without a profile has no routine, no dynamic routines and no permission_mode. Later calls address the pane by its name: give one, or Shepherd picks one (pane-<hex>) and returns it. Returns the pane (name, live, status, reported, turn, status_ms, exit_code, argv, cwd). Input is trimmed and limited to 4096 bytes per field. Control characters (except TAB) are refused, not removed.",
+            "description": "Start a program in a new pane. Give profile: the name of one of the operator's launch profiles (list_panes lists them with the directories each allows); the profile fixes the program, its arguments and its environment. cwd, when given, must be one of the profile's directories or below one (after resolving symlinks); without it the profile's first directory is used. argv (a program and its arguments) or line (a shell line run by sh -c) instead of profile work only when the operator allows arbitrary commands (list_panes: allow_arbitrary_command), and such a pane never gets a profile's environment. With argv or line, agent (kiro, devin or opencode) says which agent the pane runs, so answer_dialog and the agent's other guards apply to it; it is the caller's claim, recorded in the audit and not checked against the program. A pane without a profile has no routine, no dynamic routines and no permission_mode. With profile, extra_args (call-level flags, needs the start:args scope) are appended after the profile's arguments. Later calls address the pane by its name: give one, or Shepherd picks one (pane-<hex>) and returns it. Returns the pane (name, live, status, reported, turn, status_ms, exit_code, argv, cwd). Input is trimmed and limited to 4096 bytes per field. Control characters (except TAB) are refused, not removed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1361,6 +1363,7 @@ pub fn definitions() -> Value {
                     "argv": {"type": "array", "items": {"type": "string"}, "description": "Program and arguments; non-empty. Only when arbitrary commands are allowed."},
                     "line": {"type": "string", "description": "Shell line run by sh -c. Only when arbitrary commands are allowed."},
                     "agent": {"type": "string", "enum": ["kiro", "devin", "opencode"], "description": "With argv or line only (refused with profile, which fixes its agent): the agent the program is. Optional; without it the pane has no agent and answer_dialog refuses it."},
+                    "extra_args": {"type": "array", "items": {"type": "string"}, "description": "With profile only: call-level flags appended after the profile's own arguments (never before them, never replacing one). Needs the start:args scope. Each element follows the input rules; the profile's argv and extra_args together stay within 256 elements; an agent's refused flags (OpenCode auto-approve, Devin --permission-mode and --respect-workspace-trust) are refused here too. They run with the profile's credentials, so do not put a secret in them. Not the profile file's extra_args key, which the operator fixes. An older server ignores this field: read the argv in the returned pane to see what ran."},
                     "cwd": {"type": "string", "description": "Working directory (absolute)."},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra environment variables for an argv or line pane only (refused with profile): at most 32, names [A-Z_][A-Z0-9_]*, values under the same input rules (empty allowed; leading and trailing whitespace is trimmed). A backend may refuse protected names (the native backend refuses HOME, PATH, USER, LANG, TERM and DYLD_*/LD_*); a backend without per-run environments returns unsupported."},
                     "name": {"type": "string", "description": "Pane name: 1-32 of a-z, 0-9, '-', '_', '.'. Optional; Shepherd picks one when it is missing."}
@@ -1761,6 +1764,9 @@ fn profile_spec(sh: &Shepherd, args: &Args, profile: &str) -> Result<RunSpec, To
         )
         .with("profile", name.as_str())
     })?;
+    // Everything about the call's flags is settled here, before a program is pinned and
+    // long before a credential is read.
+    let extra_args = extra_args_arg(args, profile)?;
     let requested = match optional_str(args, "cwd")? {
         Some(cwd) => Some(validate_input(cwd).map_err(|err| format!("cwd: {err}"))?),
         None => None,
@@ -1793,12 +1799,49 @@ fn profile_spec(sh: &Shepherd, args: &Args, profile: &str) -> Result<RunSpec, To
     let mut argv = vec![program.to_string_lossy().into_owned()];
     argv.extend(profile.permission_args());
     argv.extend(profile.argv[1..].iter().cloned());
+    // The call's own flags go last: appended, never replacing the profile's.
+    argv.extend(extra_args);
     Ok(RunSpec {
         argv: Some(argv),
         cwd: Some(cwd.to_string_lossy().into_owned()),
         profile: Some(name),
         ..RunSpec::default()
     })
+}
+
+/// The call-level `extra_args` of a profile start: a list of strings appended after the
+/// profile's argv. `null` and `[]` add nothing (see `clients::extra_args_present`). Each
+/// element follows the input rules; the profile's argv and the list together stay within
+/// `MAX_ARGV`; the agent's own argv refusals run on that combination (never on the
+/// `--permission-mode` Shepherd adds itself). Not the profile file's `extra_args` key,
+/// which is the operator's and is already part of `profile.argv`.
+fn extra_args_arg(args: &Args, profile: &Profile) -> Result<Vec<String>, ToolError> {
+    if !crate::clients::extra_args_present(args) {
+        return Ok(Vec::new());
+    }
+    let items = args
+        .get("extra_args")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "extra_args must be a list of strings".to_string())?;
+    let mut extra = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let text = item
+            .as_str()
+            .ok_or_else(|| "extra_args must be a list of strings".to_string())?;
+        extra.push(validate_input(text).map_err(|err| format!("extra_args[{i}]: {err}"))?);
+    }
+    if profile.argv.len() + extra.len() > MAX_ARGV {
+        return Err(format!(
+            "extra_args: the profile's argv and extra_args may have at most {MAX_ARGV} elements together"
+        )
+        .into());
+    }
+    let mut combined = profile.argv.clone();
+    combined.extend(extra.iter().cloned());
+    check_agent_argv(profile.agent, &combined).map_err(|reason| {
+        ToolError::from(format!("extra_args: {reason}")).with("field", "extra_args")
+    })?;
+    Ok(extra)
 }
 
 /// A caller-chosen `argv` or `line`, when the operator allows those. It never
@@ -1809,6 +1852,13 @@ fn command_spec(sh: &Shepherd, args: &Args) -> Result<RunSpec, ToolError> {
             "profile_required",
             "give profile: this server starts only its launch profiles (list_panes shows them)",
         ));
+    }
+    if crate::clients::extra_args_present(args) {
+        return Err(
+            "extra_args goes with a profile; with argv, put the arguments in argv"
+                .to_string()
+                .into(),
+        );
     }
     let argv_items = match args.get("argv") {
         None | Some(Value::Null) => None,
@@ -6690,5 +6740,303 @@ mod tests {
         sh.routine_tick_at(t0);
         sh.routine_tick_at(t0 + Duration::from_secs(11));
         assert_eq!(sent_count(&fake), 1);
+    }
+}
+
+/// Call-level `extra_args` on a profile start (issue #113).
+#[cfg(test)]
+mod extra_args_tests {
+    use super::*;
+    use crate::backend::Secret;
+    use crate::testutil::{FakeBackend, TempDir};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn args(value: Value) -> Args {
+        value.as_object().unwrap().clone()
+    }
+
+    /// Three profiles over fake programs in `<dir>/bin`: a Kiro one with an operator
+    /// `extra_args` key and a credential, a Devin one (its `permission_args` is
+    /// `--permission-mode auto`) and an OpenCode one. `lookups` counts reads of the
+    /// credential's source, the stand-in for a keychain read.
+    fn policy(dir: &Path, lookups: Arc<AtomicUsize>) -> LaunchPolicy {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for program in ["devin", "kiro-cli", "opencode"] {
+            let path = bin.join(program);
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let bin = std::fs::canonicalize(bin)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let text = json!({"allow_arbitrary_command": true, "profiles": [
+            {"name": "kiro", "argv": ["kiro-cli", "chat"], "extra_args": ["--trust-workspace"],
+             "cwds": [dir], "env": {"KIRO_API_KEY": "env:KEY_SOURCE"}},
+            {"name": "devin", "argv": ["devin"], "cwds": [dir], "agent": "devin"},
+            {"name": "opencode", "argv": ["opencode"], "cwds": [dir], "agent": "opencode"},
+        ]});
+        LaunchPolicy::from_json(&text.to_string())
+            .unwrap()
+            .with_env_lookup(move |key| match key {
+                "PATH" => Some(bin.clone()),
+                "KEY_SOURCE" => {
+                    lookups.fetch_add(1, Ordering::SeqCst);
+                    Some("profile-secret".to_string())
+                }
+                _ => None,
+            })
+    }
+
+    struct Setup {
+        sh: Shepherd,
+        fake: FakeBackend,
+        lookups: Arc<AtomicUsize>,
+        dir: TempDir,
+    }
+
+    fn setup(tag: &str) -> Setup {
+        let dir = TempDir::new(tag);
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let fake = FakeBackend::new(true);
+        fake.state.lock().unwrap().runnable = true;
+        let sh = Shepherd::with_policy(fake.clone(), policy(dir.path(), lookups.clone()));
+        Setup {
+            sh,
+            fake,
+            lookups,
+            dir,
+        }
+    }
+
+    impl Setup {
+        fn start(&self, body: Value) -> Result<Value, ToolError> {
+            call(&self.sh, "start_pane", &args(body))
+        }
+
+        fn runs(&self) -> Vec<RunSpec> {
+            self.fake.state.lock().unwrap().runs.clone()
+        }
+
+        fn bin(&self, program: &str) -> String {
+            std::fs::canonicalize(self.dir.path().join("bin").join(program))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn extra_args_are_appended_after_the_profile_argv_and_the_program_is_untouched() {
+        let s = setup("xa-append");
+        let out = s
+            .start(json!({"profile": "kiro", "name": "k", "extra_args": ["-a", "--model", "m1"]}))
+            .unwrap();
+        let mut want = vec![s.bin("kiro-cli")];
+        want.extend(strs(&["chat", "--trust-workspace", "-a", "--model", "m1"]));
+        assert_eq!(s.runs()[0].argv, Some(want.clone()));
+        // The returned pane shows the final argv, the way a client sees what ran.
+        assert_eq!(out["argv"], json!(want));
+        // Env, profile and credentials are the profile's, as without extra_args.
+        assert_eq!(s.runs()[0].profile.as_deref(), Some("kiro"));
+        assert_eq!(
+            s.runs()[0].profile_env,
+            [("KIRO_API_KEY".to_string(), Secret::new("profile-secret"))]
+        );
+        assert!(s.runs()[0].env.is_empty());
+    }
+
+    #[test]
+    fn extra_args_go_after_the_permission_flag_shepherd_adds_and_leave_it_alone() {
+        let s = setup("xa-permission");
+        s.start(json!({"profile": "devin", "name": "d", "extra_args": ["--model", "m1"]}))
+            .unwrap();
+        // A Devin profile with harmless extra_args is accepted: the check never sees
+        // Shepherd's own `--permission-mode`.
+        assert_eq!(
+            s.runs()[0].argv,
+            Some(vec![
+                s.bin("devin"),
+                "--permission-mode".to_string(),
+                "auto".to_string(),
+                "--model".to_string(),
+                "m1".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_start_without_extra_args_is_what_it_was_and_null_and_empty_add_nothing() {
+        let s = setup("xa-absent");
+        s.start(json!({"profile": "kiro", "name": "a"})).unwrap();
+        s.start(json!({"profile": "kiro", "name": "b", "extra_args": null}))
+            .unwrap();
+        s.start(json!({"profile": "kiro", "name": "c", "extra_args": []}))
+            .unwrap();
+        let runs = s.runs();
+        assert_eq!(runs.len(), 3);
+        for run in &runs {
+            assert_eq!(
+                run.argv,
+                Some(vec![
+                    s.bin("kiro-cli"),
+                    "chat".into(),
+                    "--trust-workspace".into()
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn the_agents_own_refusals_run_on_the_call_and_nothing_is_started_or_read() {
+        let s = setup("xa-refuse");
+        for (profile, extra, needle) in [
+            (
+                "devin",
+                json!(["--permission-mode", "dangerous"]),
+                "--permission-mode",
+            ),
+            (
+                "devin",
+                json!(["--permission-mode=dangerous"]),
+                "--permission-mode",
+            ),
+            (
+                "devin",
+                json!(["--respect-workspace-trust"]),
+                "--respect-workspace-trust",
+            ),
+            ("opencode", json!(["--auto"]), "--auto"),
+            (
+                "opencode",
+                json!(["run", "--auto-approve"]),
+                "--auto-approve",
+            ),
+        ] {
+            let err = s
+                .start(json!({"profile": profile, "extra_args": extra}))
+                .unwrap_err();
+            assert_eq!(err.data["error"], "invalid_input", "{extra}");
+            assert_eq!(err.data["field"], "extra_args", "{extra}");
+            assert!(err.text.contains(needle), "{}", err.text);
+            assert!(
+                err.text.starts_with("invalid_input: extra_args: "),
+                "{}",
+                err.text
+            );
+        }
+        // The same flags are fine for an agent that does not refuse them.
+        s.start(
+            json!({"profile": "kiro", "name": "k", "extra_args": ["--permission-mode", "--auto"]}),
+        )
+        .unwrap();
+        assert_eq!(s.runs().len(), 1, "only the kiro start reached the backend");
+        // The refused calls read no credential; only the accepted kiro start did.
+        assert_eq!(s.lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn kiro_dash_a_is_accepted_and_the_trust_guard_covers_the_pane() {
+        let s = setup("xa-kiro-a");
+        s.start(json!({"profile": "kiro", "name": "work", "extra_args": ["-a"]}))
+            .unwrap();
+        assert!(s.runs()[0]
+            .argv
+            .as_ref()
+            .unwrap()
+            .contains(&"-a".to_string()));
+        {
+            let mut state = s.fake.state.lock().unwrap();
+            state.panes[0].turn = Some(0);
+            state.screen = Some(
+                include_str!("../tests/fixtures/kiro-3.3.0/trust-all-warning-synthetic.screen.txt")
+                    .to_string(),
+            );
+        }
+        let err = call(
+            &s.sh,
+            "send_input",
+            &args(json!({"terminal": "work", "text": "hello"})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "pane_needs_trust_acceptance");
+        assert!(s.fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn extra_args_follow_the_input_rules() {
+        let s = setup("xa-input");
+        let long = "x".repeat(4097);
+        let ok_long = "y".repeat(4096);
+        for (extra, needle) in [
+            (json!(["bad\nline"]), "extra_args[0]"),
+            (json!(["fine", "esc\u{1b}[0m"]), "extra_args[1]"),
+            (json!([""]), "extra_args[0]"),
+            (json!(["  "]), "extra_args[0]"),
+            (json!([long]), "extra_args[0]"),
+            (json!(["fine", 7]), "list of strings"),
+            (json!(["fine", null]), "list of strings"),
+            (json!("-a"), "list of strings"),
+            (json!({"a": "b"}), "list of strings"),
+        ] {
+            let err = s
+                .start(json!({"profile": "kiro", "extra_args": extra}))
+                .unwrap_err();
+            assert_eq!(err.data["error"], "invalid_input", "{extra}");
+            assert!(err.text.contains(needle), "{extra}: {}", err.text);
+        }
+        assert!(s.runs().is_empty());
+        assert_eq!(s.lookups.load(Ordering::SeqCst), 0);
+        // The limit itself is fine, and a value is trimmed like any other input.
+        s.start(json!({"profile": "kiro", "name": "a", "extra_args": [ok_long, "  -a  "]}))
+            .unwrap();
+        let argv = s.runs()[0].argv.clone().unwrap();
+        assert_eq!(argv[argv.len() - 2].len(), 4096);
+        assert_eq!(argv[argv.len() - 1], "-a");
+    }
+
+    #[test]
+    fn the_profile_argv_and_extra_args_together_stay_within_the_cap() {
+        let s = setup("xa-cap");
+        // The kiro profile's argv is 3 elements (program, chat, --trust-workspace).
+        let fits: Vec<String> = (0..MAX_ARGV - 3).map(|i| format!("a{i}")).collect();
+        s.start(json!({"profile": "kiro", "name": "a", "extra_args": fits}))
+            .unwrap();
+        assert_eq!(s.runs()[0].argv.as_ref().unwrap().len(), MAX_ARGV);
+        let over: Vec<String> = (0..MAX_ARGV - 2).map(|i| format!("a{i}")).collect();
+        let err = s
+            .start(json!({"profile": "kiro", "name": "b", "extra_args": over}))
+            .unwrap_err();
+        assert_eq!(err.data["error"], "invalid_input");
+        assert!(err.text.contains("256"), "{}", err.text);
+        assert_eq!(s.runs().len(), 1);
+    }
+
+    #[test]
+    fn extra_args_without_a_profile_or_with_argv_line_or_agent_are_invalid_input() {
+        let s = setup("xa-noprofile");
+        for body in [
+            json!({"extra_args": ["-a"]}),
+            json!({"argv": ["true"], "extra_args": ["-a"]}),
+            json!({"line": "true", "extra_args": ["-a"]}),
+            json!({"argv": ["true"], "agent": "kiro", "extra_args": ["-a"]}),
+            json!({"profile": "kiro", "argv": ["true"], "extra_args": ["-a"]}),
+            json!({"profile": "kiro", "line": "true", "extra_args": ["-a"]}),
+            json!({"profile": "kiro", "agent": "kiro", "extra_args": ["-a"]}),
+        ] {
+            let err = s.start(body.clone()).unwrap_err();
+            assert_eq!(err.data["error"], "invalid_input", "{body}");
+        }
+        assert!(s.runs().is_empty());
+        // Absent flags with argv are the old argv start.
+        s.start(json!({"argv": ["true"], "name": "t", "extra_args": []}))
+            .unwrap();
+        assert_eq!(s.runs().len(), 1);
     }
 }

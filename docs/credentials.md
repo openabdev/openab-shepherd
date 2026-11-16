@@ -107,6 +107,22 @@ A pane's agent runs as the same OS account as Shepherd and can read any token fi
 account can read (see the [trust model](adr/trust-model.md)). So give it a separate
 narrow token rather than letting it borrow the operator's.
 
+## Flags on a profile start (`start:args`)
+
+A client that holds the scope `start:args` may append flags to a profile's arguments
+for one start (`extra_args` on `start_pane`, see
+[operations.md](operations.md#call-level-extra_args-for-a-profile-start)). Those flags run
+with the profile's credentials: the keychain secrets and environment the profile gives
+the CLI. Flags can point the CLI at another endpoint or MCP configuration, so a client
+with `start:args` steers a credentialed agent. It is bounded by the client's `profiles`
+list: grant `start:args` only with profiles you trust that client with, and keep
+credentialed profiles off the lists of clients that should not steer them. An `argv` or
+`line` pane never gets a profile's credentials, with or without `start:args`.
+
+Credentials do not belong in `extra_args`. The returned pane `argv` shows them to every
+observer, `ps` shows them, and Shepherd does not record argument values in the audit
+log (only flag names). The single token holds no `start:args`; a clients file grants it.
+
 ## What Shepherd does and does not do
 
 Shepherd does:

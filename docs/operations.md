@@ -162,7 +162,10 @@ profiles and is at most 1 MiB.
 
 - `name`: the pane-name rules (1-32 of `a-z`, `0-9`, `-`, `_`, `.`); unique.
 - `argv`, then `extra_args` (optional): the fixed program and arguments. A caller
-  cannot change or add to them. `argv[0]` is a program name or an absolute path, not a
+  cannot change or replace them; a client that holds `start:args` may append flags
+  after them with the call-level `extra_args` (see
+  [Call-level `extra_args`](#call-level-extra_args-for-a-profile-start); this key is
+  the operator's, that one is the caller's). `argv[0]` is a program name or an absolute path, not a
   relative path. A name is looked up when the pane starts, before any credential is
   read, in Shepherd's `PATH` (default `/usr/bin:/bin:/usr/sbin:/sbin`), skipping empty
   and relative entries such as `.`, so the caller's `cwd` never decides which
@@ -250,7 +253,8 @@ For how the operator signs in to the coding CLI or supplies its key, see
 ### Kiro `-a` (trust all tools)
 
 kiro-cli 3.3.0 accepts `-a` / `--trust-all-tools`. Shepherd passes it through like any
-other argument in a profile's `argv` or `extra_args` and does not police it; the Kiro
+other argument in a profile's `argv` or `extra_args`, or in a call-level `extra_args`
+([below](#call-level-extra_args-for-a-profile-start)), and does not police it; the Kiro
 arguments decide trust. `permission_mode: bypass` with `allow_bypass: true` adds no
 flag, so the label and the real behaviour can disagree. (Measured on 3.3.0: with `-a`
 no `requires approval` dialog appears and the status never reports `blocked`; 3.1.0, the
@@ -316,7 +320,7 @@ backend. Calls after the lookup use the pane's internal id. `send_input`,
 
 | MCP tool | Backend calls | Parameters | Result |
 |----------|---------------|------------|--------|
-| `start_pane` | `run` | `profile` (a [launch profile](#launch-profiles)), `cwd` (one the profile allows), `name` (optional; generated when missing); or, only with `allow_arbitrary_command`, `argv` or `line` (exactly one), `agent` (optional: `kiro`, `devin` or `opencode`), `cwd`, `name`, `env` (optional object, this pane only) | a [pane object](#pane-object) |
+| `start_pane` | `run` | `profile` (a [launch profile](#launch-profiles)), `cwd` (one the profile allows), `name` (optional; generated when missing), `extra_args` (optional list of flags appended after the profile's arguments; needs `start:args`, see [Call-level `extra_args`](#call-level-extra_args-for-a-profile-start)); or, only with `allow_arbitrary_command`, `argv` or `line` (exactly one), `agent` (optional: `kiro`, `devin` or `opencode`), `cwd`, `name`, `env` (optional object, this pane only) | a [pane object](#pane-object) |
 | `send_input` | `get` (twice), `send` | `terminal`, `text` | `terminal`, `turn`, `started`, `status` (a state word or null); on refusal, error `pane_blocked` with `kind` |
 | `read_output` | `get`, `read` | `terminal`, `lines` (0 to 10000) | `text` (escapes stripped), `complete`, `source` (`screen`, `history`, `stitched`, or `other`), `reason` (why only the screen was read: `blocked`, `other`, or null) |
 | `get_status` | `get` | `terminal` | a [pane object](#pane-object) plus `terminal` |
@@ -642,6 +646,82 @@ The declaration is the caller's claim. Shepherd does not compare it with `argv[0
 (a `line`, `npx` or `env` would defeat any such rule); a wrong claim leads to a
 dialog parser that does not recognise the screen and sends no key. The audit records
 the claim (`agent`) next to `launch` and `argv0`.
+
+## Call-level `extra_args` for a profile start
+
+A profile fixes its program and arguments. A client that holds the scope `start:args`
+may add flags to one start:
+
+```json
+{"profile": "kiro-sandbox", "extra_args": ["-a", "--model", "claude-sonnet-4"], "cwd": "/work/demo"}
+```
+
+- **Append only.** The pane runs `program`, then the `permission_mode` flag Shepherd adds
+  for the profile's agent (Devin only), then the profile's own `argv` and its file
+  `extra_args`, then the call's `extra_args`. It cannot replace or remove a profile
+  argument, change the program, the working-directory list, the environment, the
+  credentials or the routine settings. The returned pane's `argv` shows what ran.
+- **Scope and list.** The call needs `start`, the profile on the client's `profiles`
+  list and `start:args`. Neither `start` nor `start:arbitrary` stands in for it. The
+  list is the control: grant `start:args` only together with profiles you trust that
+  client to steer.
+- **Presence.** A non-empty array needs the scope. `null` and `[]` add nothing and need
+  none, so an older client library that sends them is not refused.
+- **Input rules.** Each element follows the [input rules](#input-rules) (trimmed, 1 to
+  4096 bytes, no control characters), error prefix `extra_args[i]:`. The profile's
+  `argv` and the call's `extra_args` together have at most 256 elements.
+- **The agent's own refusals still run.** On the profile's `argv` plus the call's
+  `extra_args` (never on the `--permission-mode` Shepherd adds itself): OpenCode
+  auto-approve flags, and for Devin `--permission-mode` and `--respect-workspace-trust`,
+  are `invalid_input` with the field `extra_args`. A client that needs one of those
+  edits the profile, which is an operator decision. Kiro `-a` is not policed (see
+  [Kiro `-a`](#kiro--a-trust-all-tools)); the Kiro trust-all guard covers the pane.
+- **Not for argv or line.** `extra_args` with no `profile`, or together with `argv`,
+  `line` or `agent`, is `invalid_input`; with `argv`, put the arguments in `argv`.
+- **It runs with the profile's credentials.** Unlike an `argv` or `line` pane, a
+  profile pane has the profile's environment and keychain secrets, and flags can point
+  the CLI at another endpoint or MCP configuration. Never put a credential in
+  `extra_args`: it is returned in the pane's `argv`, shows in `ps`, and the audit does
+  not record values. See [credentials.md](credentials.md).
+- **Older servers ignore it.** A server without this field drops unknown arguments, so
+  a client must read the returned `argv` to see that its flags were applied.
+- **Audit.** A start with flags records `launch` `profile+args`, `extra_args_n` (the
+  count) and `flags` (names only, see [Audit log](#audit-log)).
+
+### Who can use it: a single token cannot
+
+`start:args` is in the list of scopes a clients file may name, and not in the seven the
+single token holds. **A deployment with only `OPENAB_SHEPHERD_TOKEN` or a token file and
+no clients file cannot use `extra_args`**: the call is `forbidden`, naming `start:args`.
+Nothing else about that deployment changes. To use it, move to a clients file. The short
+recipe:
+
+1. Make a token and its hash as in [Operator recipe](#operator-recipe-a-token-and-its-hash).
+2. Unset `OPENAB_SHEPHERD_TOKEN` and `OPENAB_SHEPHERD_TOKEN_FILE` (a clients file refuses
+   them), and set `OPENAB_SHEPHERD_CLIENTS` and `OPENAB_SHEPHERD_AUDIT_FILE`.
+3. Write the clients file, with the scopes the old token had that the client needs plus
+   `start:args`, and a short `profiles` list:
+
+```json
+{
+  "version": 1,
+  "clients": [
+    {
+      "id": "orchestrator",
+      "token_sha256": "<64 hex characters>",
+      "scopes": ["observe", "read", "control", "start", "start:args", "dialog", "remove"],
+      "profiles": ["kiro-sandbox"]
+    }
+  ]
+}
+```
+
+4. Give the client the token, and restart Shepherd (the clients file is read once).
+
+There is no server setting that grants `start:args` to every client, and no posture
+switch. To also let that client run its own program, add `start:arbitrary` and set
+`allow_arbitrary_command: true` in the profiles file; the two are separate and both are
+needed. See the [trusted-client recipe](adr/trust-model.md#trusted-clients).
 
 ## Terminal backend
 
@@ -1084,6 +1164,7 @@ Everything not allowed is denied, and a tool with no scope mapping is denied.
 | `control` | `send_input`, `interrupt_pane` |
 | `start` | `start_pane` with a `profile` that is on the client's `profiles` list |
 | `start:arbitrary` | `start_pane` with `argv` or `line` |
+| `start:args` | `start_pane` with a `profile` and a non-empty call-level `extra_args` (needs `start` too; the single token does not hold it) |
 | `dialog` | `answer_dialog` |
 | `remove` | `remove_pane` |
 | `attach` | Watching a pane's stream as a viewer (reserved: the attach surface is not in this release) |
@@ -1094,7 +1175,9 @@ Everything not allowed is denied, and a tool with no scope mapping is denied.
 - A `start_pane` call that names a `profile` needs `start` and the profile on the
   list. A call with `argv` or `line` (the key present counts, even as `null`) needs
   `start:arbitrary`. `start:arbitrary` does not turn on `allow_arbitrary_command`:
-  the server setting is a separate ceiling, and both must allow it.
+  the server setting is a separate ceiling, and both must allow it. A call with a
+  non-empty `extra_args` also needs `start:args`, which `start` and `start:arbitrary`
+  do not imply.
 - A client's scopes only narrow what the server and the profile already allow. They
   never add a bypass mode, an environment variable or a directory.
 - A denied call is an MCP tool result with the error code `forbidden` (not an HTTP
@@ -1146,8 +1229,15 @@ is recorded (only allowed when no clients file is set).
   - `start_pane`: `profile` and `pane` (the requested name; the outcome line also
     carries the name the pane got). A start with `argv` or `line` also records `launch`
     (`argv` or `line`), `argv0` (the basename of `argv[0]`; none for `line`) and, when
-    the call declares one, `agent`. The arguments, the line and the environment are never
-    recorded.
+    the call declares one, `agent`. A profile start with a non-empty call-level
+    `extra_args` records `launch` `profile+args` and `extra_args_n` (the count). An
+    `argv` start or a start with `extra_args` also records `flags`: only elements of the
+    form `--name` (lowercase letters, digits and `-`, cut at the first `=`) and the exact
+    short flag `-a`, each once, at most 32. `--api-key SECRET` records `--api-key`;
+    `-pSECRET` and `--api-key=SECRET` record nothing of the secret. The argument values,
+    the line and the environment are never recorded. A plain profile start has the
+    record it always had. `flags` answers "who started a trust-all pane"; it is not a
+    complete list of what ran.
   - `send_input`: `pane` and `text_len` (the length of the text in bytes).
   - `answer_dialog`: `pane` and `choice`.
   - `read_output`, `interrupt_pane`, `remove_pane`, `draft_clear`: `pane`.
@@ -1190,7 +1280,7 @@ Typed text is not recorded, only its length, but a screen read by a client with
 
 - No clients file: nothing changes. The token from `OPENAB_SHEPHERD_TOKEN_FILE` (or
   `OPENAB_SHEPHERD_TOKEN`) becomes the client `default`, with the seven scopes above `attach` and every
-  profile (none of `attach`, `attach:write`, `lease:preempt` or `routine`). It is audited only if `OPENAB_SHEPHERD_AUDIT_FILE` is set.
+  profile (none of `attach`, `attach:write`, `lease:preempt`, `routine` or `start:args`). It is audited only if `OPENAB_SHEPHERD_AUDIT_FILE` is set.
 - With a clients file, a token file or a token in the environment is a startup error,
   because a token with every scope would cancel the limits of the others. The message
   names the fix: unset the variable and give that client its own entry

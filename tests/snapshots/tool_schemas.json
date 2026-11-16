@@ -311,6 +311,13 @@
             "description": "Extra environment variables for an argv or line pane only (refused with profile): at most 32, names [A-Z_][A-Z0-9_]*, values under the same input rules (empty allowed; leading and trailing whitespace is trimmed). A backend may refuse protected names (the native backend refuses HOME, PATH, USER, LANG, TERM and DYLD_*/LD_*); a backend without per-run environments returns unsupported.",
             "type": "object"
           },
+          "extra_args": {
+            "description": "With profile only: call-level flags appended after the profile's own arguments (never before them, never replacing one). Needs the start:args scope. Each element follows the input rules; the profile's argv and extra_args together stay within 256 elements; an agent's refused flags (OpenCode auto-approve, Devin --permission-mode and --respect-workspace-trust) are refused here too. They run with the profile's credentials, so do not put a secret in them. Not the profile file's extra_args key, which the operator fixes. An older server ignores this field: read the argv in the returned pane to see what ran.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "line": {
             "description": "Shell line run by sh -c. Only when arbitrary commands are allowed.",
             "type": "string"
