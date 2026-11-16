@@ -250,7 +250,13 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, tools::TOOL_NAMES);
+        // The legacy caller of a bare deployment holds no `lease:preempt`, so
+        // `draft_clear` is not listed for it (issue #77).
+        let legacy: Vec<&str> = tools::TOOL_NAMES
+            .into_iter()
+            .filter(|name| *name != "draft_clear")
+            .collect();
+        assert_eq!(names, legacy);
     }
 
     #[test]
@@ -464,7 +470,7 @@ mod issue4_pr1_mcp {
     use crate::clients::{ProfileAccess, Scope};
     use crate::dialog::fixtures::dialog_on_allow;
     use crate::profiles::LaunchPolicy;
-    use crate::testutil::{FakeBackend, TempDir};
+    use crate::testutil::{FakeBackend, FakeShared, TempDir};
     use std::io;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -594,6 +600,11 @@ mod issue4_pr1_mcp {
                 Scope::Dialog,
             ),
             ("remove_pane", json!({"terminal": "work"}), Scope::Remove),
+            (
+                "draft_clear",
+                json!({"terminal": "work"}),
+                Scope::LeasePreempt,
+            ),
         ]
     }
 
@@ -878,7 +889,7 @@ mod issue4_pr1_mcp {
     }
 
     #[test]
-    fn the_default_caller_sees_every_tool_and_the_old_wrapper_agrees() {
+    fn the_default_caller_sees_every_old_tool_and_the_old_wrapper_agrees() {
         let dir = TempDir::new("i4-default");
         let fake = idle_fake();
         let sh = shepherd(&fake, dir.path(), true);
@@ -890,14 +901,48 @@ mod issue4_pr1_mcp {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, tools::TOOL_NAMES);
+        // Every tool but `draft_clear` (issue #77): that one needs
+        // `lease:preempt`, which the legacy caller does not hold.
+        let legacy: Vec<&str> = tools::TOOL_NAMES
+            .into_iter()
+            .filter(|name| *name != "draft_clear")
+            .collect();
+        assert_eq!(names, legacy);
         assert_eq!(handle_message(&sh, &list), Some(reply));
         // Every tool the old suites call is allowed for it, whatever the args.
         let dir2 = TempDir::new("i4-default-table");
         for (tool, arguments, _) in table(dir2.path()) {
             let out = run(&sh, &Caller::default_client(), tool, arguments);
-            assert_ne!(code(&out), "forbidden", "{tool}: {out}");
+            if tool == "draft_clear" {
+                assert_eq!(code(&out), "forbidden", "{out}");
+                assert_eq!(out["structuredContent"]["scope"], "lease:preempt");
+            } else {
+                assert_ne!(code(&out), "forbidden", "{tool}: {out}");
+            }
         }
+    }
+
+    #[test]
+    fn draft_clear_is_listed_only_for_a_caller_with_lease_preempt() {
+        let dir = TempDir::new("i4-list-draft-clear");
+        let fake = idle_fake();
+        let sh = shepherd(&fake, dir.path(), true);
+        let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+        let listed = |caller: &Caller| -> Vec<String> {
+            handle_message_as(&sh, caller, &list).unwrap()["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let draft_clear = "draft_clear".to_string();
+        assert!(!listed(&caller_with(&[Scope::Control], &[])).contains(&draft_clear));
+        assert!(!listed(&caller_with(&[Scope::AttachWrite], &[])).contains(&draft_clear));
+        assert_eq!(
+            listed(&caller_with(&[Scope::LeasePreempt], &[])),
+            [draft_clear]
+        );
     }
 
     // ---- group 5: audit around the tools ----
@@ -1155,5 +1200,87 @@ mod issue4_pr1_mcp {
         let records = sink.records();
         assert_eq!(records[0]["client"], "tester");
         assert!(!sink.bytes().contains("system:routine"));
+    }
+    // ---- issue #77: draft_clear ----
+
+    fn shared_shepherd(fake: &FakeBackend, dir: &Path, shared: &Arc<FakeShared>) -> Shepherd {
+        shepherd(fake, dir, false).with_shared_panes(shared.clone())
+    }
+
+    #[test]
+    fn draft_clear_without_lease_preempt_reaches_neither_the_backend_nor_the_person_side() {
+        let dir = TempDir::new("pr2-forbidden");
+        let fake = idle_fake();
+        let shared = Arc::new(FakeShared::default());
+        shared.person_at_the_pane(false, true);
+        let (audit, sink) = memory_audit();
+        let sh = shared_shepherd(&fake, dir.path(), &shared).with_audit(Arc::new(audit));
+        // Every scope but the one it needs, the legacy caller among them.
+        let others: Vec<Scope> = Scope::ALL
+            .into_iter()
+            .filter(|s| *s != Scope::LeasePreempt)
+            .collect();
+        for caller in [caller_with(&others, &["ci"]), Caller::default_client()] {
+            let out = run(&sh, &caller, "draft_clear", json!({"terminal": "work"}));
+            assert_eq!(code(&out), "forbidden", "{out}");
+            assert_eq!(out["structuredContent"]["scope"], "lease:preempt");
+        }
+        assert_eq!(shared.clears(), 0);
+        assert_eq!(shared.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+        assert!(*shared.draft.lock().unwrap(), "the draft is still set");
+        let records = sink.records();
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(records.iter().all(|r| r["tool"] == "draft_clear"));
+        assert!(records.iter().all(|r| r["outcome"] == "denied"));
+    }
+
+    #[test]
+    fn draft_clear_with_lease_preempt_clears_and_the_audit_shows_call_and_outcome() {
+        let dir = TempDir::new("pr2-clear");
+        let fake = idle_fake();
+        let shared = Arc::new(FakeShared::default());
+        shared.person_at_the_pane(true, true);
+        let (audit, sink) = memory_audit();
+        let sh = shared_shepherd(&fake, dir.path(), &shared).with_audit(Arc::new(audit));
+        let person = caller_with(&[Scope::LeasePreempt], &[]);
+        let out = run(&sh, &person, "draft_clear", json!({"terminal": "work"}));
+        assert_eq!(out["isError"], false, "{out}");
+        assert_eq!(out["structuredContent"]["cleared"], true, "{out}");
+        assert!(!*shared.draft.lock().unwrap());
+        assert!(
+            shared.lease.lock().unwrap().is_some(),
+            "the lease is not touched"
+        );
+        // Nothing was typed into the pane.
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+        let records = sink.records();
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0]["phase"], "call");
+        assert_eq!(records[1]["phase"], "outcome");
+        assert_eq!(records[1]["outcome"], "ok");
+        for record in &records {
+            assert_eq!(record["tool"], "draft_clear");
+            assert_eq!(record["client"], "tester");
+            assert_eq!(record["pane"], "work");
+        }
+        // Again: nothing to clear is not an error.
+        let again = run(&sh, &person, "draft_clear", json!({"terminal": "work"}));
+        assert_eq!(again["structuredContent"]["cleared"], false, "{again}");
+    }
+
+    #[test]
+    fn a_failing_sink_refuses_draft_clear_and_clears_nothing() {
+        let dir = TempDir::new("pr2-failclosed");
+        let fake = idle_fake();
+        let shared = Arc::new(FakeShared::default());
+        shared.person_at_the_pane(false, true);
+        let sh = shared_shepherd(&fake, dir.path(), &shared).with_audit(Arc::new(failing_audit()));
+        let person = caller_with(&[Scope::LeasePreempt], &[]);
+        let out = run(&sh, &person, "draft_clear", json!({"terminal": "work"}));
+        assert_eq!(out["isError"], true);
+        assert_eq!(code(&out), "audit_unavailable", "{out}");
+        assert_eq!(shared.clears(), 0);
+        assert!(*shared.draft.lock().unwrap(), "the draft is still set");
     }
 }

@@ -312,8 +312,9 @@ fn front_main(args: &[String]) -> ExitCode {
         audit,
     } = startup;
     let native = link.backend.clone();
-    let mut shepherd =
-        tools::Shepherd::with_policy(native.clone(), policy).with_registry(Arc::new(native));
+    let mut shepherd = tools::Shepherd::with_policy(native.clone(), policy)
+        .with_registry(Arc::new(native.clone()))
+        .with_shared_panes(Arc::new(native));
     // Before the routine starts, so its nudges are recorded too.
     if let Some(audit) = audit {
         shepherd = shepherd.with_audit(audit);
@@ -450,7 +451,8 @@ fn main() -> ExitCode {
                 }
             }));
             let handle = Some(native.clone());
-            let mut shepherd = tools::Shepherd::with_policy(native, policy);
+            let mut shepherd = tools::Shepherd::with_policy(native.clone(), policy)
+                .with_shared_panes(Arc::new(native));
             // Before the routine starts, so its nudges are recorded too.
             if let Some(audit) = audit {
                 shepherd = shepherd.with_audit(audit);

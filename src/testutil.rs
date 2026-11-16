@@ -9,6 +9,7 @@ use crate::backend::{
     TerminalInfo, TerminalList, TerminalRef, WaitResult,
 };
 use crate::panelock::PaneLocks;
+use crate::shared_panes::{HumanState, LeaseInfo, SharedPanes};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -98,6 +99,8 @@ pub struct FakeState {
     /// When set, the next `send` that passes its guard fails with this
     /// instead of writing.
     pub send_error: Option<BackendError>,
+    /// When set, `list` returns every pane instead of being unsupported.
+    pub listable: bool,
 }
 
 /// An in-memory backend. `get`, `send`, `remove`, and (with
@@ -248,7 +251,19 @@ impl TerminalBackend for FakeBackend {
     }
 
     fn list(&self, _all: bool) -> Result<TerminalList, BackendError> {
-        self.unsupported("list")
+        let state = self.state.lock().unwrap();
+        if !state.listable {
+            drop(state);
+            return self.unsupported("list");
+        }
+        drop(state);
+        self.record("list");
+        let state = self.state.lock().unwrap();
+        Ok(TerminalList {
+            terminals: state.panes.clone(),
+            hidden_finished: None,
+            live_limit: None,
+        })
     }
 
     fn read(&self, t: &TerminalRef, _lines: u32) -> Result<ScreenText, BackendError> {
@@ -462,5 +477,51 @@ impl TerminalBackend for FakeBackend {
             stopped: pane.live.then_some(StopHow::Exited),
             exit_code: pane.exit_code,
         })
+    }
+}
+
+/// A person side for the fake backend (issue #77): one lease and one draft,
+/// whichever pane is asked about, and a count of the questions and clears so a
+/// test can tell whether a call reached it.
+#[derive(Default)]
+pub struct FakeShared {
+    pub lease: Mutex<Option<LeaseInfo>>,
+    pub draft: Mutex<bool>,
+    pub asked: std::sync::atomic::AtomicUsize,
+    pub clears: std::sync::atomic::AtomicUsize,
+    /// When set, `draft_clear` fails with this kind of error.
+    pub clear_error: Mutex<Option<ErrorKind>>,
+}
+
+impl FakeShared {
+    pub fn person_at_the_pane(&self, lease: bool, draft: bool) {
+        *self.lease.lock().unwrap() = lease.then(|| LeaseInfo {
+            holder: "person".to_string(),
+            idle: Duration::from_millis(3_400),
+            expires_in: Duration::from_millis(296_600),
+        });
+        *self.draft.lock().unwrap() = draft;
+    }
+
+    pub fn clears(&self) -> usize {
+        self.clears.load(Ordering::SeqCst)
+    }
+}
+
+impl SharedPanes for FakeShared {
+    fn human_state(&self, _t: &TerminalRef) -> Result<HumanState, BackendError> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        Ok(HumanState {
+            lease: self.lease.lock().unwrap().clone(),
+            draft: *self.draft.lock().unwrap(),
+        })
+    }
+
+    fn draft_clear(&self, _t: &TerminalRef) -> Result<bool, BackendError> {
+        self.clears.fetch_add(1, Ordering::SeqCst);
+        if let Some(kind) = self.clear_error.lock().unwrap().clone() {
+            return Err(BackendError::new(kind, "fake: the clear failed"));
+        }
+        Ok(std::mem::replace(&mut *self.draft.lock().unwrap(), false))
     }
 }

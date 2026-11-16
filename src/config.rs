@@ -204,7 +204,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// The token(s), the clients and the audit path. Without a clients file this is
 /// today's single token, as client `default`. With one, the audit path is
 /// required and both token variables are a startup error: a token beside a
-/// clients file would hold every scope and undo the narrower tokens.
+/// clients file would hold the legacy scopes and undo the narrower tokens.
 fn load_identity<F>(
     lookup: &F,
     project_dir: &Path,
@@ -954,8 +954,11 @@ mod issue4_pr1_loader {
         let header = format!("Bearer {LEGACY}");
         let caller = config.clients.authenticate(Some(&header), 0).unwrap();
         assert_eq!(caller.client(), "default");
-        for scope in Scope::ALL {
+        for scope in Scope::LEGACY {
             assert!(caller.has(scope), "{scope}");
+        }
+        for scope in [Scope::Attach, Scope::AttachWrite, Scope::LeasePreempt] {
+            assert!(!caller.has(scope), "the legacy token holds {scope}");
         }
     }
 }

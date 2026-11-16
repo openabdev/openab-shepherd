@@ -138,6 +138,11 @@ failed nudge. So is a pane a person is at (`pane_human_controlled`, `pane_draft_
 the nudge is refused, not queued, counts toward neither the cooldown nor the cap, and
 is logged once per episode. When the person is gone the next tick nudges, and the idle
 time already elapsed counts.
+A server that knows who is at the pane checks before it types: a pane with a lease or a
+draft is skipped before the nudge is counted and before any audit `call` line is written,
+so the audit file does not fill with one refused call per tick while a person types. The
+refusal inside the write stays the authority; the check is only an early exit. A
+`draft_clear` by a client with `lease:preempt` lets the next tick nudge.
 
 ## Identity and audit
 

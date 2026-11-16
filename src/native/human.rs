@@ -16,6 +16,7 @@
 #![cfg_attr(not(test), allow(dead_code))] // the shared-panes attach calls these
 
 use super::*;
+use crate::shared_panes::{HumanState, LeaseInfo, SharedPanes};
 use std::sync::TryLockError;
 
 /// How long a lease operation waits for a bot's in-flight write (a paste, its
@@ -29,22 +30,6 @@ const INPUT_POLL: Duration = Duration::from_millis(2);
 pub(crate) struct LeaseGrant {
     pub id: u64,
     pub expires_in: Duration,
-}
-
-/// Who holds the lease, for display.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LeaseInfo {
-    pub holder: String,
-    pub idle: Duration,
-    pub expires_in: Duration,
-}
-
-/// What a pane's person-side state is right now.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HumanState {
-    /// None when no lease is held or the held one has idled out.
-    pub lease: Option<LeaseInfo>,
-    pub draft: bool,
 }
 
 /// Where one lease stands, for the thread that serves its holder.
@@ -358,5 +343,15 @@ impl NativeBackend {
             pane.set_draft_flag(false)?;
         }
         Ok(was_set)
+    }
+}
+
+impl SharedPanes for NativeBackend {
+    fn human_state(&self, t: &TerminalRef) -> Result<HumanState, BackendError> {
+        NativeBackend::human_state(self, t)
+    }
+
+    fn draft_clear(&self, t: &TerminalRef) -> Result<bool, BackendError> {
+        NativeBackend::draft_clear(self, t)
     }
 }

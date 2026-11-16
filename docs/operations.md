@@ -49,7 +49,7 @@ later is a contained change.
 | `examples/native_probe.rs` | The real-Kiro probe for the native backend |
 | `examples/native_leak_check.rs` | Real-Kiro leak check: removes a pane and verifies no descendant process survives (issue #10) |
 | `examples/record_tail.rs` | Records a program's raw output and final screen as a replay fixture (user-run; see [Restart survival](#restart-survival)) |
-| `src/tools.rs` | The nine tools, their schemas, the safety rules, and the backend calls each one makes |
+| `src/tools.rs` | The ten tools, their schemas, the safety rules, and the backend calls each one makes |
 | `src/routine.rs` | The per-pane routine state and its nudge decision (the tools run its thread) |
 | `src/dialog.rs` | Text parser for the kiro-cli permission dialog |
 | `src/devin_dialog.rs` | Text parser for the Devin CLI permission dialog |
@@ -265,6 +265,7 @@ backend. Calls after the lookup use the pane's internal id. `send_input`,
 | `interrupt_pane` | `get` (twice), `interrupt` | `terminal`, `timeout` (1 to 60 s, optional) | `terminal`, `key` (the stop key the backend chose: `esc`, `ctrl+c`, or `other`), `outcome` (`stopped`, `exited`, `still_working`, `unknown`, or `other`) |
 | `answer_dialog` | `get`, `read`, `keys` | `terminal`, `choice` (`allow_once` or `deny_once`) | `terminal`, `choice`, `selected`, `title`, `command`, `options`, `moves`, `keys_result` (`status`, `turn`) |
 | `remove_pane` | `get` (twice), `remove` | `terminal`, `timeout` (0 to 60 s, default 2: the grace before the kill) | `name`, `was_live` (the program was running), `stopped` (`exited`, `killed`, `other`, or null when it had already finished), `exit_code` (128 + the signal number when a signal ended it; null when unknown). See [remove_pane](#remove_pane) |
+| `draft_clear` | `get`, then the person side's `draft_clear` (no pane lock: it types nothing) | `terminal` | `terminal`, `cleared` (whether a draft was set). Needs the `lease:preempt` scope. See [draft_clear](#draft_clear) |
 
 Tool results carry `structuredContent` and a text copy. Unknown tool names are
 JSON-RPC errors.
@@ -290,6 +291,7 @@ unchanged (a breaking change of the result shape; no client depended on it).
 | `turn` | Goes up each time the status leaves `working` |
 | `status_ms` | When the status last changed, ms since the epoch |
 | `argv`, `cwd` | What it was started with, when the backend says |
+| `human` | Only on `get_status` and `list_panes` entries, and only while a person is at the pane: `{lease, draft}`. `lease` is null or `{holder, idle_secs, expires_in_secs}`; `draft` is whether they typed and have not pressed Enter. The field is left out when there is neither, and on a server where nobody can take a lease, so output there is unchanged |
 
 ### Errors
 
@@ -308,8 +310,8 @@ for debugging; do not parse it.
 | `status_mismatch` | A backend-side input condition did not hold; nothing was sent |
 | `pane_finished` | The pane's program has ended |
 | `pane_replayed` | The pane was picked up by a new server after a restart and its screen is not yet trusted, so nothing was typed. Refused for `send_input`, `answer_dialog` and the routine's nudge. It clears when the program repaints; see [Restart survival](#restart-survival) |
-| `pane_human_controlled` | A person holds the pane's input lease, so nothing was typed. Refused for `send_input`, `send_keys`, `answer_dialog`, `interrupt_pane`, `remove_pane` and the routine's nudge, and never queued: look again later. `idle_secs` and `expires_in_secs` say how long the person has been quiet and when the lease ends if they stay so (300 s without input). No client can take a lease yet, so a server started as before never answers this |
-| `pane_draft_pending` | A person typed into the pane and has not pressed Enter, so nothing was typed. Refused for the same operations as `pane_human_controlled`, and never queued. Only a person's Enter clears it, not a turn advance and not time. A server restart under `hold` keeps it. No client can create a draft yet |
+| `pane_human_controlled` | A person holds the pane's input lease, so nothing was typed. Refused for `send_input`, `send_keys`, `answer_dialog`, `interrupt_pane`, `remove_pane` and the routine's nudge, and never queued: look again later. `idle_secs` and `expires_in_secs` say how long the person has been quiet and when the lease ends if they stay so (300 s without input). No client can take a lease yet, so a server started as before never answers this. `draft_clear` does not end a lease |
+| `pane_draft_pending` | A person typed into the pane and has not pressed Enter, so nothing was typed. Refused for the same operations as `pane_human_controlled`, and never queued. Only a person's Enter clears it, not a turn advance and not time. A server restart under `hold` keeps it. A client with `lease:preempt` can clear it with [`draft_clear`](#draft_clear) when the person is gone. No client can create a draft yet |
 | `terminal_changed` | The name pointed at a different pane while waiting for the pane lock; nothing was sent |
 | `refused` | `answer_dialog` refused; see [answer_dialog](#answer_dialog) |
 | `unavailable` | The backend cannot be reached |
@@ -448,6 +450,29 @@ What this guarantees, and what it does not:
 - **Guarded key.** The native backend has `conditional_keys`: `enter` carries the
   status, kind and turn guard and is checked in the same step as the key press, and no
   other client can attach to a native pane.
+
+### draft_clear
+
+Clears a pane's draft flag (issue #77). A person who types into a pane leaves the
+flag set until they press Enter, and while it is set every bot write is refused with
+`pane_draft_pending`. If the person is gone and their half-typed line no longer
+matters, a client with `lease:preempt` calls `draft_clear` with the pane's name.
+
+- It clears the flag whoever holds the pane's input lease, and does not touch the
+  lease: while a person holds one, a bot is still refused with
+  `pane_human_controlled`.
+- It types nothing. The half-typed line stays on the pane's input line; read the
+  screen first if that matters.
+- It takes no pane lock, so it works while another call is stuck on that lock, and
+  waits only for a write that is already in flight. It never lands between a bot's
+  paste and its Enter.
+- The result is `terminal` and `cleared`: true when a draft was set, false when
+  there was nothing to clear (not an error). A backend with no person side, which
+  includes a server nobody can take a lease on, answers `unsupported`.
+- It is recorded in the audit log like the other mutating tools, and is refused
+  with `audit_unavailable` when the `call` line cannot be written.
+- A bot does not clear a draft any other way: neither a turn advance nor time does,
+  and no other tool.
 
 ### remove_pane
 
@@ -889,6 +914,9 @@ Everything not allowed is denied, and a tool with no scope mapping is denied.
 | `start:arbitrary` | `start_pane` with `argv` or `line` |
 | `dialog` | `answer_dialog` |
 | `remove` | `remove_pane` |
+| `attach` | Watching a pane's stream as a viewer (reserved: the attach surface is not in this release) |
+| `attach:write` | Typing into a pane as a person, under the input lease (reserved, as `attach`) |
+| `lease:preempt` | `draft_clear`; taking the input lease from a person who holds it (the second part is reserved, as `attach`) |
 
 - A `start_pane` call that names a `profile` needs `start` and the profile on the
   list. A call with `argv` or `line` (the key present counts, even as `null`) needs
@@ -901,6 +929,11 @@ Everything not allowed is denied, and a tool with no scope mapping is denied.
   has a scope for; this is a convenience, the check runs on every call.
 - `dialog` is kept apart on purpose: approving a permission dialog lets the agent
   run what it asked for.
+- `attach`, `attach:write` and `lease:preempt` are for a person at a shared pane
+  (issue #77), not for a bot. The single legacy token holds none of the three, so
+  a deployment that wants a person at a pane needs a clients file, and a bot's
+  client is simply not given them. A clients file may name them (an older server
+  reading a file that does is a startup error on the unknown scope).
 
 ### Audit log
 
@@ -918,7 +951,7 @@ is recorded (only allowed when no clients file is set).
   `phase`.
 - `phase` is one of:
   - `call`: written before a mutating tool runs (`start_pane`, `send_input`,
-    `answer_dialog`, `remove_pane`, `interrupt_pane`).
+    `answer_dialog`, `remove_pane`, `interrupt_pane`, `draft_clear`).
   - `outcome`: written after the call, best effort, for the mutating tools and for
     `read_output`. It carries `outcome`, which is `ok` or `error:<code>` using the
     tool's error code.
@@ -930,7 +963,7 @@ is recorded (only allowed when no clients file is set).
     carries the name the pane got).
   - `send_input`: `pane` and `text_len` (the length of the text in bytes).
   - `answer_dialog`: `pane` and `choice`.
-  - `read_output`, `interrupt_pane`, `remove_pane`: `pane`.
+  - `read_output`, `interrupt_pane`, `remove_pane`, `draft_clear`: `pane`.
 - Never recorded: tokens, token hashes, the `Authorization` header, environment
   values, argv, request bodies, typed text, screen text, file contents.
 - Failed authentications are not written to the audit file. Shepherd prints each one
@@ -941,8 +974,8 @@ is recorded (only allowed when no clients file is set).
 error; a file that was unlinked or renamed while Shepherd runs is not detected,
 because writes keep going to the old file), these tools are refused with the error
 code `audit_unavailable` and nothing is done: `start_pane`, `send_input`,
-`answer_dialog` and `remove_pane`. The routine's nudges follow the same rule.
-`interrupt_pane` and the reads go ahead. `interrupt_pane` stays open because it is
+`answer_dialog`, `remove_pane` and `draft_clear`. The routine's nudges follow the same
+rule. `interrupt_pane` and the reads go ahead. `interrupt_pane` stays open because it is
 how a person stops a runaway agent; it is still recorded when the write works.
 Failed writes are counted and reported on stderr at most once a minute. A full disk
 therefore stops state changes but not reading, interrupting, or answering a dialog in
@@ -960,8 +993,8 @@ Typed text is not recorded, only its length, but a screen read by a client with
 ### Migration from the single token
 
 - No clients file: nothing changes. The token from `OPENAB_SHEPHERD_TOKEN_FILE` (or
-  `OPENAB_SHEPHERD_TOKEN`) becomes the client `default`, with every scope and every
-  profile. It is audited only if `OPENAB_SHEPHERD_AUDIT_FILE` is set.
+  `OPENAB_SHEPHERD_TOKEN`) becomes the client `default`, with the seven scopes above `attach` and every
+  profile (none of `attach`, `attach:write` or `lease:preempt`). It is audited only if `OPENAB_SHEPHERD_AUDIT_FILE` is set.
 - With a clients file, a token file or a token in the environment is a startup error,
   because a token with every scope would cancel the limits of the others. The message
   names the fix: unset the variable and give that client its own entry

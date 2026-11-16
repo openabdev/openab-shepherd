@@ -2212,4 +2212,146 @@ mod tools_layer {
         call(&sh, "remove_pane", &args(json!({"terminal": "w"}))).unwrap();
         assert!(PaneRegistry::registered(s.b()).is_empty());
     }
+    // ---- issue #77, PR2: the tools over a real native front ----
+
+    /// The tools with the front as the person side, over a pane that reports
+    /// `done` and then reads its terminal.
+    fn shared_tools(s: &Split, dir: &TempDir) -> Shepherd {
+        let script = format!("printf '{DONE}'; cat > /dev/null");
+        let b = s.b().clone();
+        Shepherd::with_policy(b.clone(), policy(dir, &script, None)).with_shared_panes(Arc::new(b))
+    }
+
+    fn code_of(result: Result<Value, crate::tools::ToolError>) -> String {
+        result.expect_err("the call should be refused").data["error"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn a_draft_is_cleared_by_draft_clear_and_by_nothing_a_bot_does() {
+        let s = Split::new(1 << 20);
+        let dir = TempDir::new("pr2-draft-clear");
+        let sh = shared_tools(&s, &dir);
+        start(&sh, "w");
+        let t = TerminalRef::new("w");
+        eventually("the done status", || {
+            let got = s.b().get(&t).ok()?;
+            got.status
+                .as_ref()
+                .is_some_and(|st| st.state == State::Done)
+                .then_some(())
+        });
+        let get = |tool: &str| call(&sh, tool, &args(json!({"terminal": "w"}))).unwrap();
+        assert!(get("get_status").get("human").is_none(), "nobody is here");
+        let id = typing(s.b(), &t, b"half a line");
+        let mark = s.host.mark();
+        let status = get("get_status");
+        assert_eq!(status["human"]["draft"], true, "{status}");
+        assert_eq!(status["human"]["lease"]["holder"], "person", "{status}");
+        assert!(
+            status["human"]["lease"]["expires_in_secs"]
+                .as_u64()
+                .unwrap()
+                <= 300
+        );
+        let send = || {
+            call(
+                &sh,
+                "send_input",
+                &args(json!({"terminal": "w", "text": "bot"})),
+            )
+        };
+        let interrupt = || call(&sh, "interrupt_pane", &args(json!({"terminal": "w"})));
+        let remove = || call(&sh, "remove_pane", &args(json!({"terminal": "w"})));
+        // The lease first, with the draft under it.
+        for refused in [code_of(send()), code_of(interrupt()), code_of(remove())] {
+            assert_eq!(refused, "pane_human_controlled");
+        }
+        // The person lets go; the draft is what is left.
+        s.b().lease_release(&t, id).unwrap();
+        let listed = call(&sh, "list_panes", &args(json!({}))).unwrap();
+        assert_eq!(
+            listed["panes"][0]["human"],
+            json!({"lease": null, "draft": true})
+        );
+        for refused in [code_of(send()), code_of(interrupt()), code_of(remove())] {
+            assert_eq!(refused, "pane_draft_pending");
+        }
+        // Waiting, and the refusals themselves, clear nothing and queue nothing.
+        thread::sleep(Duration::from_secs(1));
+        assert!(draft_of(s.b(), &t));
+        assert!(s.host.writes_since(mark).is_empty());
+        assert!(!s.host.calls()[mark..].contains(&Call::Kill));
+        // A person with lease:preempt clears it; the next bot write goes.
+        let cleared = get("draft_clear");
+        assert_eq!(cleared["cleared"], true, "{cleared}");
+        assert!(!draft_of(s.b(), &t));
+        assert!(
+            !load(&*s.host, &s.b().get(&t).unwrap().id)
+                .unwrap()
+                .human_draft
+        );
+        assert!(get("get_status").get("human").is_none());
+        call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "w", "text": "bot"})),
+        )
+        .unwrap();
+        assert!(
+            !s.host.writes_since(mark).is_empty(),
+            "the bot's write went after the clear"
+        );
+    }
+
+    #[test]
+    fn draft_clear_leaves_a_held_lease_and_a_bot_stays_refused() {
+        let s = Split::new(1 << 20);
+        let dir = TempDir::new("pr2-draft-clear-lease");
+        let sh = shared_tools(&s, &dir);
+        start(&sh, "w");
+        let t = TerminalRef::new("w");
+        let id = typing(s.b(), &t, b"x");
+        let out = call(&sh, "draft_clear", &args(json!({"terminal": "w"}))).unwrap();
+        assert_eq!(out["cleared"], true);
+        assert!(lease_of(s.b(), &t) && !draft_of(s.b(), &t));
+        let mark = s.host.mark();
+        let sent = call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "w", "text": "bot"})),
+        );
+        assert_eq!(code_of(sent), "pane_human_controlled");
+        assert!(s.host.writes_since(mark).is_empty());
+        s.b().human_write(&t, id, b"y").unwrap();
+    }
+
+    #[test]
+    fn a_bare_front_with_no_person_side_behaves_as_before() {
+        let s = Split::new(1 << 20);
+        let dir = TempDir::new("pr2-bare");
+        let script = format!("printf '{DONE}'; cat > /dev/null");
+        let sh = tools(&s, policy(&dir, &script, None));
+        start(&sh, "w");
+        let t = TerminalRef::new("w");
+        eventually("the done status", || {
+            let got = s.b().get(&t).ok()?;
+            got.status
+                .as_ref()
+                .is_some_and(|st| st.state == State::Done)
+                .then_some(())
+        });
+        let status = call(&sh, "get_status", &args(json!({"terminal": "w"}))).unwrap();
+        assert!(status.get("human").is_none());
+        let cleared = call(&sh, "draft_clear", &args(json!({"terminal": "w"})));
+        assert_eq!(code_of(cleared), "unsupported");
+        call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "w", "text": "bot"})),
+        )
+        .unwrap();
+    }
 }
