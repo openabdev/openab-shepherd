@@ -406,3 +406,11 @@ Possible later extensions, none planned:
 Any extension would add trigger and action fields inside the same routine record. It
 needs a concrete scenario first, and a written design and review and a
 comparison with herdr and Orca before any code.
+
+## Panes without a profile
+
+A pane started with `argv` or `line` (with or without a declared `agent`) has no launch
+profile, so it has no idle routine and no `dynamic_routines` ceiling: `routine_create` on
+it is `routines_not_allowed`. Both limits belong to the operator's profile, and a caller
+does not set its own. To run routines on a pane that needs extra flags, use a profile with
+`dynamic_routines`.

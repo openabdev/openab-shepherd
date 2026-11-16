@@ -189,11 +189,12 @@ profiles and is at most 1 MiB.
   `start_pane` with `profile_unavailable`, and nothing starts.
 - `allow_arbitrary_command` (default false): when true, `start_pane` also takes a
   caller-chosen `argv` or `line` (and `env`). Such a pane never gets a profile's
-  environment, whatever program it runs.
+  environment, whatever program it runs. A caller can also declare which agent that
+  program is with `start_pane`'s `agent` field (see [Declaring an agent](#declaring-an-agent-for-an-argv-or-line-pane)).
 - `agent` (optional, default `kiro`): `kiro`, `devin` or `opencode`. It decides which permission
   dialog `answer_dialog` reads for panes this profile starts, and, for `devin`, the
   launch flag below. For `opencode`, `answer_dialog` sends Esc for `deny_once` and presses Enter for `allow_once` only after
-  it verifies the highlight from styled cells (see [opencode.md](opencode.md)), and its profiles must use `permission_mode` `normal`. A pane started any other way has no agent, so `answer_dialog`
+  it verifies the highlight from styled cells (see [opencode.md](opencode.md)), and its profiles must use `permission_mode` `normal`. A pane started any other way has no agent (unless an `argv` or `line` start declares one, see [Declaring an agent](#declaring-an-agent-for-an-argv-or-line-pane)), so `answer_dialog`
   refuses it with no keys sent. Panes started before this Shepherd process have no
   record of their agent, so they are refused too.
   A profile whose `argv` or `extra_args` names `opencode` (case-insensitive substring) and contains an auto-approve spelling (`--auto`, `autoaccept`, `auto-accept`) is refused at load. This prevents accidental configuration; it does not defend against a renamed binary, a wrapper script, or `allow_arbitrary_command`.
@@ -315,7 +316,7 @@ backend. Calls after the lookup use the pane's internal id. `send_input`,
 
 | MCP tool | Backend calls | Parameters | Result |
 |----------|---------------|------------|--------|
-| `start_pane` | `run` | `profile` (a [launch profile](#launch-profiles)), `cwd` (one the profile allows), `name` (optional; generated when missing); or, only with `allow_arbitrary_command`, `argv` or `line` (exactly one), `cwd`, `name`, `env` (optional object, this pane only) | a [pane object](#pane-object) |
+| `start_pane` | `run` | `profile` (a [launch profile](#launch-profiles)), `cwd` (one the profile allows), `name` (optional; generated when missing); or, only with `allow_arbitrary_command`, `argv` or `line` (exactly one), `agent` (optional: `kiro`, `devin` or `opencode`), `cwd`, `name`, `env` (optional object, this pane only) | a [pane object](#pane-object) |
 | `send_input` | `get` (twice), `send` | `terminal`, `text` | `terminal`, `turn`, `started`, `status` (a state word or null); on refusal, error `pane_blocked` with `kind` |
 | `read_output` | `get`, `read` | `terminal`, `lines` (0 to 10000) | `text` (escapes stripped), `complete`, `source` (`screen`, `history`, `stitched`, or `other`), `reason` (why only the screen was read: `blocked`, `other`, or null) |
 | `get_status` | `get` | `terminal` | a [pane object](#pane-object) plus `terminal` |
@@ -615,6 +616,32 @@ lock. A call waiting for the lock waits as long as the holder runs (an
 `interrupt_pane` holds it for up to its timeout; an `answer_dialog` holds it for up
 to the 3 s render wait plus its other steps: up to 0.8 s of cursor confirmation and
 each backend call; a `remove_pane` holds it for up to its timeout plus about 2 s).
+
+## Declaring an agent for an argv or line pane
+
+A pane started with `argv` or `line` has no agent by default, so `answer_dialog`
+refuses it and the agent-specific guards do not apply. A caller that already may start
+such a pane (scope `start:arbitrary` and `allow_arbitrary_command`) can say what the
+program is:
+
+```json
+{"argv": ["kiro-cli", "chat", "--trust-workspace"], "agent": "kiro", "cwd": "/work/demo"}
+```
+
+`agent` is `kiro`, `devin` or `opencode`, the same names a profile's `agent` takes. It needs
+no new scope. It is refused with a profile (a profile fixes its agent) and with any value
+other than the three names (`invalid_input`). The pane then gets what a profile pane of
+that agent gets: the dialect `answer_dialog` reads, the Devin `/yolo` refusal, the Devin
+trust-prompt close at start, the OpenCode answer handling and the Kiro trust-all
+guard. It does not get a profile's working-directory list, environment or credentials,
+a routine, `dynamic_routines` (so `routine_create` is `routines_not_allowed`) or
+`permission_mode`; a Devin pane that needs `--permission-mode` gets it from the caller's
+`argv`, which every observer sees in `list_panes`.
+
+The declaration is the caller's claim. Shepherd does not compare it with `argv[0]`
+(a `line`, `npx` or `env` would defeat any such rule); a wrong claim leads to a
+dialog parser that does not recognise the screen and sends no key. The audit records
+the claim (`agent`) next to `launch` and `argv0`.
 
 ## Terminal backend
 
@@ -1117,7 +1144,10 @@ is recorded (only allowed when no clients file is set).
 - `list_panes`, `get_status`, `wait_status` and `routine_list` write no line.
 - Per-tool fields come from an allowlist; anything else is dropped:
   - `start_pane`: `profile` and `pane` (the requested name; the outcome line also
-    carries the name the pane got).
+    carries the name the pane got). A start with `argv` or `line` also records `launch`
+    (`argv` or `line`), `argv0` (the basename of `argv[0]`; none for `line`) and, when
+    the call declares one, `agent`. The arguments, the line and the environment are never
+    recorded.
   - `send_input`: `pane` and `text_len` (the length of the text in bytes).
   - `answer_dialog`: `pane` and `choice`.
   - `read_output`, `interrupt_pane`, `remove_pane`, `draft_clear`: `pane`.

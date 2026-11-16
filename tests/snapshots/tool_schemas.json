@@ -284,6 +284,15 @@
     {
       "inputSchema": {
         "properties": {
+          "agent": {
+            "description": "With argv or line only (refused with profile, which fixes its agent): the agent the program is. Optional; without it the pane has no agent and answer_dialog refuses it.",
+            "enum": [
+              "kiro",
+              "devin",
+              "opencode"
+            ],
+            "type": "string"
+          },
           "argv": {
             "description": "Program and arguments; non-empty. Only when arbitrary commands are allowed.",
             "items": {

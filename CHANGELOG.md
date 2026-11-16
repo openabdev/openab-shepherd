@@ -4,6 +4,11 @@
 
 ### Added
 
+- `agent` for `start_pane` with `argv` or `line` (issue #113). A caller that may start its own
+  command can declare `kiro`, `devin` or `opencode`, so `answer_dialog` and the agent guards
+  apply to the pane. No new scope; the declaration is audited (`launch`, `argv0`, `agent`) and
+  never checked against the program. The `start_pane` input schema gains the optional `agent`
+  property. See `docs/operations.md`.
 - Agent-created routines (issue #98; #100, #102 to #105). Four tools, `routine_create`,
   `routine_list`, `routine_update` and `routine_delete`, let an agent or any client with the new
   `routine` scope ask Shepherd to type a fixed line into a pane every N seconds (trigger `every`,

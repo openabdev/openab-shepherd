@@ -1501,3 +1501,45 @@ fn start_pane_closes_a_devin_pane_stopped_at_the_trust_prompt() {
     assert!(log.iter().all(|call| call.method() != "keys"));
     assert_eq!(sh.agent_of("devin1"), None);
 }
+
+#[test]
+fn start_pane_closes_a_declared_devin_pane_stopped_at_the_trust_prompt() {
+    let trust = "Do you trust the authors of this directory?\n 1 Yes, trust\n 2 No, exit\n";
+    let backend = scripted(vec![
+        run_reply(),
+        screen(trust),
+        remove_ok(RemoveResult {
+            was_live: true,
+            stopped: Some(StopHow::Exited),
+            exit_code: None,
+        }),
+    ]);
+    let sh = Shepherd::with_policy(backend.clone(), LaunchPolicy::arbitrary());
+    let out = run_tool(
+        &sh,
+        "start_pane",
+        json!({"argv": ["devin"], "agent": "devin", "name": "devin1"}),
+    );
+    let log = backend.finish();
+    assert_eq!(out["isError"], true);
+    assert!(text_of(&out).contains("trust_prompt"), "{}", text_of(&out));
+    assert_eq!(methods(&log), ["run", "read", "remove"]);
+    assert!(log.iter().all(|call| call.method() != "send"));
+    assert!(log.iter().all(|call| call.method() != "keys"));
+    assert_eq!(sh.agent_of("devin1"), None);
+}
+
+#[test]
+fn start_pane_without_an_agent_does_not_look_for_the_trust_prompt() {
+    let backend = scripted(vec![run_reply()]);
+    let sh = Shepherd::with_policy(backend.clone(), LaunchPolicy::arbitrary());
+    let out = run_tool(
+        &sh,
+        "start_pane",
+        json!({"argv": ["devin"], "name": "devin1"}),
+    );
+    let log = backend.finish();
+    assert_eq!(out["isError"], false, "{}", text_of(&out));
+    assert_eq!(methods(&log), ["run"]);
+    assert_eq!(sh.agent_of("devin1"), None);
+}
