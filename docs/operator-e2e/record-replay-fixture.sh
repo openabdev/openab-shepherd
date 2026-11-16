@@ -20,7 +20,7 @@
 # For opencode the script writes a throwaway opencode.jsonc with ask rules for shell and
 # edit into the scratch directory, so the third scenario ends on a permission dialog.
 #
-# Build the recorder on the build host first (the laptop never runs cargo):
+# Build the recorder on the build host first (not on a light developer machine):
 #   cargo build --release --example record_tail
 # and point REC at it if it is not at target/release/examples/record_tail.
 set -u

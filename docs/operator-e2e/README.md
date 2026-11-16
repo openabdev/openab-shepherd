@@ -322,7 +322,7 @@ The binary `~/.local/bin/openab-shepherd` and the copy on the build host stay; d
 - **Devin version drift**: the CLI auto-updates. The parser follows the dialog layout of 3000.12.57; if `answer_dialog` refuses with a layout reason, note the version (`devin --version`) and the `seen` screen.
 - **`trust_prompt` error from `start_pane`**: the directory is not trusted yet; redo D0 for that exact directory. A trust prompt that appears more than about 3 s after the start is not detected; `answer_dialog` then finds no dialog.
 - **OpenCode never blocks**: the `ask` rules are missing or not read. Check `/tmp/shepherd-e2e/opencode/opencode.jsonc` exists and the pane's cwd is that directory (`get_status oc`, field `cwd`). Without `ask` rules the command just runs and `wait_status` reports `done` with no dialog.
-- **HTTP 401** (`unauthorized`): the token file differs from the one the server loaded. Restart the server or fix `SHEPHERD_TOKEN_FILE`.
+- **HTTP 401** (`unauthorized`): the token file differs from the one the server loaded. Restart the server or fix `OPENAB_SHEPHERD_TOKEN_FILE`.
 - **HTTP 403** (`forbidden`): the Host header is not `127.0.0.1`, `[::1]` or `localhost` (with or without a port). Use the default `SHEPHERD_URL`.
 - **Server exits 2 at start**: stderr says why. Typical: token or profiles file inside a git repository or inside the server's start folder, token mode wider than 0600, profiles file group/other-writable, a `cwds` entry that does not exist, token shorter than 16 characters.
 - **`start_pane` returns `not_found`**: `argv[0]` is not an executable at that path (re-run `setup.sh` after fixing `PATH`), or the cwd does not exist. A cwd outside the profile's `cwds` is refused with a `cwd: ...` validation error instead.

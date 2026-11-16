@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# macOS (macmini): run the holder as a launchd agent and check both kinds of restart.
+# macOS: run the holder as a launchd agent and check both kinds of restart.
 #   launchctl kill USR2   restarts the server only: the pane survives.
 #   launchctl kickstart -k restarts the holder: the pane ends, as documented.
 # It installs a throwaway agent (dev.openab.shepherd-e2e-restart) in ~/Library/LaunchAgents

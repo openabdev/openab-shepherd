@@ -11,7 +11,7 @@
 # reports and a recorded Kiro permission dialog, and the verdicts come from MCP fields,
 # files the panes write, process ids and the holder log.
 #
-# Works on macOS (macmini) and Linux (p1): no `stat -f`, no lsof. Needs bash, python3,
+# Works on macOS and Linux: no `stat -f`, no lsof. Needs bash, python3,
 # openssl, curl, pgrep.
 #
 # Settings (environment):

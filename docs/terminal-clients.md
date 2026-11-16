@@ -6,7 +6,7 @@ the operator a shell where an agent works, and also wants to supervise the
 agent itself. The motivating example is OpenAB Connect, the client for
 [openab-pty](https://github.com/openabdev/openab-pty). This
 page describes the combined shape, how to deploy it, where the client keeps
-the token, and the result of checking Shepherd's nine tools against what a
+the token, and the result of checking Shepherd's fourteen tools against what a
 terminal client needs. For the operator reference, see
 [operations.md](operations.md). Tracking issue:
 [#39](https://github.com/openabdev/openab-shepherd/issues/39); the client
@@ -72,12 +72,14 @@ Shepherd, and the operator's shell opens there under openab-pty.
 
 ## The token, and where a client keeps it
 
-One bearer token controls every pane. Anyone holding it can start programs
+The single bearer token controls every pane. Anyone holding it can start programs
 (subject to the launch profiles), type into panes, answer permission
-dialogs, and remove panes. Shepherd has no per-client authorization (see
-[known limits](operations.md#known-limits-mvp-scope)), so for a terminal
-client the token is a standing capability over the operator's agents, not a
-per-session pass.
+dialogs, and remove panes. Give a terminal client its own entry in the
+clients file with only the scopes it needs (`observe`, `read`, `control` and
+`dialog`; the `attach` scopes are reserved until the attach surface exists, issue
+[#77](https://github.com/openabdev/openab-shepherd/issues/77)); see
+[operations.md](operations.md#clients-scopes-and-the-audit-log). Either way the
+token is a standing capability over the operator's agents, not a per-session pass.
 
 A terminal client should therefore store the token in the OS keychain —
 the same handling the openab-pty client contract gives its admin
@@ -105,7 +107,7 @@ Each need a terminal client has, checked against the tools as they are
 | Stop a runaway turn | `interrupt_pane` | Sufficient. It sends the backend's stop key and reports the outcome; it does not escalate, so follow it with `wait_status`. |
 | End the supervised run | `remove_pane` | Sufficient. It signals the pane's process group and the descendants Shepherd has seen, kills what is left, and frees the slot (at most 8 live panes). |
 
-Conclusion: the nine tools cover the supervision actions a terminal client
+Conclusion: the ten pane tools cover the supervision actions a terminal client
 needs for permission dialogs on the tested agents. They do not cover
 `question` and `auth` dialogs, pane geometry, push events or styled output;
 those gaps are recorded below, not fixed here. This page proposes no tool
@@ -142,8 +144,8 @@ changes.
   standing limit for every client, but a human at a terminal is the user
   most likely to expect to type the answer.
 - **OpenCode is not verified end to end.** OpenCode v2.2.7 behaviour was
-  measured in live sessions on a laptop; Shepherd itself has not been
+  measured in live sessions on a developer machine; Shepherd itself has not been
   checked end to end against OpenCode, and whether the startup `idle`
-  report becomes a `get_status` result is still an open point (see the
-  README's OpenCode section). A terminal client supervising an OpenCode
+  report becomes a `get_status` result is still an open point (see
+  [opencode.md](opencode.md)). A terminal client supervising an OpenCode
   pane inherits those caveats.

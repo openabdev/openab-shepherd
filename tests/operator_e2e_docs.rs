@@ -184,6 +184,7 @@ fn the_relative_links_in_the_docs_resolve() {
         root().join("docs/routine.md"),
         root().join("docs/terminal-clients.md"),
         root().join("docs/credentials.md"),
+        root().join("docs/opencode.md"),
     ];
     for dir in ["docs/adr", "docs/operator-e2e"] {
         for entry in std::fs::read_dir(root().join(dir)).expect("read dir") {
@@ -570,4 +571,95 @@ fn the_dynamic_routines_example_in_routine_md_loads_with_the_documented_defaults
         "the example shows the defaults"
     );
     std::fs::remove_dir_all(&base).ok();
+}
+
+/// Every markdown file of the README and `docs/`, found recursively.
+fn markdown_files() -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|x| x == "md") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = vec![root().join("README.md")];
+    walk(&root().join("docs"), &mut files);
+    files.sort();
+    files
+}
+
+/// The text of each ```mermaid block of `text`, or an error naming the file and line of a
+/// block that is never closed.
+fn mermaid_blocks(name: &str, text: &str) -> Result<Vec<String>, String> {
+    let mut blocks = Vec::new();
+    let mut open: Option<(usize, String)> = None;
+    for (n, line) in text.lines().enumerate() {
+        match &mut open {
+            None if line.trim_end() == "```mermaid" => open = Some((n + 1, String::new())),
+            Some(_) if line.trim_end() == "```" => {
+                blocks.push(open.take().expect("open block").1);
+            }
+            Some((_, body)) => {
+                body.push_str(line);
+                body.push('\n');
+            }
+            None => {}
+        }
+    }
+    match open {
+        Some((line, _)) => Err(format!("{name}:{line}: a ```mermaid block is never closed")),
+        None => Ok(blocks),
+    }
+}
+
+#[test]
+fn every_mermaid_block_is_closed_not_empty_and_a_flowchart_or_a_sequence_diagram() {
+    let mut problems = Vec::new();
+    let mut total = 0;
+    for file in markdown_files() {
+        let name = file.strip_prefix(root()).unwrap().display().to_string();
+        match mermaid_blocks(&name, &read(&file)) {
+            Err(e) => problems.push(e),
+            Ok(blocks) => {
+                for (i, block) in blocks.iter().enumerate() {
+                    total += 1;
+                    let first = block
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty() && !l.starts_with("%%"));
+                    match first {
+                        None => problems.push(format!("{name}: block {} is empty", i + 1)),
+                        Some(l) => {
+                            let kind = l.split_whitespace().next().unwrap_or("");
+                            if kind != "flowchart" && kind != "sequenceDiagram" {
+                                problems.push(format!(
+                                    "{name}: block {} is a {kind:?}; use flowchart or sequenceDiagram",
+                                    i + 1
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "mermaid problems:\n{}",
+        problems.join("\n")
+    );
+    assert!(
+        total >= 7,
+        "expected at least seven mermaid blocks, found {total}"
+    );
+}
+
+#[test]
+fn the_mermaid_scanner_catches_an_unterminated_and_an_empty_block() {
+    assert!(mermaid_blocks("x.md", "```mermaid\nflowchart TD\n  A --> B\n").is_err());
+    let blocks = mermaid_blocks("x.md", "```mermaid\n```\ntext\n").expect("closed");
+    assert_eq!(blocks, vec![String::new()]);
 }

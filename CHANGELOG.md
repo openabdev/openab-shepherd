@@ -4,9 +4,26 @@
 
 ### Added
 
+- Agent-created routines (issue #98; #100, #102 to #105). Four tools, `routine_create`,
+  `routine_list`, `routine_update` and `routine_delete`, let an agent or any client with the new
+  `routine` scope ask Shepherd to type a fixed line into a pane every N seconds (trigger `every`,
+  action `text`). A profile opts in with `dynamic_routines`; without it `routines_not_allowed` is
+  returned. Routines are kept in the pane's meta, survive a restart under `hold`, skip busy or
+  replayed ticks instead of queueing them, and are audited as `system:routine`. A pane's
+  program sees its own name in `SHEPHERD_PANE`. The single token holds no `routine` scope.
+  See `docs/routine.md`.
+- Clients, scopes and the audit log (issue #4; #68, #75, #80). `OPENAB_SHEPHERD_CLIENTS` names a
+  clients file with one entry per caller (token hash, scopes, profiles, expiry), and
+  `OPENAB_SHEPHERD_AUDIT_FILE` records a `call` and an `outcome` line per mutating call. Scopes:
+  `observe`, `read`, `control`, `start`, `start:arbitrary`, `dialog`, `remove`, `attach`,
+  `attach:write`, `lease:preempt` and `routine`.
+- Shared panes, steps 2 and 3 (issue #77; #96, #97). The `draft_clear` tool (scope
+  `lease:preempt`), the reserved scopes `attach`, `attach:write` and `lease:preempt`, a `human`
+  object in `get_status`, and resizing by the lease holder (10 to 500 columns, 5 to 300 rows). No client
+  can take a lease yet.
 - Shared panes, step 1 (issue #77). The native backend now has an input lease and a draft flag per
   pane, as the backend half of letting a person type into a pane a bot also drives. While a person holds
-  the lease, or has typed and not pressed Enter, `send_input`, `send_keys`, `answer_dialog`,
+  the lease, or has typed and not pressed Enter, `send_input`, key presses, `answer_dialog`,
   `interrupt_pane`, `remove_pane` and the routine's nudge are refused with the new errors
   `pane_human_controlled` and `pane_draft_pending`, and are never queued. The draft is written to the
   pane's meta before the person's first byte and survives a server restart under `hold`; a lease does not.
@@ -22,6 +39,11 @@
 
 ### Changed
 
+- Documentation: the trust model is an ADR (`docs/adr/trust-model.md`, #72); the README, the
+  operations reference and the ADR statuses were brought in line with the current design, and
+  diagrams were added.
+- Tests: a snapshot of the tool names and input schemas (#71), replay fixtures for kiro and opencode (#94),
+  tini and zombie handling in the image (#90, #91).
 - Container image: the default command is now `openab-shepherd hold -- --host 127.0.0.1 --port 8765`
   (the pane holder under tini) instead of the bare `openab-shepherd --host 127.0.0.1 --port 8765`.
   With the holder, `SIGUSR2` restarts the server and the panes keep running; stopping the

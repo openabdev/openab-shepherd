@@ -1,6 +1,6 @@
 # Agent-created routines: operator end-to-end runbook
 
-For a person at a terminal on **macmini (macOS)**; it also runs on Linux. `routine-dynamic.sh`
+For a person at a terminal on a **macOS host**; it also runs on Linux. `routine-dynamic.sh`
 starts the real `openab-shepherd hold` and drives the four `routine_*` tools through MCP. **Agents
 never run it**: an agent must not start the Shepherd server. Issue #98 stays open until you have run
 it and pasted the result into the issue (see [Results](#results-for-the-issue)).
@@ -19,7 +19,7 @@ these files when it ends (`KEEP=1` keeps them).
 
 ## Before you start
 
-1. A release binary built on the build host, not on the laptop, copied to
+1. A release binary built on the build host, copied to
    `~/.local/bin/openab-shepherd` (or set `SHEPHERD_BIN`). Note the commit you built from.
 2. `bash`, `python3`, `openssl`, `curl` and `pgrep` on the machine.
 3. Run from this directory (`docs/operator-e2e` in a clone of the repository).
@@ -94,5 +94,5 @@ work is left", with a `todo_file` in the pane's directory. Expect one `routine_c
 ## Results for the issue
 
 Paste the `host:`, `binary:`, `summary:` and `RESULT:` lines, and the commit you built. **#98 closes
-when this script says `RESULT: PASS` on macmini**, and not before: the PRs that carry the code and
+when this script says `RESULT: PASS` on a macOS host**, and not before: the PRs that carry the code and
 the docs say `Refs #98` and do not close it.

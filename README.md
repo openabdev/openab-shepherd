@@ -9,6 +9,26 @@ tools. The safety rules are enforced by Shepherd, not by the agent: which progra
 may start, where they run, which credentials they get, when typing is refused, and
 which answers a permission dialog may receive.
 
+## Overview
+
+- **Pane model.** Shepherd owns the panes, not the client. Each pane is a program on its own
+  PTY, addressed by name. Under `openab-shepherd hold`, a holder process owns the PTYs and a
+  restartable front serves MCP; a bare `openab-shepherd` does both in one process.
+- **Tools and scopes.** Fourteen tools. A client holds explicit scopes (`observe`, `read`,
+  `control`, `start`, `start:arbitrary`, `dialog`, `remove`, `routine`, and the reserved
+  `attach`, `attach:write`, `lease:preempt`); no scope implies another. See
+  [Scopes](docs/operations.md#scopes) and [docs/credentials.md](docs/credentials.md).
+- **Restart survival.** Under `hold`, the front can be killed or restarted with `SIGUSR2` and
+  the panes keep running; the new front adopts them and replays their output silently.
+  See [Restart survival](docs/operations.md#restart-survival).
+- **Routine.** Shepherd can type a line into an idle pane on a schedule: a profile's idle
+  nudge, or an `every N seconds` routine an agent creates with `routine_create`.
+  See [docs/routine.md](docs/routine.md).
+- **Trust model.** Shepherd assumes one operator account and trusted pane programs. It
+  limits which programs start, with which credentials, and which dialog answers are sent;
+  it does not isolate panes from each other or from the account. See
+  [docs/adr/trust-model.md](docs/adr/trust-model.md).
+
 ## Features
 
 - **Loopback-only server with bearer auth.** `--host` accepts only the literal IPv4
@@ -19,7 +39,10 @@ which answers a permission dialog may receive.
   `read_output`, `get_status`, `wait_status`, `list_panes`, `interrupt_pane`,
   `answer_dialog`, `remove_pane` and `draft_clear`. Panes are addressed by name.
   Four more, `routine_create`, `routine_list`, `routine_update` and `routine_delete`,
-  need the `routine` scope (see the routine feature below).
+  need the `routine` scope (see the routine feature below). `draft_clear` needs the
+  `lease:preempt` scope; the other nine tools need `observe`, `read`, `control`, `start`,
+  `dialog` or `remove`. The scope table is in
+  [docs/operations.md](docs/operations.md#scopes).
 - **Blocked-dialog handling.** `send_input` refuses to type while a pane is blocked
   on a dialog and returns `pane_blocked`. `answer_dialog` accepts only `allow_once`
   or `deny_once`; the rule-creating options cannot be chosen. It reads the dialog
@@ -58,14 +81,27 @@ which answers a permission dialog may receive.
   about every 250 ms, so a process that fully detaches faster than that is missed
   (see [Status and known limits](#status-and-known-limits)).
 - **Container image.** The `Dockerfile` builds a Debian image that runs as uid 1000
-  under tini, with kiro-cli pinned to 3.1.0 and checked against a SHA-256. The image
+  under tini, with kiro-cli pinned to 3.1.0 (the image does not ship 3.3.0, where the Kiro dialog parser was measured) and checked against a SHA-256. The image
   holds no token and no profiles file. Its default command runs the pane holder
   (`openab-shepherd hold -- ...`); override the command with the bare
   `openab-shepherd --host ... --port ...` for the single-process behaviour.
 
 ## How it works
 
-![Shepherd architecture](docs/architecture.svg)
+```mermaid
+flowchart LR
+  C[MCP client or bot] -->|POST /mcp, bearer| F[Shepherd front]
+  F --> H[holder]
+  H --> P1[pane: kiro]
+  H --> P2[pane: devin]
+  H --> P3[pane: opencode]
+  F --- R[routine thread]
+  R -->|nudge text| F
+  F -.->|call and outcome lines| A[audit file]
+```
+
+A bare `openab-shepherd` runs the front and the panes in one process, with no holder.
+Under `openab-shepherd hold` the holder owns the panes and starts the front, so the front can restart while the panes keep running.
 
 1. The MCP client sends JSON-RPC over HTTP `POST /mcp` to the loopback listener,
    directly or through `tailscale serve`. Shepherd checks the Host header, then the
@@ -123,6 +159,15 @@ OPENAB_SHEPHERD_PROFILES=<profiles-file> \
 ./target/release/openab-shepherd --port 8765
 ```
 
+To keep panes alive across a server restart, run it under the holder:
+
+```sh
+OPENAB_SHEPHERD_TOKEN_FILE=<token-file> OPENAB_SHEPHERD_PROFILES=<profiles-file> \
+./target/release/openab-shepherd hold -- --port 8765
+```
+
+`kill -USR2 <holder-pid>` then restarts only the front. The container image runs this by default.
+
 Point the MCP client at `http://<loopback-address>:8765/mcp` with the header
 `Authorization: Bearer <token>`. To reach it from another machine on the tailnet,
 put it behind `tailscale serve` and allow that name, for example
@@ -132,8 +177,8 @@ Two optional variables add named clients with limited scopes and an audit log:
 `OPENAB_SHEPHERD_CLIENTS` (path of the clients file, JSON, mode 0600, outside any git
 repository) and `OPENAB_SHEPHERD_AUDIT_FILE` (path of the audit log, JSON Lines, in a
 mode 0700 directory; required when a clients file is set). Without them, the single
-token keeps every scope that existed before shared panes (it holds none of `attach`,
-`attach:write` and `lease:preempt`; a person at a pane needs a clients file). With a clients file, a token file or token variable is a startup
+token (client `default`) keeps every scope that existed before shared panes. It holds none of `attach`,
+`attach:write`, `lease:preempt` and `routine`, so `draft_clear` and the four `routine_*` tools answer it with `forbidden`; they need a clients file. With a clients file, a token file or token variable is a startup
 error: each caller gets its own entry in the clients file. See
 [Clients, scopes and the audit log](docs/operations.md#clients-scopes-and-the-audit-log).
 
@@ -150,79 +195,23 @@ pairing with openab-pty, are in
 
 ## OpenCode CLI
 
-Observed on a laptop with OpenCode 2.2.7 (`opencode --version`), installed locally with bun.
-The startup, the permission dialog and the OSC 7501 states were measured in live sessions
-with real model turns (the dialog on OpenCode v2.2.7); Shepherd itself has not yet been
-checked end to end against OpenCode. Those checks are operator-run.
-
-- Launch with `argv: ["opencode", "--standalone"]`. Without `--standalone`, OpenCode
-  starts a background server (`opencode serve --service`) that keeps running after the
-  TUI exits. Stop it with `opencode service stop`, which exits 0 and ends the process
-  (observed on the laptop).
-- Never pass `--auto`, and never set `session.permissions` to `autoaccept`. Both
-  approve permission prompts without a dialog. A profile whose `argv` or `extra_args`
-  contains `--auto`, a `--auto-…` flag, or an `autoaccept` or `auto-accept` spelling is
-  refused when the config loads. This applies when the profile sets `agent: "opencode"`,
-  or when any argv element names `opencode` (for example `npx opencode`, `sh -c "opencode …"`,
-  or `/usr/local/bin/opencode`), even with no `agent` field. The check does not cover `env` or OpenCode's own config
-  file, and it does not cover a command given to `start_pane` through
-  `allow_arbitrary_command`.
-  This check prevents accidental auto-approve configuration. It matches by name (case-insensitive substring `opencode`) and does not defend against a deliberately renamed binary, a wrapper script, or the `allow_arbitrary_command` path.
-- At startup OpenCode reports `state=idle:app=opencode` over OSC 7501. This report was
-  observed on the laptop. The output filter removes it. Whether the native backend turns it
-  into a `get_status` result is not yet verified. It is an open point pending a live check.
-- A launch profile may name `agent: "opencode"`, but only with `permission_mode` `normal`:
-  no OpenCode mode was measured, so `accept-edits` and `bypass` are rejected.
-- The permission dialog was measured on OpenCode v2.2.7 in a live session (shell and file
-  edit). OpenCode reports `state=idle|working|blocked|clear` over OSC 7501, with ST
-  terminators and colon-separated fields, and `kind=permission` on `blocked`. It has no `done`
-  state: a turn ends `clear`, then `idle`. For an OpenCode pane, `wait_status` reports
-  `done` for an `idle` that follows at least one turn, and `cancelled` after a dialog that
-  `answer_dialog` denied.
-- **A dialog appears only when the effective OpenCode config has an `ask` rule.** With no
-  rule, a shell command ran at once and the pane went `working` to `idle` with no `blocked`.
-  Shepherd then has no dialog to answer, and that turn is complete. To get a dialog, the
-  operator must set `ask` rules for `shell` and `edit` in OpenCode's own config, for
-  example in `~/.config/opencode/opencode.json`:
-  `"permissions": [{"action": "shell", "resource": "*", "effect": "ask"}, {"action": "edit", "resource": "*", "effect": "ask"}]`.
-  No environment variable or explicit config path that sets permissions is documented
-  (`opencode --help` and opencode.ai/docs/config were read), so Shepherd does not set
-  one and writes no file into the working directory.
-- `answer_dialog` on an OpenCode pane needs the pane to be `blocked` with kind `permission`
-  and the screen to show the whole dialog: `△ Permission required`, a `$ <command>` or
-  `→ Edit <path>` line, then `Allow once`, `Always allow`, `Reject` in that order and the
-  `ctrl+f fullscreen` hint. Anything else is refused with no key sent.
-  - `deny_once` sends `Esc`, which cancels exactly like `Reject` (measured with marker
-    files) and ends the turn (`idle`). It re-checks status and turn just before the key.
-  - `allow_once` presses `Enter` only after it verifies the highlight. OpenCode draws the
-    highlight as a background colour (no reverse video, no glyph), and the colour depends on
-    the terminal: a 256-colour palette index without `COLORTERM`, truecolor with it. The
-    native backend therefore applies a relative rule to the styled screen cells (colours and
-    the reverse attribute, used internally and never returned by a tool) and presses `Enter`
-    in the same step, under the status, kind and turn guard. It presses only when the dialog
-    text checks pass and `Allow once` has a background that differs from both other options,
-    while those two have the same background as each other. Colours are compared as values
-    (default, palette index or RGB) without converting between palette and RGB, so the rule
-    works with palette or truecolor. All three equal, the highlight on another option, any
-    other pattern, a label with mixed backgrounds, a default background on `Allow once`,
-    reverse video on any label, text that changed before the key, or a backend that cannot
-    read colours: refused with no key sent. Measured on OpenCode v2.2.7 only; the foreground
-    is not checked, and a theme that highlights differently is unmeasured.
-  - `Always allow` is never selected, and `Right` is never sent.
-- Not measured: MCP tools (the configured server was failing), number or letter
-  shortcuts and `Tab` in the dialog, the effect of `Always allow`, and a file write without
-  an `ask` rule.
+The OpenCode notes (launch, the permission dialog, the highlight check) are in
+[docs/opencode.md](docs/opencode.md).
 
 ## Status and known limits
 
-Shepherd is an MVP (version 0.4.0). The native backend was verified against
+Shepherd is an MVP. The latest release is 0.4.0; main carries unreleased changes (see
+[CHANGELOG.md](CHANGELOG.md)). The native backend was verified against
 kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 [MVP-REPORT.md](MVP-REPORT.md) (a dated record, not a current status), and the native core's design is in
 [docs/adr/native-core.md](docs/adr/native-core.md).
 The trust model (one account, pane programs trusted) and the non-goals are in
-[docs/adr/trust-model.md](docs/adr/trust-model.md).
+[docs/adr/trust-model.md](docs/adr/trust-model.md). The restart-survival and shared-pane design
+is in [docs/adr/restart-survival-and-shared-panes.md](docs/adr/restart-survival-and-shared-panes.md).
 
-- **No multi-client authorization.** Anyone holding the token controls every pane.
+- **No pane ownership.** With the single token, anyone holding it controls every pane.
+  With a clients file each client has its own scopes and an audit trail, but any client
+  with a scope can use it on every pane. Pane ownership is a non-goal (see the trust model).
 - **Two dialog choices only.** `answer_dialog` answers `allow_once` or `deny_once`
   and nothing else. Other dialog kinds (`question`, `auth`) are not answered.
 - **Text-based dialog parsing.** The dialog is parsed from screen text. Measured
@@ -233,7 +222,8 @@ The trust model (one account, pane programs trusted) and the non-goals are in
 - **A fast detached descendant escapes cleanup.** A descendant that is re-parented
   and fully detaches (new session, no terminal, parents gone) within the 250 ms
   between looks at the process table is never seen and survives. macOS has no
-  unprivileged way to close this gap; a Linux subreaper is a follow-up.
+  unprivileged way to close this gap. On Linux the holder is deliberately not a subreaper;
+  an orphan that escapes the scan is reaped by PID 1 (tini in the image).
 - **Panes survive a server restart only under `hold`.** A bare `openab-shepherd` owns
   its panes and they end with it. `openab-shepherd hold -- <server flags>` runs a holder
   that owns the panes and restarts the server (`SIGUSR2`), but stopping the holder ends
@@ -241,6 +231,16 @@ The trust model (one account, pane programs trusted) and the non-goals are in
 
 The full list, including the output filter's limits,
 is in [docs/operations.md](docs/operations.md#known-limits-mvp-scope).
+
+## Documentation
+
+- [docs/operations.md](docs/operations.md): operator reference (variables, profiles, tools, errors, scopes, audit, restart survival, image).
+- [docs/routine.md](docs/routine.md): the idle routine and agent-created routines.
+- [docs/credentials.md](docs/credentials.md): coding CLI credentials and an agent as an MCP client.
+- [docs/terminal-clients.md](docs/terminal-clients.md) and [docs/opencode.md](docs/opencode.md): terminal clients and OpenCode notes.
+- [docs/adr/](docs/adr/): design records (native core, trust model, restart survival and shared panes).
+- [docs/operator-e2e/](docs/operator-e2e/README.md): operator end-to-end runbooks.
+- [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

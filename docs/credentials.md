@@ -70,7 +70,22 @@ This is about the credential the coding CLI uses. Who may call Shepherd is a sep
 question: with a clients file, each caller has its own token, limited scopes and an
 audit trail, and `dialog` and `read` are separate scopes, as are the three for a
 person at a shared pane (`attach`, `attach:write`, `lease:preempt`; see
-[operations.md](operations.md#clients-scopes-and-the-audit-log)).
+[operations.md](operations.md#clients-scopes-and-the-audit-log)). `draft_clear` needs
+`lease:preempt`, and a bot's client is not given it.
+
+```mermaid
+flowchart TD
+  T[client token] --> HC{Host header ok?}
+  HC -- no --> R403[HTTP 403]
+  HC -- yes --> AU{token known and not expired?}
+  AU -- no --> R401[HTTP 401, stderr line]
+  AU -- yes --> SC{scope for this tool?}
+  SC -- no --> DN[forbidden result, denied line]
+  SC -- yes --> CL[call line, mutating tools]
+  CL -->|write fails, fail closed| UN[audit_unavailable]
+  CL --> TL[tool runs]
+  TL --> OC[outcome line]
+```
 
 ## An agent as an MCP client
 
@@ -84,7 +99,7 @@ scopes are its ceiling. For an agent that schedules itself with the `routine_*` 
 ([routine.md](routine.md#agent-created-routines)), grant `routine`, plus `observe` if it
 should call `list_panes`, and no `control`. The `routine` scope does not imply `control`;
 it lets the agent make Shepherd type a fixed line of at most 1024 bytes into panes whose
-profile set `dynamic_routines`, within that profile's limits. The single legacy token
+profile set `dynamic_routines`, within that profile's limits. The single token (client `default`)
 holds no `routine` scope, and the list of every scope (the one a clients file may name)
 includes it.
 
@@ -110,12 +125,12 @@ which flags are added by name; it does not protect or restrict any credential.
 
 ## Verified and not verified
 
-Checked on origin/main by reading code and tests only (no run). Details in
+Checked by reading code and tests only (no run). Details in
 [#15](https://github.com/openabdev/openab-shepherd/issues/15).
 
 Verified, env passthrough:
 - The child environment is cleared, then set from HOME, PATH, USER, LANG, TERM and
-  the profile's extras (`src/native/pty.rs`). A profile extra with the same name
+  the profile's extras (`src/native/host/pty.rs`). A profile extra with the same name
   replaces the baseline value.
 - A profile `env` is the only route for a credential. Names must be valid and at most
   32. At load, a profile `env` is refused if it sets `TERM`, `PATH`, `SHEPHERD_PANE`, a `DYLD_*` or
@@ -123,7 +138,7 @@ Verified, env passthrough:
   a Devin profile it is also refused if it sets `DEVIN_PERMISSION_MODE`. `HOME`,
   `USER` and `LANG` are not refused there. The caller's per-run `env` (arbitrary
   commands only) is refused for all of `HOME`, `PATH`, `USER`, `LANG`, `TERM`,
-  `DYLD_*` and `LD_*` (`src/native/pty.rs`).
+  `DYLD_*` and `LD_*` (`src/native/host/pty.rs`).
 - Panes started with a caller `argv` or `line` get no profile env
   (`src/native/mod.rs`).
 - `list_panes` has no env field. `Secret` prints `<redacted>` in Debug output.
