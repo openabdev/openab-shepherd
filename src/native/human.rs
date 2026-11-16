@@ -25,6 +25,12 @@ use std::sync::TryLockError;
 const INPUT_WAIT: Duration = Duration::from_secs(3);
 const INPUT_POLL: Duration = Duration::from_millis(2);
 
+/// The sizes a lease holder may ask for. A request outside is clamped.
+const MIN_COLS: u16 = 10;
+const MAX_COLS: u16 = 500;
+const MIN_ROWS: u16 = 5;
+const MAX_ROWS: u16 = 300;
+
 /// A lease just granted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LeaseGrant {
@@ -322,6 +328,44 @@ impl NativeBackend {
             }
         }
         Ok(())
+    }
+
+    /// Resize the pane's terminal and its emulator to `cols` by `rows`
+    /// (clamped to 10 to 500 by 5 to 300), as lease `lease_id`'s holder.
+    /// Returns the size applied.
+    ///
+    /// Only the live lease holder resizes. The one other resize is the
+    /// adoption nudge, which restores 200x120 after a front restart. The host
+    /// and the emulator change inside one `state` critical section, so a read
+    /// never sees one without the other. If the host refuses, the emulator is
+    /// left alone. The size is not restored when the lease ends. A resize
+    /// does not renew the lease: only input does.
+    pub(crate) fn resize(
+        &self,
+        t: &TerminalRef,
+        lease_id: u64,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(u16, u16), BackendError> {
+        let cols = cols.clamp(MIN_COLS, MAX_COLS);
+        let rows = rows.clamp(MIN_ROWS, MAX_ROWS);
+        let pane = self.inner.resolve(t)?;
+        let mut st = pane.lock_state()?;
+        if !st.live {
+            return Err(finished(&pane.id));
+        }
+        pane.check_lease(&st, lease_id)?;
+        self.inner
+            .host
+            .resize(&pane.id, cols, rows)
+            .map_err(|err| {
+                BackendError::new(
+                    ErrorKind::Other,
+                    format!("native: {}: cannot resize the terminal: {err}", pane.id),
+                )
+            })?;
+        st.emu.resize(cols, rows);
+        Ok((cols, rows))
     }
 
     /// Clear the draft, whoever holds the lease, and leave the lease alone.

@@ -696,8 +696,15 @@ the routine's watch. The log line is `front: attached; adopted N pane(s), M repl
   pane is `replayed` and `unknown` until the next adoption.
 - `turn` is monotonic across a restart. When the snapshot is older than the first
   replayed line, `turn` may undercount, and the front logs it.
-- The terminal size is fixed at 200 columns by 120 rows. A pane the holder lists at
-  another size is adopted as `replayed`.
+- The terminal size is 200 columns by 120 rows until a person who holds the pane's
+  input lease resizes it (issue #77; the attach surface that lets a person do that is
+  not in this release). A pane the holder lists at another size is adopted as
+  `replayed`, and the front's repaint nudge returns it to 200 by 120. That nudge is
+  the only resize that is not made by a lease holder. A holder's size is kept to
+  10 to 500 columns by 5 to 300 rows, applies to the terminal and to the screen
+  a bot reads together, and stays when the lease ends: nothing restores 200 by 120
+  until the next holder or a front restart, so a bot may see a different wrap in
+  between. Adoption does not read the size back.
 
 `replayed` is not a field of the pane object. A caller sees it as the `pane_replayed`
 error and acts as for any refusal: read the screen, wait, or leave the pane.
