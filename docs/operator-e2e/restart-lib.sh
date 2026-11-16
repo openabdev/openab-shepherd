@@ -31,6 +31,7 @@ R_LOG="$R_WORK/holder.log"
 R_PIDFILE="$R_WORK/holder.pid"
 R_FAILS=0
 R_PASSES=0
+R_SKIPS=0
 
 export SHEPHERD_URL="http://127.0.0.1:$PORT/mcp"
 export SHEPHERD_TOKEN_FILE="$R_HOME/token"
@@ -67,12 +68,16 @@ r_check() {
   fi
 }
 
+# r_skip DESCRIPTION : a check that cannot run on this host. Visible in the output and in the
+# summary line; it is not a failure.
+r_skip() { echo "SKIP $*"; R_SKIPS=$((R_SKIPS + 1)); }
+
 # r_finish : print the summary the operator pastes into the issue; exit 1 on any FAIL.
 r_finish() {
   echo
   echo "host:    $(uname -srm)"
   echo "binary:  $("$BIN" --help 2>&1 | head -1) ($BIN)"
-  echo "summary: $R_PASSES passed, $R_FAILS failed"
+  echo "summary: $R_PASSES passed, $R_FAILS failed, $R_SKIPS skipped"
   if [ "$R_FAILS" -eq 0 ]; then echo "RESULT: PASS"; else echo "RESULT: FAIL (see $R_LOG)"; fi
   [ "$R_FAILS" -eq 0 ]
 }

@@ -1,6 +1,6 @@
 # Agent-created routines: operator end-to-end runbook
 
-For a person at a terminal on a **macOS host**; it also runs on Linux. `routine-dynamic.sh`
+For a person at a terminal on a **macOS host**; it also runs on Linux, where step 9 runs too. `routine-dynamic.sh`
 starts the real `openab-shepherd hold` and drives the four `routine_*` tools through MCP. **Agents
 never run it**: an agent must not start the Shepherd server. Issue #98 stays open until you have run
 it and pasted the result into the issue (see [Results](#results-for-the-issue)).
@@ -43,7 +43,7 @@ check that nothing is made up still holds with two intervals missed); the full r
 - A clients file with `ops` (scopes `observe`, `read`, `control`, `start`, `remove`; starts the
   panes; has no `routine` scope) and `agent-a` (scopes `routine` and `observe`; no `control`).
 - An audit file in a directory of mode 700.
-- The holder starts with a file-size limit and `SIGXFSZ` ignored, for step 9.
+- The holder starts with a file-size limit and `SIGXFSZ` ignored, for step 9 (effective on Linux only).
 
 ## The ten checks
 
@@ -60,11 +60,19 @@ it needs has expired by then.
 | 6 | The front is replaced by one that cannot attach (protocol number 999), so MCP is down, for `DOWN_SECS` (default 300); then a matching front attaches | at most one new line in 30 s, not one per missed tick; `next_due_at` still on the grid |
 | 7 | The audit file: `routine_create` has `call` and `outcome` under `agent-a`, with the routine id; each nudge is a `send_input` `call` and `outcome` by `system:routine` with `routine` and `created_by`; `routine_list` wrote nothing; the nudge text is nowhere in the file | Python over the JSON lines |
 | 8 | `dynamic_routines` is removed from the profile and the holder gets `SIGUSR2`: the routines are `stopped` with `stop_reason` `profile_changed`, nothing types for more than one interval, and `routine_delete` works | `routine_list`, line counts, the log line |
-| 9 | The audit file is padded to the holder's size limit, so the next append fails: `routine_create` returns `audit_unavailable`, nothing is created, and `routine_list` still works | error code; the list is empty |
+| 9 | **Linux only** (a `SKIP` line on macOS, see below). The audit file is padded to the holder's size limit, so the next append fails: `routine_create` returns `audit_unavailable`, nothing is created, and `routine_list` still works | error code; the list is empty |
 | 10 | The routine created with `expires_secs: 90` has typed once and then shows `expired`, with no next time, and types nothing more | `status`; `next_due_in_secs` null; line count |
 
 Step 9 does not break the audit directory's mode, because an open file keeps working after its
-directory changes. A size limit fails the write on demand and on both macOS and Linux.
+directory changes. A size limit fails the write on demand on Linux, where the kernel returns `EFBIG`.
+
+**Step 9 does not run on macOS.** macOS does not enforce `RLIMIT_FSIZE`: an `O_APPEND` write past
+the limit succeeds and the file keeps growing (measured with a small Python program on a macOS arm64
+host). On macOS the script prints `SKIP step 9: RLIMIT_FSIZE is not enforced on macOS; run this script
+on a Linux host to check it`, and the summary counts it: `summary: N passed, 0 failed, 1 skipped`.
+`RESULT: PASS` needs no failures; a skip is never silent. Run the script on a Linux host to check
+step 9. The `audit_unavailable` behaviour is also covered by the unit tests in
+`src/mcp/routine_tests.rs` and `src/mcp.rs`.
 
 ## With a real agent (optional, costs model prompts)
 
@@ -88,11 +96,11 @@ work is left", with a `todo_file` in the pane's directory. Expect one `routine_c
 - Step 6 `MCP is down` fails: the version file was not read by the new front; see
   `version-mismatch.sh` in [restart-survival.md](restart-survival.md).
 - Step 6 more than one new line: that is a catch-up burst and a real bug. Keep the log (`KEEP=1`).
-- Step 9 does not return `audit_unavailable`: the holder did not apply the size limit (the log shows
+- Step 9 (Linux) does not return `audit_unavailable`: the holder did not apply the size limit (the log shows
   the python start line), or the audit file was already larger than the limit.
 
 ## Results for the issue
 
-Paste the `host:`, `binary:`, `summary:` and `RESULT:` lines, and the commit you built. **#98 closes
-when this script says `RESULT: PASS` on a macOS host**, and not before: the PRs that carry the code and
+Paste the `host:`, `binary:`, `summary:` (with its skipped count) and `RESULT:` lines, and the commit you built. **#98 closes
+when this script says `RESULT: PASS` on a macOS host and step 9 has passed on a Linux host**, and not before: the PRs that carry the code and
 the docs say `Refs #98` and do not close it.

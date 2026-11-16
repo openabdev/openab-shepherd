@@ -19,10 +19,14 @@
 #   9     the audit file cannot be written: routine_create is audit_unavailable, nothing created
 #   10    an expiring routine shows expired and types nothing more (checked after step 6)
 #
-# Step 9 needs a write that fails on demand. The holder starts with a file-size limit
+# Step 9 runs on Linux only. It needs a write that fails on demand. The holder starts with a file-size limit
 # (RLIMIT_FSIZE, SIGXFSZ ignored); the script then pads the audit file to the limit, so the
 # next append fails with EFBIG. Changing the audit directory's mode would not do it: the file
-# is already open.
+# is already open. macOS does not enforce RLIMIT_FSIZE (an append past the limit still
+# succeeds; measured on macOS arm64), so there the step prints a SKIP line, the summary counts
+# it ("N passed, 0 failed, 1 skipped") and RESULT is decided by the failures alone. The
+# audit_unavailable behaviour is also covered by the unit tests in src/mcp/routine_tests.rs
+# (the audit_unavailable cases) and src/mcp.rs (tools refused when the audit sink fails).
 #
 # Settings (environment): SHEPHERD_BIN, PORT (default 8767), R_HOME, R_WORK (both must contain
 # shepherd-e2e-restart), DOWN_SECS (default 300), KEEP=1 (leave everything behind).
@@ -192,6 +196,26 @@ d_wait_rfield() {
   return 1
 }
 
+# d_wait_text FILE TEXT SECONDS : wait until FILE's first line is TEXT.
+d_wait_text() {
+  local end=$((SECONDS + $3))
+  while [ "$SECONDS" -lt "$end" ]; do
+    [ "$(head -1 "$1" 2>/dev/null)" = "$2" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# d_wait_log REGEX SECONDS : wait until the holder log matches REGEX.
+d_wait_log() {
+  local end=$((SECONDS + $2))
+  while [ "$SECONDS" -lt "$end" ]; do
+    r_log_has "$1" && return 0
+    sleep 1
+  done
+  return 1
+}
+
 # d_wait_lines FILE MIN SECONDS : wait until FILE has at least MIN lines.
 d_wait_lines() {
   local end=$((SECONDS + $3))
@@ -262,8 +286,8 @@ d_main() {
   r_check "exp is done" r_wait_field exp status.state "done" 20
   r_check "busy is working" r_wait_field busy status.state working 20
   r_check "dyn knows its own name in SHEPHERD_PANE" r_wait_file "$R_WORK/dyn/pane-env.txt" 10
-  r_check "SHEPHERD_PANE is dyn" test "$(cat "$R_WORK/dyn/pane-env.txt" 2>/dev/null)" = dyn
-  r_check "SHEPHERD_PANE is busy" test "$(cat "$R_WORK/busy/pane-env.txt" 2>/dev/null)" = busy
+  r_check "SHEPHERD_PANE is dyn" d_wait_text "$R_WORK/dyn/pane-env.txt" dyn 10
+  r_check "SHEPHERD_PANE is busy" d_wait_text "$R_WORK/busy/pane-env.txt" busy 10
 
   # --- Step 3: create, the refusals, list ---------------------------------------------------
   local created
@@ -300,8 +324,9 @@ d_main() {
   r_check "dyn is typed into at the first grid time" d_wait_lines "$R_WORK/dyn/typed.txt" 1 90
   r_check "the typed line is the routine's text" \
     test "$(head -1 "$R_WORK/dyn/typed.txt")" = "$D_NUDGE_TEXT"
-  r_check "dyn: runs is 1 and last_result is sent" \
-    test "$(d_rfield dyn r1 runs)/$(d_rfield dyn r1 last_result)" = "1/sent"
+  # The engine updates runs and last_result after it has typed, so wait for both.
+  r_check "dyn: runs is 1" d_wait_rfield dyn r1 runs 1 20
+  r_check "dyn: last_result is sent" d_wait_rfield dyn r1 last_result sent 20
   r_check "busy: the tick found it working (skipped:working)" d_wait_rfield busy r1 last_result skipped:working 30
   r_check "busy: nothing was typed" test "$(d_typed busy)" = 0
   touch "$R_WORK/busy/finish"                       # the turn ends now; the missed tick is gone
@@ -310,7 +335,8 @@ d_main() {
   r_check "busy: the skipped tick is not made up after the turn ends" test "$(d_typed busy)" = 0
   r_check "busy is typed into at its next grid time, once" d_wait_lines "$R_WORK/busy/typed.txt" 1 90
   r_check "busy: exactly one line" test "$(d_typed busy)" = 1
-  r_check "exp: typed once before it expires" test "$(d_typed exp)" = 1
+  r_check "exp: typed once before it expires" d_wait_lines "$R_WORK/exp/typed.txt" 1 30
+  r_check "exp: exactly one line so far" test "$(d_typed exp)" = 1
 
   # --- Step 5: SIGUSR2 keeps the grid -------------------------------------------------------
   local due_before lines_before due_after
@@ -377,7 +403,7 @@ d_main() {
   r_check "dyn: r1 is stopped" d_wait_rfield dyn r1 status stopped 20
   r_check "dyn: the reason is profile_changed" test "$(d_rfield dyn r1 stop_reason)" = profile_changed
   r_check "busy: r1 is stopped" test "$(d_rfield busy r1 status)" = stopped
-  r_check "the log says the routine was stopped" r_log_has 'routine r1 stopped \(profile_changed\)'
+  r_check "the log says the routine was stopped" d_wait_log 'routine r1 stopped \(profile_changed\)' 20
   sleep 65                                            # more than one grid interval
   r_check "dyn: nothing typed after the profile change" test "$(d_typed dyn)" = "$lines_before"
   r_check "busy: nothing typed after the profile change" test "$(d_typed busy)" = "$busy_before"
@@ -390,14 +416,20 @@ d_main() {
   # --- Step 9: the audit file cannot be written ---------------------------------------------
   d_write_profiles on
   r_check "SIGUSR2 with dynamic_routines back: a new front serves MCP" d_restart
-  local size need
-  size="$(wc -c < "$D_AUDIT" | tr -d ' ')"
-  need=$((D_FSIZE - size + 1024))
-  head -c "$need" /dev/zero | tr '\0' '\n' >> "$D_AUDIT"      # the file now reaches the limit
-  r_check "with the audit file full, routine_create is audit_unavailable" \
-    test "$(r_error as_agent rc_create dyn 60 "$D_NUDGE_TEXT")" = audit_unavailable
-  r_check "...and nothing was created" \
-    test "$(as_agent rc_list dyn 2>/dev/null | d_py 'len(d["routines"])')" = 0
+  if [ "$(uname -s)" = Darwin ]; then
+    # macOS does not enforce RLIMIT_FSIZE: an O_APPEND write past the limit still succeeds
+    # (measured on macOS arm64), so the file cannot be made to fail. Linux returns EFBIG.
+    r_skip "step 9: RLIMIT_FSIZE is not enforced on macOS; run this script on a Linux host to check it"
+  else
+    local size need
+    size="$(wc -c < "$D_AUDIT" | tr -d ' ')"
+    need=$((D_FSIZE - size + 1024))
+    head -c "$need" /dev/zero | tr '\0' '\n' >> "$D_AUDIT"      # the file now reaches the limit
+    r_check "with the audit file full, routine_create is audit_unavailable" \
+      test "$(r_error as_agent rc_create dyn 60 "$D_NUDGE_TEXT")" = audit_unavailable
+    r_check "...and nothing was created" \
+      test "$(as_agent rc_list dyn 2>/dev/null | d_py 'len(d["routines"])')" = 0
+  fi
   r_check "routine_list still works" as_agent rc_list dyn
 
   r_finish
