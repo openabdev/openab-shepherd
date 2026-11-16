@@ -604,7 +604,7 @@ The trait merged in #5 (`main` at `091aac3`) differs from `9022867` as follows. 
     - O-3: arrows under DECCKM with kitty flag 1 use the CSI form (`CSI A`), per Q7. The probe did not exercise it (Kiro leaves DECCKM off); other programs may differ.
     - O-5: finished panes keep their full emulator and raw ring, about 520 MB worst case with 32 retained. Compacting a finished pane to its final screen, or a lower `MAX_FINISHED_PANES`, is a follow-up.
     - O-6: vte ends an OSC on any ESC, so an unterminated 7501 report followed by another escape sequence is accepted as a report. Low risk.
-    - Fixed in the same round: an interrupt of a program that never reported status writes the raw byte `0x03` whatever keyboard flags are pushed; the keychain reader starts with default signal dispositions and an empty mask; Shepherd refuses to start the native backend if the exit-signal handler cannot be installed (SOL2-N1).
+    - Fixed in the same round: an interrupt of a program that never reported status writes the raw byte `0x03` whatever keyboard flags are pushed; the keychain reader starts with default signal dispositions and an empty mask; Shepherd refuses to start the native backend if the exit-signal handler cannot be installed.
 
 ## 16. Consequences
 

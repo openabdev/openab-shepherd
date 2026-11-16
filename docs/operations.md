@@ -605,7 +605,7 @@ profile.
 `NativeBackend` (`src/native/`) is the only backend and is what Shepherd starts;
 `OPENAB_SHEPHERD_BACKEND` accepts only unset, empty or `native`, and any other value
 exits with status 2. The trait stays so that another backend can be added later
-without touching the tools; none is planned. 
+without touching the tools; none is planned.
 
 ### Native backend
 

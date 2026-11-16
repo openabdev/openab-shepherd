@@ -40,12 +40,12 @@
   - Kiro prompts used: 3 in total. The first run stopped at step 1 before any prompt: kiro-cli
     showed "You are not logged in" because on this laptop it authenticates only through
     `KIRO_API_KEY`, which the whitelist dropped. `child_env` now passes `KIRO_API_KEY` by name,
-    since review B1 only to an `argv` launch of `kiro-cli`, and since review SOL-B1 only
+    since review B1 only to an `argv` launch of `kiro-cli`, and since a later review only
     of the `kiro-cli` Shepherd's own `PATH` finds, by canonical path (regression tests
     `child_env_passes_kiro_api_key_only_to_a_kiro_launch`,
     `kiro_program_is_only_the_operators_kiro_cli`,
     `only_a_kiro_cli_launch_sees_kiro_api_key`); the second run passed. That name rule
-    was then replaced by launch profiles (owner decision for SOL-B1); see Known limits.
+    was then replaced by launch profiles (owner decision); see Known limits.
 - The backend-trait section below is the previous state.
 
 ### Previous: backend trait refactor (branch `feat/backend-trait`)
@@ -299,7 +299,7 @@ curl -s -i $URL -H "$AUTH" -H 'Content-Type: application/json' -d '{"jsonrpc":"2
   introducer (U+009D) is not removed. TUI redraw noise is not removed. An unterminated OSC or DCS
   hides the text after it.
 - **Done versus idle.** kiro-cli 3.1.0 stays in `done` after a turn, not `idle`. The OSC 7501 probe
-  measured this (`.agents/tasks/openab-shepherd-osc7501-probe/report.md`). `wait_status` ends with
+  measured this. `wait_status` ends with
   `done` in that case, so callers must read `status`.
 - **Wait semantics for programs that never report status.** Such a program counts as working until
   it exits. `wait_status` returns only on exit or on timeout (`ended: false`).

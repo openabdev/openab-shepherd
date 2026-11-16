@@ -1,6 +1,6 @@
 # ADR: Restart survival and shared panes
 
-- **Status:** Accepted for restart survival (implemented in #83 to #91, #94, #100; issue #76 closed). Shared panes: the lease, draft, refusals, scopes, `draft_clear` and lease-holder resize are implemented (#95, #96, #97); attach is not implemented (issue #77).
+- **Status:** Accepted for restart survival (implemented in #83 to #92, #94; issue #76 closed). Shared panes: the lease, draft, refusals, scopes, `draft_clear` and lease-holder resize are implemented (#95, #96, #97); attach is not implemented (issue #77).
 - **Date:** 2026-11-14 (rescoped)
 - **Author:** chaodu-agent
 - **Related:** #66 (restart survival), #4 (client identity, scopes, audit; first PR #68 merged), `docs/adr/native-core.md`, openabdev/openab-pty#97 (what OpenAB Connect speaks).
@@ -107,7 +107,7 @@ Where the two reviews still differed, this ADR picked the smaller option. Approv
 
 - **Q1. Attach transport.** WebSocket or chunked HTTP plus POST: follow whatever openab-pty#97 Connect already speaks. One choice, to be made in the shared-panes issue.
 - **Q2. Resize authority.** One review: last active viewer sets size (herdr). Other: only the lease holder resizes. Chosen: lease holder only, since a resize changes layout under a bot's dialog parser. Decided in code (#97).
-- **Q3. Link.** Chosen: anonymous socketpair, holder is always the parent of the front. Alternative: a named socket in a 0700 directory with a single writer, which is herdr's literal shape but brings stale-socket handling back. Decided in code: two socketpairs (#87; see note 5 below).
+- **Q3. Link.** Chosen: anonymous socketpair, holder is always the parent of the front. Alternative: a named socket in a 0700 directory with a single writer, which is herdr's literal shape but brings stale-socket handling back. Decided in code: two socketpairs (#88; see note 5 below).
 - **Q4. Persisted pane state.** Chosen: `meta` inside the holder. Alternative: a front-written `registry.json`, which needs reconcile logic after a crash. Decided in code: `meta` in the holder (#83 to #91).
 - **Q5. Placeholder hook issue.** Chosen: file it now, no work scheduled. Alternative: file nothing until someone asks.
 - **Q6. Bad config.** Chosen: log loop with MCP down. Alternative: a fast container fail on first deploy, which needs `--check-config` back. Decided in code: the log loop.
