@@ -98,7 +98,7 @@ Verified, env passthrough:
   the profile's extras (`src/native/pty.rs`). A profile extra with the same name
   replaces the baseline value.
 - A profile `env` is the only route for a credential. Names must be valid and at most
-  32. At load, a profile `env` is refused if it sets `TERM`, `PATH`, a `DYLD_*` or
+  32. At load, a profile `env` is refused if it sets `TERM`, `PATH`, `SHEPHERD_PANE`, a `DYLD_*` or
   `LD_*` name, or a name starting `OPENAB_SHEPHERD_` or `HC_` (`src/profiles.rs`); for
   a Devin profile it is also refused if it sets `DEVIN_PERMISSION_MODE`. `HOME`,
   `USER` and `LANG` are not refused there. The caller's per-run `env` (arbitrary

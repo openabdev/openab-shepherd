@@ -123,11 +123,13 @@ whose program has ended is forgotten, not re-checked on every pass.
 The routine thread serves every watched pane, so it waits at most 2 s
 for a pane's lock: a pane another call holds for longer is skipped for
 that check, with nothing sent and nothing counted.
-The routine's audit trail is Shepherd's stderr log: every nudge (with
-the pane's idle seconds), every give-up and every failed attempt is a
-line there, and nowhere else — a client cannot tell a routine nudge
-from its own input except that the pane's turn counter advances, which a
-routine nudge does like any typed prompt. A registration survives a
+The routine's audit trail is Shepherd's stderr log (every nudge with
+the pane's idle seconds, every give-up and every failed attempt is a
+line there) and, when an audit log is configured, a `send_input` `call`
+line and an `outcome` line by the actor `system:routine` (see
+[Identity and audit](#identity-and-audit)). A client cannot tell a routine nudge
+from its own input by looking at the pane, except that the pane's turn counter
+advances, which a routine nudge does like any typed prompt. A registration survives a
 server restart under `hold`: the new server rebuilds each watch from the pane's
 record, with the nudge count, the give-up flag and the allowance for turns its own
 nudges caused. It reads the routine's settings from the current profile, so a pane
@@ -146,10 +148,15 @@ refusal inside the write stays the authority; the check is only an early exit. A
 
 ## Identity and audit
 
-A routine has no client identity: it is not a client from the clients file, and the
-record of what it decided is Shepherd's stderr (`routine nudge`, `routine gave up`).
-The only trace in the audit log is the fixed system actor `system:routine` on the
-send it makes.
+A routine has no client identity: it is not a client from the clients file. What it
+decided is on Shepherd's stderr (`routine nudge`, `routine gave up`). With an audit log
+configured, each nudge it attempts is two lines by the fixed system actor
+`system:routine`: a `send_input` `call` line before the send (a nudge whose `call`
+line cannot be written is not sent) and an `outcome` line after it, `ok` or
+`error:<code>` (for example `error:status_mismatch` when the pane moved first). Both
+carry `routine` (`profile`) and `created_by` (`profile`), and the length of the text
+but never the text. A tick that skips (a person at the pane, a replayed pane) writes no
+audit line.
 
 ## The deprecated `watchdog` key
 
@@ -169,9 +176,7 @@ the `send_input` path).
 Possible later extensions, none planned:
 
 - other triggers: a schedule, a pane exit, a webhook;
-- other actions: a notification, a saved prompt;
-- a built-in client name for the routine in the audit log, instead of the current
-  stderr-only record.
+- other actions: a notification, a saved prompt.
 
 Any extension would add trigger and action fields inside the same `routine`
 section. It needs a concrete scenario first, and a design reviewed by the sol and

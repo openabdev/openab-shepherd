@@ -33,7 +33,7 @@ const TERM: &str = "xterm-256color";
 const PROTECTED_KEYS: [&str; 5] = ["HOME", "PATH", "USER", "LANG", "TERM"];
 const PROTECTED_PREFIXES: [&str; 2] = ["DYLD_", "LD_"];
 
-/// A caller's per-run environment, checked: at most 32 entries, names
+/// A caller's per-run environment, checked: at most `MAX_EXTRA_ENV` entries (the tool layer allows a caller 32), names
 /// `[A-Z_][A-Z0-9_]*` and not protected, values without NUL.
 pub(crate) fn run_env(env: &[(String, String)]) -> Result<Vec<(OsString, OsString)>, BackendError> {
     let out: Vec<(OsString, OsString)> = env

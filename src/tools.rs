@@ -629,7 +629,7 @@ impl Shepherd {
                     Some(guard),
                     Some(&pane_id),
                     Some(self.routine_lock_wait),
-                    Some(audit::ROUTINE_ACTOR),
+                    Some(RoutineAudit::PROFILE),
                 ) {
                     Ok(_) => {
                         // The send just returned: stamp it with a fresh
@@ -1238,14 +1238,31 @@ fn send_text_guarded(
     )
 }
 
+/// Who a routine's send is recorded as: the fixed actor, the routine's id
+/// and the client that created it (`profile` for the profile routine).
+#[derive(Clone, Copy)]
+struct RoutineAudit<'a> {
+    routine: &'a str,
+    created_by: &'a str,
+}
+
+impl RoutineAudit<'_> {
+    const PROFILE: RoutineAudit<'static> = RoutineAudit {
+        routine: "profile",
+        created_by: "profile",
+    };
+}
+
 /// `send_text_guarded` with an optional bound on the wait for the pane lock:
 /// a lock still held when `lock_wait` runs out is a `pane_busy` refusal and
 /// nothing is sent. `None` waits as every other tool does.
 ///
-/// `audit_actor` is set by a caller that does not come through `mcp::call_tool`
+/// `routine` is set by a caller that does not come through `mcp::call_tool`
 /// (the routine), which records MCP calls itself: the send is then recorded
-/// as a `send_input` by that actor, before it, and is refused when the record
-/// cannot be written. This adds no behaviour to the send itself.
+/// as a `send_input` by `system:routine` with the routine's id and creator, a
+/// `call` before it (the send is refused when that cannot be written) and an
+/// `outcome` after it, `ok` or `error:<code>`. Never the text. This adds no
+/// behaviour to the send itself.
 fn send_text_within(
     sh: &Shepherd,
     terminal: &str,
@@ -1253,16 +1270,32 @@ fn send_text_within(
     extra_guard: Option<InputGuard>,
     expected_pane_id: Option<&str>,
     lock_wait: Option<Duration>,
-    audit_actor: Option<&str>,
+    routine: Option<RoutineAudit<'_>>,
 ) -> Result<Value, ToolError> {
-    if let (Some(actor), Some(audit)) = (audit_actor, sh.audit()) {
-        let mut args = Args::new();
-        args.insert("terminal".into(), json!(terminal));
-        args.insert("text".into(), json!(text));
-        audit
-            .before(actor, "send_input", &args)
-            .map_err(|unavailable| unavailable.to_tool_error())?;
-    }
+    let (Some(who), Some(audit)) = (routine, sh.audit()) else {
+        return send_text_inner(sh, terminal, text, extra_guard, expected_pane_id, lock_wait);
+    };
+    let mut args = Args::new();
+    args.insert("terminal".into(), json!(terminal));
+    args.insert("text".into(), json!(text));
+    args.insert("routine".into(), json!(who.routine));
+    args.insert("created_by".into(), json!(who.created_by));
+    audit
+        .before(audit::ROUTINE_ACTOR, "send_input", &args)
+        .map_err(|unavailable| unavailable.to_tool_error())?;
+    let result = send_text_inner(sh, terminal, text, extra_guard, expected_pane_id, lock_wait);
+    audit.after(audit::ROUTINE_ACTOR, "send_input", &args, &result);
+    result
+}
+
+fn send_text_inner(
+    sh: &Shepherd,
+    terminal: &str,
+    text: &str,
+    extra_guard: Option<InputGuard>,
+    expected_pane_id: Option<&str>,
+    lock_wait: Option<Duration>,
+) -> Result<Value, ToolError> {
     let (_guard, pane, now) = lock_pane_within(sh, terminal, lock_wait)?;
     // A caller that observed a specific pane (the routine) can pin the
     // send to that pane's id: if the name was reused while waiting for
@@ -5147,6 +5180,66 @@ mod tests {
                 "{case}: {records:?}"
             );
         }
+    }
+
+    /// A routine nudge is a `call` line and then an `outcome` line by the
+    /// routine actor, naming the routine and its creator, never the text.
+    #[test]
+    fn a_nudge_writes_a_call_then_an_outcome_naming_the_routine() {
+        use crate::audit::testing::memory_audit;
+        let dir = crate::testutil::TempDir::new("tools-nudge-audit");
+        let fake = FakeBackend::new(true);
+        let (audit, sink) = memory_audit();
+        let sh = registered_pane(Arc::new(MemoryRegistry::default()), &fake, &dir)
+            .with_audit(Arc::new(audit));
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
+        assert_eq!(sent_count(&fake), 1);
+        let records = sink.records();
+        let nudges: Vec<&Value> = records
+            .iter()
+            .filter(|r| r["client"] == audit::ROUTINE_ACTOR)
+            .collect();
+        assert_eq!(nudges.len(), 2, "{records:?}");
+        assert_eq!(nudges[0]["phase"], "call");
+        assert_eq!(nudges[1]["phase"], "outcome");
+        assert_eq!(nudges[1]["outcome"], "ok");
+        for record in &nudges {
+            assert_eq!(record["tool"], "send_input");
+            assert_eq!(record["pane"], "work");
+            assert_eq!(record["routine"], "profile");
+            assert_eq!(record["created_by"], "profile");
+            assert_eq!(record["text_len"], "continue".len());
+        }
+        assert!(
+            !sink.bytes().contains("continue\""),
+            "the text was recorded"
+        );
+    }
+
+    /// A refused nudge is on file as an error, not as a sent one.
+    #[test]
+    fn a_refused_nudge_shows_its_error_code_in_the_outcome() {
+        use crate::audit::testing::memory_audit;
+        let dir = crate::testutil::TempDir::new("tools-nudge-audit-refused");
+        let fake = FakeBackend::new(true);
+        let (audit, sink) = memory_audit();
+        let sh = registered_pane(Arc::new(MemoryRegistry::default()), &fake, &dir)
+            .with_audit(Arc::new(audit));
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        fake.state.lock().unwrap().send_error =
+            Some(BackendError::new(ErrorKind::Replayed, "replayed"));
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
+        assert_eq!(sent_count(&fake), 0);
+        let records = sink.records();
+        let outcome = records
+            .iter()
+            .find(|r| r["client"] == audit::ROUTINE_ACTOR && r["phase"] == "outcome")
+            .unwrap_or_else(|| panic!("no outcome line: {records:?}"));
+        assert_eq!(outcome["outcome"], "error:pane_replayed");
+        assert_eq!(outcome["routine"], "profile");
     }
 
     #[test]

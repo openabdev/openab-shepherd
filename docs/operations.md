@@ -166,7 +166,7 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
   `cwd` must resolve (symlinks and `..` resolved) to one of them or a directory
   below one; without `cwd` the first is used. The pane runs in the resolved path.
 - `env` (optional, at most 32): variables for this profile's panes only. A name is
-  `[A-Z_][A-Z0-9_]*` and may not be `TERM`, `PATH`, `DYLD_*`, `LD_*`,
+  `[A-Z_][A-Z0-9_]*` and may not be `TERM`, `PATH`, `SHEPHERD_PANE`, `DYLD_*`, `LD_*`,
   `OPENAB_SHEPHERD_*` or `HC_*`. A value
   is one of:
   - `keychain:<service>`: read when the pane starts with
@@ -562,7 +562,10 @@ Pane ids are `n:<k>`
 
 - **Child environment.** `env_clear()`, then only `HOME`, `PATH` (default
   `/usr/bin:/bin:/usr/sbin:/sbin`), `USER`, `LANG` (default `en_US.UTF-8`) and
-  `TERM=xterm-256color`, then the pane's [launch profile](#launch-profiles) `env`.
+  `TERM=xterm-256color`, then the pane's [launch profile](#launch-profiles) `env`,
+  then `SHEPHERD_PANE=<the pane's name>` last, so the agent can pass it as `terminal`
+  to a tool (a profile that names it is refused at load; a caller's value is
+  overridden). It is a name, never a credential.
   No credential passes by name: `KIRO_API_KEY` and every other secret reach a child
   only through its profile (kiro-cli without a stored login authenticates with
   `KIRO_API_KEY`, so a Kiro profile sets it, for example from the keychain). A
@@ -615,7 +618,7 @@ Pane ids are `n:<k>`
 | Pending replies | 4 KiB |
 | State and kind words | 32 bytes |
 | argv | 256 elements |
-| Extra env (per run, plus code-set) | 32 entries |
+| Extra env (per run, plus code-set, plus `SHEPHERD_PANE`) | 40 entries |
 | Write deadline | 5 s |
 | Paste settle | 100 ms quiet, at most 1 s |
 | Start wait | 2 s |
