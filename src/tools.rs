@@ -618,6 +618,24 @@ impl Shepherd {
                             );
                         }
                     }
+                    Err(err)
+                        if err.data["error"] == "pane_human_controlled"
+                            || err.data["error"] == "pane_draft_pending" =>
+                    {
+                        // A person holds the pane's lease or has typed and
+                        // not pressed Enter. Nothing was sent, and the nudge
+                        // is not queued: a skip like a replayed pane, counted
+                        // toward neither the cooldown nor the cap, so a
+                        // person at the pane cannot make the routine give up.
+                        let mut first = false;
+                        self.settle_routine(name, &pane_id, |watch| first = watch.note_held());
+                        if first {
+                            eprintln!(
+                                "openab-shepherd: routine: pane {name}: not nudging while a \
+                                 person is at the pane"
+                            );
+                        }
+                    }
                     Err(err) => {
                         // Any other refusal or failure (a `terminal_changed`
                         // or `status_mismatch` among them) counts toward the
@@ -1615,6 +1633,16 @@ fn backend_failure(terminal: Option<&str>, err: BackendError) -> ToolError {
         ErrorKind::Replayed => format!(
             "{pane} was picked up after a restart and its screen is not yet trusted; nothing was sent"
         ),
+        ErrorKind::HumanControlled {
+            expires_in_secs, ..
+        } => format!(
+            "a person is typing into {pane}; nothing was sent. Their lease ends in \
+             {expires_in_secs} s unless they keep typing; look again later"
+        ),
+        ErrorKind::DraftPending => format!(
+            "a person has typed into {pane} and not pressed Enter; nothing was sent. \
+             Look again later"
+        ),
         ErrorKind::Unsupported(op) => format!("the terminal backend does not support {op}"),
         ErrorKind::InvalidInput => "the terminal backend refused the request".to_string(),
         ErrorKind::Protocol => "the terminal backend sent a reply Shepherd cannot use".to_string(),
@@ -1623,6 +1651,15 @@ fn backend_failure(terminal: Option<&str>, err: BackendError) -> ToolError {
     let mut failure = ToolError::new(err.code(), message);
     if let Some(terminal) = terminal {
         failure = failure.with("terminal", terminal);
+    }
+    if let ErrorKind::HumanControlled {
+        idle_secs,
+        expires_in_secs,
+    } = &err.kind
+    {
+        failure = failure
+            .with("idle_secs", *idle_secs)
+            .with("expires_in_secs", *expires_in_secs);
     }
     failure.with("backend_detail", err.detail)
 }
@@ -4761,6 +4798,69 @@ mod tests {
         // No cooldown either: the next tick nudges as soon as the pane is trusted.
         sh.routine_tick_at(t0 + Duration::from_secs(12));
         assert_eq!(sent_count(&fake), 1);
+    }
+
+    #[test]
+    fn a_person_at_the_pane_is_a_skip_not_a_failed_nudge() {
+        for refusal in [
+            ErrorKind::HumanControlled {
+                idle_secs: 3,
+                expires_in_secs: 297,
+            },
+            ErrorKind::DraftPending,
+        ] {
+            let dir = crate::testutil::TempDir::new("tools-registry-human");
+            let fake = FakeBackend::new(true);
+            let reg = Arc::new(MemoryRegistry::default());
+            let sh = registered_pane(reg.clone(), &fake, &dir);
+            let t0 = Instant::now();
+            sh.routine_tick_at(t0);
+            // Far more ticks than the cap allows failed nudges.
+            for tick in 11..31 {
+                fake.state.lock().unwrap().send_error =
+                    Some(BackendError::new(refusal.clone(), "a person is here"));
+                sh.routine_tick_at(t0 + Duration::from_secs(tick));
+            }
+            assert_eq!(sent_count(&fake), 0, "{refusal:?}");
+            let watch = sh.routine_map().get("work").unwrap().state();
+            assert_eq!(watch, RoutineState::default(), "{refusal:?}: counted");
+            assert_eq!(
+                reg.get("id-work").unwrap().routine,
+                Some(RoutineState::default()),
+                "{refusal:?}: the pending count was not taken back"
+            );
+            // The person leaves: no cooldown, no give-up, the next tick nudges.
+            sh.routine_tick_at(t0 + Duration::from_secs(31));
+            assert_eq!(sent_count(&fake), 1, "{refusal:?}");
+        }
+    }
+
+    #[test]
+    fn a_person_at_the_pane_reaches_callers_with_their_codes_and_timings() {
+        let held = backend_failure(
+            Some("work"),
+            BackendError::new(
+                ErrorKind::HumanControlled {
+                    idle_secs: 12,
+                    expires_in_secs: 288,
+                },
+                "raw backend text",
+            ),
+        );
+        assert_eq!(held.data["error"], "pane_human_controlled");
+        assert_eq!(held.data["idle_secs"], 12);
+        assert_eq!(held.data["expires_in_secs"], 288);
+        assert_eq!(held.data["terminal"], "work");
+        assert_eq!(held.data["backend_detail"], "raw backend text");
+        assert!(held.text.starts_with("pane_human_controlled: "));
+        assert!(held.text.contains("nothing was sent"), "{}", held.text);
+        let draft = backend_failure(
+            Some("work"),
+            BackendError::new(ErrorKind::DraftPending, "raw"),
+        );
+        assert_eq!(draft.data["error"], "pane_draft_pending");
+        assert!(draft.data.get("idle_secs").is_none());
+        assert!(draft.text.contains("nothing was sent"), "{}", draft.text);
     }
 
     #[test]

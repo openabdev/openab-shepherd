@@ -134,7 +134,10 @@ nudges caused. It reads the routine's settings from the current profile, so a pa
 whose profile was removed, or no longer has a `routine`, is not watched, and one log
 line says so. The idle clock starts again at the restart. A pane that was picked up
 after a restart and has not repainted (`pane_replayed`) is skipped, not counted as a
-failed nudge.
+failed nudge. So is a pane a person is at (`pane_human_controlled`, `pane_draft_pending`):
+the nudge is refused, not queued, counts toward neither the cooldown nor the cap, and
+is logged once per episode. When the person is gone the next tick nudges, and the idle
+time already elapsed counts.
 
 ## Identity and audit
 

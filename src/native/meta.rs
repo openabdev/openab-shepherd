@@ -190,6 +190,13 @@ impl MetaStore {
     pub(crate) fn set_human_draft(&self) -> io::Result<()> {
         self.update(|m| m.human_draft = true)
     }
+
+    /// Clear the human-draft flag. Returns once the host has it; on failure
+    /// the in-memory meta is already clear, so the caller keeps its own flag
+    /// set and tries again.
+    pub(crate) fn clear_human_draft(&self) -> io::Result<()> {
+        self.update(|m| m.human_draft = false)
+    }
 }
 
 /// Read a pane's meta from the host. None, with a log line, when the host has

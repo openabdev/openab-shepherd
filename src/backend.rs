@@ -450,6 +450,18 @@ pub enum ErrorKind {
     /// modes may differ from what the program believes; nothing was sent.
     /// It clears when the program next repaints.
     Replayed,
+    /// A person holds the pane's input lease, so a bot's write was refused and
+    /// nothing was sent. Never queued: look again later.
+    HumanControlled {
+        /// Seconds since the holder's last input.
+        idle_secs: u64,
+        /// Seconds until the lease ends for want of input.
+        expires_in_secs: u64,
+    },
+    /// A person has typed into the pane and not pressed Enter (or an operator
+    /// has not cleared the draft), so a bot's write was refused and nothing
+    /// was sent. Never queued.
+    DraftPending,
     /// The backend cannot do this.
     Unsupported(String),
     /// The backend refused the request's parameters.
@@ -508,6 +520,8 @@ impl BackendError {
             ErrorKind::ScreenRefused => "screen_refused",
             ErrorKind::Finished => "pane_finished",
             ErrorKind::Replayed => "pane_replayed",
+            ErrorKind::HumanControlled { .. } => "pane_human_controlled",
+            ErrorKind::DraftPending => "pane_draft_pending",
             ErrorKind::Unsupported(_) => "unsupported",
             ErrorKind::InvalidInput => "invalid_input",
             ErrorKind::Protocol | ErrorKind::Other => "backend_error",

@@ -4,7 +4,10 @@
 //! were given, so a name and its id share one lock.
 //!
 //! This serializes Shepherd's own calls only. A person at the terminal or another
-//! client of the terminal backend is not covered.
+//! client of the terminal backend is not covered by this lock. The native
+//! backend covers a person who types through Shepherd by other means: the
+//! pane's input lease and draft flag (`native/human.rs`) refuse a bot's write
+//! while either exists, inside the backend's own write path.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
