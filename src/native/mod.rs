@@ -1362,8 +1362,29 @@ impl crate::registry::PaneRegistry for NativeBackend {
         })
     }
 
+    fn set_routines(
+        &self,
+        pane_id: &str,
+        routines: &crate::registry::RoutineSet,
+    ) -> Result<(), BackendError> {
+        let pane = match self.inner.resolve(&TerminalRef::new(pane_id)) {
+            Ok(pane) if pane.id == pane_id => pane,
+            _ => return Ok(()),
+        };
+        let Some(store) = pane.meta.as_ref() else {
+            return Ok(());
+        };
+        store.set_routines(routines).map_err(|err| {
+            BackendError::new(
+                ErrorKind::Other,
+                format!("native: {pane_id}: cannot write the pane metadata: {err}"),
+            )
+        })
+    }
+
     fn forget(&self, pane_id: &str) -> Result<(), BackendError> {
         self.meta_update(pane_id, |m| {
+            m.routines = crate::registry::RoutineSet::default();
             m.agent = None;
             m.profile = None;
             m.answered = false;
@@ -1380,7 +1401,7 @@ impl crate::registry::PaneRegistry for NativeBackend {
             .iter()
             .filter_map(|pane| {
                 let meta = pane.meta.as_ref()?.get();
-                if meta.agent.is_none() && meta.routine.is_none() {
+                if meta.agent.is_none() && meta.routine.is_none() && meta.routines.is_empty() {
                     return None;
                 }
                 Some(crate::registry::RegisteredPane {
@@ -1395,6 +1416,7 @@ impl crate::registry::PaneRegistry for NativeBackend {
                         gave_up: r.gave_up,
                         nudge_allowance: r.nudge_allowance,
                     }),
+                    routines: meta.routines,
                     live: pane.is_live(),
                 })
             })

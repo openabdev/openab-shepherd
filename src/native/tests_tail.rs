@@ -5,8 +5,9 @@
 
 use super::host::local::LocalHost;
 use super::host::{Attached, HostPane, KillOutcome, Spawned, META_CAP};
-use super::meta::{load, RoutineMeta, META_VERSION};
+use super::meta::{load, RoutineMeta, META_VERSION, ROUTINES_BLOB_CAP};
 use super::*;
+use crate::registry::{RoutineRecord, RoutineSet};
 use crate::testutil::TempDir;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -352,6 +353,7 @@ fn every_meta_field_round_trips() {
             gave_up: true,
             nudge_allowance: 3,
         }),
+        routines: Default::default(),
         answered: true,
     };
     let back = PaneMeta::from_bytes(&meta.to_bytes()).unwrap();
@@ -472,4 +474,176 @@ fn the_default_tail_is_one_mebibyte() {
     assert_eq!(at.tail_end - at.tail_start, TAIL_CAP as u64);
     assert!(at.tail_start > 0, "1.1 MiB of output wrapped a 1 MiB tail");
     b.shutdown();
+}
+
+// ---- issue #98, PR2: the routines key in the meta ----
+
+fn routine_rec(n: u64, text: &str) -> RoutineRecord {
+    RoutineRecord {
+        id: format!("r{n}"),
+        every_secs: 600,
+        text: text.to_string(),
+        todo_file: Some("a/relative/path/to/TODO.md".to_string()),
+        created_by: "agent-a".to_string(),
+        created_at: 1_000,
+        expires_at: 100_000,
+        max_runs: Some(7),
+        status: "active".to_string(),
+        stop_reason: None,
+        runs: 1,
+        fail_streak: 0,
+        last_run_at: Some(1_600),
+        last_result: Some("sent".to_string()),
+        last_error: None,
+        next_due: 2_200,
+    }
+}
+
+fn meta_with_tracker() -> PaneMeta {
+    let mut tracker = Tracker::default();
+    tracker.apply(State::Blocked, Some("permission".into()), 42);
+    PaneMeta {
+        name: Some("worker".into()),
+        cwd: "/work".into(),
+        agent: Some("kiro".into()),
+        profile: Some("kiro-default".into()),
+        tracker: Some(tracker.snapshot()),
+        tracker_seq: 99,
+        human_draft: true,
+        ..PaneMeta::default()
+    }
+}
+
+#[test]
+fn routines_round_trip_in_the_meta_and_the_version_stays_1() {
+    let mut meta = meta_with_tracker();
+    meta.routines = RoutineSet {
+        seq: 3,
+        items: vec![routine_rec(1, "check"), routine_rec(3, "again")],
+    };
+    let back = PaneMeta::from_bytes(&meta.to_bytes()).unwrap();
+    assert_eq!(back, meta);
+    let v: serde_json::Value = serde_json::from_slice(&meta.to_bytes()).unwrap();
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["routines"]["v"], 1);
+    assert_eq!(v["routines"]["seq"], 3);
+    // No routines, no key: an older build reads the same bytes as before.
+    let none: serde_json::Value = serde_json::from_slice(&meta_with_tracker().to_bytes()).unwrap();
+    assert!(none.get("routines").is_none());
+}
+
+#[test]
+fn a_blob_written_before_routines_existed_still_loads() {
+    let old = br#"{"v":1,"name":"w","labels":[],"argv":["kiro-cli"],"cwd":"/w",
+        "agent":"kiro","profile":"kiro","tracker":null,"tracker_seq":0,
+        "human_draft":false,"routine":null,"answered":false}"#;
+    let meta = PaneMeta::from_bytes(old).unwrap();
+    assert_eq!(meta.agent.as_deref(), Some("kiro"));
+    assert!(meta.routines.is_empty());
+    assert_eq!(meta.routines.seq, 0);
+}
+
+#[test]
+fn a_malformed_routines_value_is_empty_and_keeps_the_rest_of_the_meta() {
+    let base = meta_with_tracker();
+    for bad in [
+        serde_json::json!("garbage"),
+        serde_json::json!(12),
+        serde_json::json!([1, 2]),
+        serde_json::json!({"v": 1}),
+        serde_json::json!({"v": 7, "seq": 1, "items": []}),
+        serde_json::json!({"v": 1, "seq": "x", "items": {"a": 1}}),
+    ] {
+        let mut blob: serde_json::Value = serde_json::from_slice(&base.to_bytes()).unwrap();
+        blob["routines"] = bad.clone();
+        let (meta, notes) = PaneMeta::from_bytes_with_notes(blob.to_string().as_bytes())
+            .unwrap_or_else(|e| {
+                panic!("{bad}: the whole meta was refused: {e}");
+            });
+        assert!(meta.routines.is_empty(), "{bad}");
+        assert!(!notes.is_empty(), "{bad}: nothing was logged");
+        // The tracker and the human-draft flag survive.
+        assert_eq!(meta.tracker, base.tracker, "{bad}");
+        assert!(meta.human_draft, "{bad}");
+        assert_eq!(meta.agent, base.agent, "{bad}");
+    }
+}
+
+#[test]
+fn a_bad_routine_item_is_dropped_and_the_others_and_the_tracker_are_kept() {
+    let base = meta_with_tracker();
+    let mut blob: serde_json::Value = serde_json::from_slice(&base.to_bytes()).unwrap();
+    let mut broken = routine_rec(2, "second").to_json();
+    broken["every_secs"] = serde_json::json!("often");
+    broken["trigger"] = serde_json::json!({"type": "every"});
+    blob["routines"] = serde_json::json!({"v": 1, "seq": 3, "items": [
+        routine_rec(1, "first").to_json(), broken, routine_rec(3, "third").to_json()]});
+    let (meta, notes) = PaneMeta::from_bytes_with_notes(blob.to_string().as_bytes()).unwrap();
+    let ids: Vec<&str> = meta.routines.items.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, ["r1", "r3"]);
+    assert_eq!(meta.routines.seq, 3);
+    assert_eq!(notes.len(), 1);
+    assert_eq!(meta.tracker, base.tracker);
+}
+
+#[test]
+fn an_unknown_future_key_is_ignored() {
+    let mut blob: serde_json::Value =
+        serde_json::from_slice(&meta_with_tracker().to_bytes()).unwrap();
+    blob["something_later"] = serde_json::json!({"x": [1, 2, 3]});
+    blob["routines"] = serde_json::json!({"v": 1, "seq": 1, "items": [],
+        "later_field": true});
+    let meta = PaneMeta::from_bytes(blob.to_string().as_bytes()).unwrap();
+    assert_eq!(meta.agent.as_deref(), Some("kiro"));
+    assert_eq!(meta.routines.seq, 1);
+}
+
+#[test]
+fn load_reads_a_malformed_routines_key_without_losing_the_pane() {
+    let host = LocalHost::new();
+    let id = host_rig(&host);
+    let mut blob: serde_json::Value =
+        serde_json::from_slice(&meta_with_tracker().to_bytes()).unwrap();
+    blob["routines"] = serde_json::json!("garbage");
+    host.meta_set(&id, blob.to_string().as_bytes()).unwrap();
+    let meta = load(&host, &id).expect("the meta is adopted");
+    assert!(meta.tracker.is_some());
+    assert!(meta.routines.is_empty());
+    host.end_all();
+}
+
+#[test]
+fn set_routines_refuses_a_blob_over_the_cap_and_changes_nothing() {
+    let host = Counting::new(LocalHost::with_tail(4096));
+    let id = host_rig(&host.inner);
+    let store = MetaStore::new(
+        Arc::clone(&host) as Arc<dyn PtyHost>,
+        id.clone(),
+        PaneMeta::default(),
+    );
+    // Ten routines of the largest text fit with room to spare.
+    let max_text = "x".repeat(1024);
+    let worst = RoutineSet {
+        seq: 10,
+        items: (1..=10).map(|n| routine_rec(n, &max_text)).collect(),
+    };
+    store.set_routines(&worst).unwrap();
+    let stored = host.meta_get(&id).unwrap();
+    assert!(stored.len() < ROUTINES_BLOB_CAP / 2, "{}", stored.len());
+    assert_eq!(store.get().routines, worst);
+
+    // A pane whose argv already fills the budget cannot take them.
+    store
+        .update(|m| m.argv = vec!["a".repeat(40 * 1024)])
+        .unwrap();
+    let before_bytes = host.meta_get(&id).unwrap();
+    let sets_before = host.sets();
+    let mut bigger = worst.clone();
+    bigger.items.push(routine_rec(11, &max_text));
+    let err = store.set_routines(&bigger).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(host.sets(), sets_before, "nothing was written");
+    assert_eq!(host.meta_get(&id).unwrap(), before_bytes);
+    assert_eq!(store.get().routines, worst, "memory is unchanged");
+    host.end_all();
 }

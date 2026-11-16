@@ -11,12 +11,18 @@
 
 use super::host::PtyHost;
 use super::status::TrackerSnapshot;
+use crate::registry::RoutineSet;
 use serde_json::{json, Value};
 use std::io;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The schema version this build writes and reads.
 pub(crate) const META_VERSION: u64 = 1;
+
+/// The largest meta blob a routines write may produce. The host refuses a
+/// blob over 64 KiB (`META_CAP`); the rest is headroom for argv and the
+/// tracker snapshot, whose size is not bounded here.
+pub(crate) const ROUTINES_BLOB_CAP: usize = 48 * 1024;
 
 /// The routine's counters for a pane, kept so a restart does not rearm a
 /// routine that gave up or reset its nudge cap.
@@ -45,6 +51,10 @@ pub(crate) struct PaneMeta {
     /// before the human's first byte is written.
     pub human_draft: bool,
     pub routine: Option<RoutineMeta>,
+    /// Agent-created routines (issue #98). An additive key: meta `v` stays 1,
+    /// an older build ignores the key, and a value of the wrong shape reads
+    /// as empty without losing the rest of the meta.
+    pub routines: RoutineSet,
     /// A dialog was answered, so a following idle is a cancel.
     pub answered: bool,
 }
@@ -59,7 +69,7 @@ impl PaneMeta {
                 "nudge_allowance": r.nudge_allowance,
             })
         });
-        json!({
+        let mut blob = json!({
             "v": META_VERSION,
             "name": self.name,
             "labels": labels,
@@ -72,15 +82,24 @@ impl PaneMeta {
             "human_draft": self.human_draft,
             "routine": routine,
             "answered": self.answered,
-        })
-        .to_string()
-        .into_bytes()
+        });
+        if !self.routines.is_blank() {
+            blob["routines"] = self.routines.to_json();
+        }
+        blob.to_string().into_bytes()
     }
 
     /// Why the blob is not usable, as a log line: not JSON, another version,
     /// or a field of the wrong shape. A pane with such meta is adopted
     /// without a restore, never refused.
+    #[cfg(test)]
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        Self::from_bytes_with_notes(bytes).map(|(meta, _)| meta)
+    }
+
+    /// [`PaneMeta::from_bytes`], with the log lines for what was dropped from
+    /// the lenient `routines` key.
+    pub(crate) fn from_bytes_with_notes(bytes: &[u8]) -> Result<(Self, Vec<String>), String> {
         let value: Value =
             serde_json::from_slice(bytes).map_err(|err| format!("meta is not JSON: {err}"))?;
         match value.get("v").and_then(Value::as_u64) {
@@ -88,10 +107,13 @@ impl PaneMeta {
             Some(other) => return Err(format!("meta has version {other}, not {META_VERSION}")),
             None => return Err("meta has no version".to_string()),
         }
-        Self::from_value(&value).ok_or_else(|| "meta has a field of the wrong shape".to_string())
+        let mut notes = Vec::new();
+        let meta = Self::from_value(&value, &mut notes)
+            .ok_or_else(|| "meta has a field of the wrong shape".to_string())?;
+        Ok((meta, notes))
     }
 
-    fn from_value(value: &Value) -> Option<Self> {
+    fn from_value(value: &Value, notes: &mut Vec<String>) -> Option<Self> {
         let text = |key: &str| match value.get(key)? {
             Value::Null => Some(None),
             other => Some(Some(other.as_str()?.to_string())),
@@ -126,6 +148,16 @@ impl PaneMeta {
                 nudge_allowance: r.get("nudge_allowance")?.as_u64()?,
             }),
         };
+        // Read on its own, never with `?`: a bad `routines` value must not
+        // cost the pane its tracker or its human-draft flag.
+        let routines = match value.get("routines") {
+            None | Some(Value::Null) => RoutineSet::default(),
+            Some(stored) => {
+                let (set, lost) = RoutineSet::from_json_lenient(stored);
+                notes.extend(lost);
+                set
+            }
+        };
         Some(Self {
             name: text("name")?,
             labels,
@@ -137,6 +169,7 @@ impl PaneMeta {
             tracker_seq: value.get("tracker_seq")?.as_u64()?,
             human_draft: value.get("human_draft")?.as_bool()?,
             routine,
+            routines,
             answered: value.get("answered")?.as_bool()?,
         })
     }
@@ -167,6 +200,29 @@ impl MetaStore {
         let out = change(&mut meta);
         self.host.meta_set(&self.id, &meta.to_bytes())?;
         Ok(out)
+    }
+
+    /// Replace the pane's routines and write the whole blob. All or nothing:
+    /// a blob over [`ROUTINES_BLOB_CAP`] is refused, and a failed host write
+    /// leaves the routines in memory as they were, so the caller can report
+    /// "not saved" and change nothing of its own.
+    pub(crate) fn set_routines(&self, routines: &RoutineSet) -> io::Result<()> {
+        let mut meta = self.meta.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut next = meta.clone();
+        next.routines = routines.clone();
+        let bytes = next.to_bytes();
+        if bytes.len() > ROUTINES_BLOB_CAP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the pane metadata would be {} bytes with these routines; the limit is {ROUTINES_BLOB_CAP}",
+                    bytes.len()
+                ),
+            ));
+        }
+        self.host.meta_set(&self.id, &bytes)?;
+        *meta = next;
+        Ok(())
     }
 
     /// The meta as last set.
@@ -210,8 +266,15 @@ pub(crate) fn load(host: &dyn PtyHost, id: &str) -> Option<PaneMeta> {
             return None;
         }
     };
-    match PaneMeta::from_bytes(&bytes) {
-        Ok(meta) => Some(meta),
+    match PaneMeta::from_bytes_with_notes(&bytes) {
+        Ok((meta, notes)) => {
+            for note in notes {
+                eprintln!(
+                    "openab-shepherd: native: {id}: meta: {note}; routines kept as far as readable"
+                );
+            }
+            Some(meta)
+        }
         Err(why) => {
             eprintln!("openab-shepherd: native: {id}: {why}; adopting without it");
             None

@@ -2383,6 +2383,106 @@ mod tools_layer {
         assert!(s.host.writes_since(0).is_empty());
     }
 
+    fn routine_rec(n: u64) -> crate::registry::RoutineRecord {
+        crate::registry::RoutineRecord {
+            id: format!("r{n}"),
+            every_secs: 600,
+            text: format!("check item {n}"),
+            todo_file: None,
+            created_by: "agent-a".to_string(),
+            created_at: 1_000,
+            expires_at: 100_000,
+            max_runs: None,
+            status: "active".to_string(),
+            stop_reason: None,
+            runs: 0,
+            fail_streak: 0,
+            last_run_at: None,
+            last_result: None,
+            last_error: None,
+            next_due: 1_600,
+        }
+    }
+
+    #[test]
+    fn routines_and_the_profile_come_back_after_a_front_restart() {
+        let mut s = Split::new(1 << 20);
+        let dir = TempDir::new("pr98-routines-restart");
+        let sh = tools(&s, policy(&dir, "sleep 30", None));
+        start(&sh, "w");
+        assert_eq!(sh.profile_of("w").as_deref(), Some("kiro"));
+        let info = s.b().get(&TerminalRef::new("w")).unwrap();
+        let set = crate::registry::RoutineSet {
+            seq: 5,
+            items: vec![routine_rec(2), routine_rec(5)],
+        };
+        PaneRegistry::set_routines(s.b(), &info.id, &set).unwrap();
+        assert_eq!(load(&*s.host, &info.id).unwrap().routines, set);
+
+        let sh = restart(&mut s, sh, policy(&dir, "sleep 30", None));
+        let registered = PaneRegistry::registered(s.b());
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].routines, set);
+        assert_eq!(sh.profile_of("w").as_deref(), Some("kiro"));
+    }
+
+    #[test]
+    fn a_routines_write_the_host_refuses_changes_nothing() {
+        let s = Split::new(1 << 20);
+        let dir = TempDir::new("pr98-routines-refused");
+        let sh = tools(&s, policy(&dir, "sleep 30", None));
+        start(&sh, "w");
+        let info = s.b().get(&TerminalRef::new("w")).unwrap();
+        let kept = crate::registry::RoutineSet {
+            seq: 1,
+            items: vec![routine_rec(1)],
+        };
+        PaneRegistry::set_routines(s.b(), &info.id, &kept).unwrap();
+        s.host.fail_meta.store(true, Ordering::SeqCst);
+        let more = crate::registry::RoutineSet {
+            seq: 2,
+            items: vec![routine_rec(1), routine_rec(2)],
+        };
+        assert!(PaneRegistry::set_routines(s.b(), &info.id, &more).is_err());
+        s.host.fail_meta.store(false, Ordering::SeqCst);
+        let registered = PaneRegistry::registered(s.b());
+        assert_eq!(registered[0].routines, kept, "memory is unchanged");
+        assert_eq!(load(&*s.host, &info.id).unwrap().routines, kept);
+    }
+
+    #[test]
+    fn a_routines_write_over_the_budget_is_refused_and_changes_nothing() {
+        let s = Split::new(1 << 20);
+        let dir = TempDir::new("pr98-routines-budget");
+        let sh = tools(&s, policy(&dir, "sleep 30", None));
+        start(&sh, "w");
+        let info = s.b().get(&TerminalRef::new("w")).unwrap();
+        let mut big = routine_rec(1);
+        big.text = "x".repeat(60 * 1024);
+        let set = crate::registry::RoutineSet {
+            seq: 1,
+            items: vec![big],
+        };
+        assert!(PaneRegistry::set_routines(s.b(), &info.id, &set).is_err());
+        assert!(PaneRegistry::registered(s.b())[0].routines.is_empty());
+    }
+
+    #[test]
+    fn removing_a_pane_clears_its_routines() {
+        let s = Split::new(1 << 20);
+        let dir = TempDir::new("pr98-routines-remove");
+        let sh = tools(&s, policy(&dir, "sleep 30", None));
+        start(&sh, "w");
+        let info = s.b().get(&TerminalRef::new("w")).unwrap();
+        let set = crate::registry::RoutineSet {
+            seq: 1,
+            items: vec![routine_rec(1)],
+        };
+        PaneRegistry::set_routines(s.b(), &info.id, &set).unwrap();
+        call(&sh, "remove_pane", &args(json!({"terminal": "w"}))).unwrap();
+        assert!(PaneRegistry::registered(s.b()).is_empty());
+    }
+
     #[test]
     fn removing_a_pane_leaves_no_record_behind() {
         let s = Split::new(1 << 20);
