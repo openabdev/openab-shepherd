@@ -381,13 +381,73 @@ fn the_child_sees_only_the_whitelisted_environment() {
         .collect();
     assert_eq!(
         keys,
-        BTreeSet::from(["HOME", "LANG", "PATH", "TERM", "USER"]),
+        BTreeSet::from(["HOME", "LANG", "PATH", "SHEPHERD_PANE", "TERM", "USER"]),
         "{text}"
     );
+    assert!(text.lines().any(|l| l == "SHEPHERD_PANE=env"), "{text}");
     assert!(text.lines().any(|l| l == "TERM=xterm-256color"), "{text}");
     assert!(text.lines().any(|l| l == "LANG=en_US.UTF-8"), "{text}");
     assert!(text.lines().any(|l| l == "PATH=/usr/bin:/bin"), "{text}");
     assert!(!text.contains("secret"), "{text}");
+}
+
+/// The pane's own name is in its environment, set last: a caller's value of
+/// the same name, a profile's and a code-set one all lose to it, and the
+/// other per-run variables still pass. The MCP token never does.
+#[test]
+fn the_pane_name_is_in_its_environment_and_wins() {
+    let dir = TempDir::new("native-pane-env");
+    let parent: HashMap<&'static str, &'static str> = HashMap::from([
+        ("OPENAB_SHEPHERD_TOKEN", "token-value-secret-1"),
+        ("OPENAB_SHEPHERD_TOKEN_FILE", "/tmp/token-file-secret-2"),
+    ]);
+    let b = backend_with_env(move |key| parent.get(key).map(OsString::from));
+    let spec = RunSpec {
+        env: vec![
+            ("SHEPHERD_PANE".to_string(), "caller-says-so".to_string()),
+            ("OTHER_VAR".to_string(), "kept".to_string()),
+        ],
+        profile_env: vec![(
+            "SHEPHERD_PANE".to_string(),
+            crate::backend::Secret::new("profile-says-so"),
+        )],
+        ..spec_argv("agent-7", &["/usr/bin/env"], &dir)
+    };
+    let info = b.run(&spec).unwrap();
+    b.wait(&info.reference(), LONG).unwrap();
+    let text = screen(&b, &info);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.contains(&"SHEPHERD_PANE=agent-7"), "{text}");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("SHEPHERD_PANE="))
+            .count(),
+        1,
+        "{text}"
+    );
+    assert!(lines.contains(&"OTHER_VAR=kept"), "{text}");
+    assert!(!text.contains("secret"), "{text}");
+    assert!(!text.contains("OPENAB_SHEPHERD"), "{text}");
+}
+
+/// A profile at its 32-variable limit still starts: the pane's own variable
+/// fits under the backend's limit.
+#[test]
+fn a_full_profile_env_and_the_pane_name_fit() {
+    let dir = TempDir::new("native-pane-env-full");
+    let b = backend_with_env(|_| None);
+    let spec = RunSpec {
+        profile_env: (0..32)
+            .map(|i| (format!("PROFILE_K{i}"), crate::backend::Secret::new("v")))
+            .collect(),
+        ..spec_argv("full", &["/usr/bin/env"], &dir)
+    };
+    let info = b.run(&spec).unwrap();
+    b.wait(&info.reference(), LONG).unwrap();
+    let text = screen(&b, &info);
+    assert!(text.lines().any(|l| l == "SHEPHERD_PANE=full"), "{text}");
+    assert!(text.lines().any(|l| l == "PROFILE_K31=v"), "{text}");
 }
 
 #[test]

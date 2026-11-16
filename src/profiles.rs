@@ -56,7 +56,7 @@ const DEFAULT_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// Names a profile's `env` may not set besides Shepherd's own: `TERM` (fixed
 /// by the backend), `PATH` (it decides what a child's commands run) and
 /// loader variables.
-const PROTECTED_KEYS: [&str; 2] = ["TERM", "PATH"];
+const PROTECTED_KEYS: [&str; 3] = ["TERM", "PATH", "SHEPHERD_PANE"];
 const PROTECTED_PREFIXES: [&str; 2] = ["DYLD_", "LD_"];
 
 type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
@@ -1029,6 +1029,10 @@ mod tests {
             (json!({"profiles": [{"name": "p", "argv": ["a"], "cwds": [d]}, {"name": "p", "argv": ["b"], "cwds": [d]}]}).to_string(), "two profiles"),
             (one_profile(dir.path(), json!({"lower": "x"})), "must match"),
             (one_profile(dir.path(), json!({"TERM": "dumb"})), "may not set TERM"),
+            (
+                one_profile(dir.path(), json!({"SHEPHERD_PANE": "other"})),
+                "may not set SHEPHERD_PANE",
+            ),
             (one_profile(dir.path(), json!({"OPENAB_SHEPHERD_TOKEN": "x"})), "may not set"),
             (one_profile(dir.path(), json!({"HC_SOCKET": "x"})), "may not set"),
             (one_profile(dir.path(), json!({"A": "env:OPENAB_SHEPHERD_TOKEN"})), "not Shepherd's own"),

@@ -266,7 +266,7 @@ impl Audit {
             return Ok(());
         }
         let mut record = base(actor, tool, "call");
-        record.extend(request_fields(tool, args));
+        record.extend(request_fields(actor, tool, args));
         if self.emit(record).is_err() {
             self.note_failure();
             if policy(tool) == Policy::FailClosed {
@@ -284,7 +284,7 @@ impl Audit {
             return;
         }
         let mut record = base(actor, tool, "outcome");
-        record.extend(request_fields(tool, args));
+        record.extend(request_fields(actor, tool, args));
         if tool == "start_pane" {
             if let Some(name) = result_name(result) {
                 record.insert("pane".into(), json!(cap(&name, SHORT)));
@@ -297,7 +297,7 @@ impl Audit {
     /// Record a call the scope check refused. Always attempted; never blocks.
     pub fn denied(&self, actor: &str, tool: &str, args: &Args, reason: &str) {
         let mut record = base(actor, tool, "denied");
-        record.extend(request_fields(tool, args));
+        record.extend(request_fields(actor, tool, args));
         record.insert("outcome".into(), json!("denied"));
         record.insert("reason".into(), json!(cap(reason, LONG)));
         self.emit_or_count(record);
@@ -333,7 +333,7 @@ fn put_capped(record: &mut Map<String, Value>, field: &str, args: &Args, key: &s
 }
 
 /// The allowlisted fields of a request. Anything not named here is dropped.
-fn request_fields(tool: &str, args: &Args) -> Map<String, Value> {
+fn request_fields(actor: &str, tool: &str, args: &Args) -> Map<String, Value> {
     let mut out = Map::new();
     match tool {
         "start_pane" => {
@@ -344,6 +344,12 @@ fn request_fields(tool: &str, args: &Args) -> Map<String, Value> {
             put_capped(&mut out, "pane", args, "terminal", SHORT);
             if let Some(text) = str_arg(args, "text") {
                 out.insert("text_len".into(), json!(text.len()));
+            }
+            // Only the routine names itself: a client's own `routine` or
+            // `created_by` argument is never copied into the record.
+            if actor == ROUTINE_ACTOR {
+                put_capped(&mut out, "routine", args, "routine", SHORT);
+                put_capped(&mut out, "created_by", args, "created_by", SHORT);
             }
         }
         "answer_dialog" => {
@@ -680,6 +686,22 @@ mod tests {
             .before(ROUTINE_ACTOR, "send_input", &sample("send_input"))
             .unwrap();
         assert_eq!(sink.records()[0]["client"], "system:routine");
+    }
+
+    /// Only the routine names a routine: a client's own `routine` or
+    /// `created_by` argument on `send_input` is not copied into the record.
+    #[test]
+    fn a_client_cannot_name_a_routine_in_its_own_record() {
+        let (audit, sink) = memory_audit();
+        let forged = args(json!({"terminal": "w", "text": "hi",
+            "routine": "profile", "created_by": "profile"}));
+        audit.before("alice", "send_input", &forged).unwrap();
+        audit.before(ROUTINE_ACTOR, "send_input", &forged).unwrap();
+        let records = sink.records();
+        assert!(records[0].get("routine").is_none(), "{:?}", records[0]);
+        assert!(records[0].get("created_by").is_none(), "{:?}", records[0]);
+        assert_eq!(records[1]["routine"], "profile");
+        assert_eq!(records[1]["created_by"], "profile");
     }
 
     const CANARY: &str = "CANARY-9f3c1e";

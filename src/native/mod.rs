@@ -99,7 +99,7 @@ const MAX_FINISHED_PANES: usize = 32;
 const RAW_RING: usize = 256 * 1024;
 const PENDING_REPLIES: usize = 4 * 1024;
 const MAX_ARGV: usize = 256;
-pub(crate) const MAX_EXTRA_ENV: usize = 32;
+pub(crate) const MAX_EXTRA_ENV: usize = 40;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const SETTLE_QUIET: Duration = Duration::from_millis(100);
 const SETTLE_MAX: Duration = Duration::from_secs(1);
@@ -132,7 +132,8 @@ const CAPABILITIES: Capabilities = Capabilities {
 pub struct NativeConfig {
     /// Extra variables for every child, set by code only (tests, the probe).
     /// Keys match `[A-Z_][A-Z0-9_]*`, values have no NUL; together with a
-    /// run's own `RunSpec.env`, at most 32.
+    /// run's own `RunSpec.env` and `SHEPHERD_PANE`, at most 40 (a profile's
+    /// 32 and a caller's 32 are each limited before they get here).
     pub extra_env: Vec<(OsString, OsString)>,
     /// The clock the input lease's idle rule reads. Tests move it.
     pub(crate) lease_clock: LeaseClock,
@@ -1456,6 +1457,11 @@ impl TerminalBackend for NativeBackend {
                 .map(|(key, value)| (OsString::from(key), OsString::from(value.expose()))),
         );
         extra.extend(pty::run_env(&spec.env)?);
+        // Last, so nothing before it can override it: the pane's own name,
+        // which the agent passes as `terminal`. Never a credential.
+        if let Some(name) = &spec.name {
+            extra.push((OsString::from("SHEPHERD_PANE"), OsString::from(name)));
+        }
         let env = pty::child_env(&*self.inner.env, &extra)?;
         let cwd = self.cwd_for(spec.cwd.as_deref())?;
         check_room(&*self.inner.table()?, spec.name.as_deref())?;

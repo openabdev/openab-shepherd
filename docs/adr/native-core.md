@@ -328,7 +328,7 @@ The env is built by `child_env(lookup: impl Fn(&str) -> Option<OsString>, extra:
 | `USER` | the parent's value if set; else not set |
 | `LANG` | the parent's value if set; else `en_US.UTF-8` (the dialog parser needs UTF-8 output such as `❯`) |
 | `TERM` | always `xterm-256color` (fixed; the parent's TERM is ignored) |
-| extra | `NativeConfig.extra_env` (code only: tests, the probe), then the launch profile's `RunSpec.profile_env`, then the run's `RunSpec.env`. Validated: key `[A-Z_][A-Z0-9_]*`, value without NUL, at most 32 entries together. |
+| extra | `NativeConfig.extra_env` (code only: tests, the probe), then the launch profile's `RunSpec.profile_env`, then the run's `RunSpec.env`. Validated: key `[A-Z_][A-Z0-9_]*`, value without NUL, at most 40 entries together (a profile's 32 and the pane's `SHEPHERD_PANE` fit). |
 
 Nothing else passes, by construction (`env_clear()` first). In particular, `OPENAB_SHEPHERD_TOKEN`, `OPENAB_SHEPHERD_TOKEN_FILE`, `OPENAB_SHEPHERD_PROFILES`, `OPENAB_SHEPHERD_BACKEND`, `HC_*`, `KIRO_API_KEY`, `TERM_PROGRAM*`, `COLORTERM`, `SSH_*` and cloud credentials never pass by name.
 
@@ -482,7 +482,7 @@ Nothing is logged per chunk or per call.
 | Pending replies | 4 KiB |
 | State and kind words | 32 bytes |
 | argv | 256 elements |
-| Extra env (per run plus code-set) | 32 entries |
+| Extra env (per run plus code-set, plus `SHEPHERD_PANE`) | 40 entries |
 | Write deadline | 5 s |
 | Paste settle | 100 ms quiet, at most 1 s |
 | Start wait | 2 s |
