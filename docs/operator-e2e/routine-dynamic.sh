@@ -50,7 +50,7 @@ export SHEPHERD_TOKEN_FILE="$R_HOME/ops.token"   # `ops` starts panes; r_mcp_up 
 
 # d_write_profiles on|off : the profiles file; `off` leaves dynamic_routines out of `dyn`.
 d_write_profiles() {
-  D_DYNAMIC="$1" python3 - <<'PY'
+  R_WORK="$R_WORK" R_HOME="$R_HOME" D_DYNAMIC="$1" python3 - <<'PY'
 import json, os
 
 work, home = os.environ["R_WORK"], os.environ["R_HOME"]
@@ -258,16 +258,15 @@ d_main() {
 
   # --- Step 2: panes, and SHEPHERD_PANE ---------------------------------------------------
   d_start dyn dyn; d_start busy dyn; d_start exp dyn; d_start plain plain
-  r_check "dyn is done" r_wait_field dyn status.state done 20
-  r_check "exp is done" r_wait_field exp status.state done 20
+  r_check "dyn is done" r_wait_field dyn status.state "done" 20
+  r_check "exp is done" r_wait_field exp status.state "done" 20
   r_check "busy is working" r_wait_field busy status.state working 20
   r_check "dyn knows its own name in SHEPHERD_PANE" r_wait_file "$R_WORK/dyn/pane-env.txt" 10
   r_check "SHEPHERD_PANE is dyn" test "$(cat "$R_WORK/dyn/pane-env.txt" 2>/dev/null)" = dyn
   r_check "SHEPHERD_PANE is busy" test "$(cat "$R_WORK/busy/pane-env.txt" 2>/dev/null)" = busy
 
   # --- Step 3: create, the refusals, list ---------------------------------------------------
-  local created t0
-  t0=$SECONDS
+  local created
   created="$(as_agent rc_create dyn 60 "$D_NUDGE_TEXT" todo_file=todo.md expires_secs:=1800 2>/dev/null)"
   r_check "routine_create on dyn returns r1" test "$(echo "$created" | d_py 'd["routine"]["id"]')" = r1
   r_check "it names agent-a as the creator" test "$(echo "$created" | d_py 'd["routine"]["created_by"]')" = agent-a
@@ -306,7 +305,7 @@ d_main() {
   r_check "busy: the tick found it working (skipped:working)" d_wait_rfield busy r1 last_result skipped:working 30
   r_check "busy: nothing was typed" test "$(d_typed busy)" = 0
   touch "$R_WORK/busy/finish"                       # the turn ends now; the missed tick is gone
-  r_check "busy is done" r_wait_field busy status.state done 20
+  r_check "busy is done" r_wait_field busy status.state "done" 20
   sleep 15
   r_check "busy: the skipped tick is not made up after the turn ends" test "$(d_typed busy)" = 0
   r_check "busy is typed into at its next grid time, once" d_wait_lines "$R_WORK/busy/typed.txt" 1 90

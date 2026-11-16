@@ -387,5 +387,5 @@ Possible later extensions, none planned:
 - a dynamic `idle` trigger.
 
 Any extension would add trigger and action fields inside the same routine record. It
-needs a concrete scenario first, and a design reviewed by the sol and opus5 council
-with a herdr and Orca comparison before any code.
+needs a concrete scenario first, and a design that has had a council review and a
+comparison with herdr and Orca before any code.
