@@ -4,9 +4,10 @@
 //! `restart-lib.sh` writes are accepted by the real profile loader with a dialog the real
 //! parser reads. Nothing here starts the Shepherd server.
 
-use openab_shepherd::clients::{Clients, Scope};
+use openab_shepherd::agent::Agent;
+use openab_shepherd::clients::{authorize, Clients, Scope};
 use openab_shepherd::dialog;
-use openab_shepherd::profiles::{DynamicRoutines, LaunchPolicy};
+use openab_shepherd::profiles::{check_agent_argv, DynamicRoutines, LaunchPolicy};
 use openab_shepherd::routine_model::{
     CEILING_EXPIRES_MIN_SECS, EVERY_MAX_SECS, EVERY_MIN_SECS, EXPIRES_MAX_SECS, EXPIRES_MIN_SECS,
     MAX_RUNS_MAX, MAX_RUNS_MIN, PER_PANE_MAX, PER_PANE_MIN, TEXT_MAX_BYTES,
@@ -87,7 +88,7 @@ fn the_runbook_names_every_restart_script_and_each_name_exists() {
         "cleanup.sh",
     ];
     // The routine scenario for agent-created routines has its own runbook.
-    let dynamic = ["routine-dynamic.sh"];
+    let dynamic = ["routine-dynamic.sh", "trusted-client.sh"];
     for script in scripts() {
         let name = script.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
@@ -662,4 +663,325 @@ fn the_mermaid_scanner_catches_an_unterminated_and_an_empty_block() {
     assert!(mermaid_blocks("x.md", "```mermaid\nflowchart TD\n  A --> B\n").is_err());
     let blocks = mermaid_blocks("x.md", "```mermaid\n```\ntext\n").expect("closed");
     assert_eq!(blocks, vec![String::new()]);
+}
+
+// ---------------------------------------------------------------------------
+// Trusted clients (issue #113): the docs and trusted-client.sh. No server starts.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_trusted_client_runbook_names_the_script_and_the_script_exists() {
+    let runbook = read(&e2e_dir().join("trusted-client.md"));
+    assert!(runbook.contains("trusted-client.sh"));
+    assert!(e2e_dir().join("trusted-client.sh").is_file());
+    for needle in [
+        "start:args",
+        "extra_args",
+        "pane_needs_trust_acceptance",
+        "agent",
+        "launch",
+        "flags",
+        "allow_arbitrary_command",
+        "Yes, and",
+        "summary:",
+        "skipped",
+        "RESULT: PASS",
+        "#113 and #111 close",
+    ] {
+        assert!(runbook.contains(needle), "trusted-client.md omits {needle}");
+    }
+    for file in ["README.md", "restart-survival.md"] {
+        assert!(
+            read(&e2e_dir().join(file)).contains("trusted-client.md"),
+            "{file} does not link trusted-client.md"
+        );
+    }
+    // The trust-model section and the operations recipe point at the runbook's script.
+    let trust = read(&root().join("docs/adr/trust-model.md"));
+    assert!(trust.contains("trusted-client.md"));
+}
+
+#[test]
+fn the_trusted_client_script_is_bounded_portable_and_keeps_secrets_out() {
+    let text = read(&e2e_dir().join("trusted-client.sh"));
+    assert!(text.contains("trap r_cleanup EXIT"));
+    assert!(text.contains("r_finish"));
+    assert!(text.contains("T_SOURCE_ONLY"));
+    assert!(!text.contains("Authorization"));
+    // No python program reads the environment: every value is an argument on its command line.
+    assert!(
+        !text.contains("os.environ") && !text.contains("os.getenv"),
+        "a python heredoc reads the environment"
+    );
+    // Nothing platform-specific is used without a guard: the limit macOS does not enforce, and
+    // BSD-only or GNU-only stat forms (r_mode in restart-lib.sh picks the right one).
+    for banned in ["RLIMIT", "setrlimit", "stat -f", "stat -c", "date +%s%N"] {
+        assert!(
+            !text
+                .lines()
+                .any(|l| !l.trim_start().starts_with('#') && l.contains(banned)),
+            "trusted-client.sh uses {banned} outside a comment"
+        );
+    }
+    // Reads of what a pane or the server writes later wait, and the waits are bounded.
+    assert!(text.contains("t_until") && text.contains("t_stays"));
+    assert!(text.contains("t_audit_wait"));
+    // The summary comes from restart-lib's r_finish: passed, failed and skipped.
+    let lib = read(&e2e_dir().join("restart-lib.sh"));
+    assert!(lib.contains("summary: $R_PASSES passed, $R_FAILS failed, $R_SKIPS skipped"));
+}
+
+/// Run `t_setup` of trusted-client.sh in a scratch directory and return (home, work).
+fn trusted_setup(base: &Path) -> (PathBuf, PathBuf) {
+    let (home, work) = (
+        base.join("shepherd-e2e-restart-doc-home"),
+        base.join("shepherd-e2e-restart-doc-work"),
+    );
+    std::fs::create_dir_all(base).unwrap();
+    let out = Command::new("bash")
+        .arg("-c")
+        // R_HOME and R_WORK are plain shell variables, as when the script runs with its
+        // defaults: exporting them would hide a python program that reads them from the
+        // environment without being handed them.
+        .arg(
+            "R_HOME=\"$T_HOME\"; R_WORK=\"$T_WORK\"; \
+             T_SOURCE_ONLY=1 source \"$SCRIPT\" && t_setup",
+        )
+        .env("SCRIPT", e2e_dir().join("trusted-client.sh"))
+        .env_remove("R_HOME")
+        .env_remove("R_WORK")
+        .env("T_HOME", &home)
+        .env("T_WORK", &work)
+        .env("SHEPHERD_BIN", "/bin/sh")
+        .output()
+        .expect("run t_setup");
+    assert!(
+        out.status.success(),
+        "t_setup failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (home, work)
+}
+
+fn args(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    value.as_object().expect("an object").clone()
+}
+
+#[test]
+fn the_files_the_trusted_script_writes_are_accepted_by_the_real_loaders() {
+    let base =
+        std::env::temp_dir().join(format!("shepherd-doctest-trusted-{}", std::process::id()));
+    let (home, work) = trusted_setup(&base);
+
+    let policy = LaunchPolicy::from_json(&read(&home.join("profiles.json")))
+        .expect("the profiles file is accepted by the loader");
+    assert!(
+        policy.allow_arbitrary_command,
+        "the argv steps need the flag"
+    );
+    for name in ["sandbox", "guard", "other", "oc"] {
+        let profile = policy
+            .profile(name)
+            .unwrap_or_else(|| panic!("no profile {name}"));
+        assert_eq!(
+            profile.argv.last().map(String::as_str),
+            Some(name),
+            "$0 is the name"
+        );
+        assert!(
+            profile.cwds.iter().all(|d| d.is_dir()),
+            "{name}: a cwd is missing"
+        );
+    }
+    assert_eq!(policy.profile("oc").unwrap().agent, Agent::OpenCode);
+    assert_eq!(policy.profile("sandbox").unwrap().agent, Agent::Kiro);
+    // The refusal step relies on the call-time check: the script's OpenCode profile plus
+    // `--auto` is refused, and plain flags on the sandbox profile are not.
+    let with = |name: &str, extra: &[&str]| -> Vec<String> {
+        let mut argv = policy.profile(name).unwrap().argv.clone();
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        argv
+    };
+    assert!(check_agent_argv(Agent::OpenCode, &with("oc", &["--auto"])).is_err());
+    assert!(check_agent_argv(Agent::Kiro, &with("sandbox", &["-a", "--model", "x"])).is_ok());
+
+    // The clients file: each hash matches its token file, and the scopes are the ones the
+    // steps rely on.
+    let clients = Clients::load(&home.join("clients.json"), &root()).expect("clients file loads");
+    let who = |id: &str| {
+        let token = read(&home.join(format!("{id}.token")));
+        assert!(token.starts_with(&format!("osh_{id}_")), "{id}");
+        clients
+            .authenticate(Some(&format!("Bearer {}", token.trim())), 1)
+            .unwrap_or_else(|e| panic!("{id} does not authenticate: {e:?}"))
+    };
+    let (ops, orch, trusted) = (who("ops"), who("orch"), who("trusted"));
+    assert!(!ops.has(Scope::StartArgs) && !ops.has(Scope::StartArbitrary));
+    assert!(orch.has(Scope::StartArgs) && !orch.has(Scope::StartArbitrary));
+    assert!(trusted.has(Scope::StartArgs) && trusted.has(Scope::StartArbitrary));
+    assert!(trusted.has(Scope::Dialog) && !orch.has(Scope::Dialog));
+
+    // What the steps expect from the scope check, with the real `authorize`.
+    let flags = |profile: &str| args(serde_json::json!({"profile": profile, "extra_args": ["-a"]}));
+    let plain = |profile: &str| args(serde_json::json!({"profile": profile}));
+    let denied = |caller, call| authorize(caller, "start_pane", &call).unwrap_err();
+    assert_eq!(
+        denied(&ops, flags("sandbox")).to_tool_error().data["scope"],
+        "start:args"
+    );
+    assert!(authorize(&orch, "start_pane", &flags("sandbox")).is_ok());
+    assert!(
+        authorize(&orch, "start_pane", &flags("other")).is_err(),
+        "off orch's list"
+    );
+    assert!(
+        authorize(&trusted, "start_pane", &flags("guard")).is_err(),
+        "off trusted's list"
+    );
+    for empty in [serde_json::json!(null), serde_json::json!([])] {
+        let call = args(serde_json::json!({"profile": "sandbox", "extra_args": empty}));
+        assert!(authorize(&ops, "start_pane", &call).is_ok(), "{empty}");
+    }
+    assert!(authorize(&ops, "start_pane", &plain("sandbox")).is_ok());
+    let argv_call = args(serde_json::json!({"argv": ["/bin/sh"]}));
+    assert!(authorize(&ops, "start_pane", &argv_call).is_err());
+    assert!(authorize(&trusted, "start_pane", &argv_call).is_ok());
+    // The recorded dialog the argv steps print (t_write_dialog) parses with the real parser.
+    let dialog_file = base.join("dialog.txt");
+    trusted_bash(
+        &base,
+        "t_write_dialog \"$DIALOG\"",
+        &[("DIALOG", dialog_file.as_os_str())],
+    );
+    let parsed = dialog::parse(&read(&dialog_file)).expect("the dialog text parses");
+    assert_eq!(parsed.options[0], "Allow once");
+    assert_eq!(parsed.cursor, 0);
+    let _ = &work;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        for file in [
+            "ops.token",
+            "orch.token",
+            "trusted.token",
+            "clients.json",
+            "profiles.json",
+        ] {
+            assert_eq!(mode(&home.join(file)), 0o600, "{file}");
+        }
+        assert_eq!(mode(&home.join("audit")), 0o700);
+    }
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Source trusted-client.sh without running it, and run `snippet`; panic with the output when
+/// it fails. `extra` are environment variables for the snippet only.
+fn trusted_bash(base: &Path, snippet: &str, extra: &[(&str, &std::ffi::OsStr)]) -> String {
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        .arg(format!(
+            "R_HOME=\"$T_HOME\"; R_WORK=\"$T_WORK\"; T_SOURCE_ONLY=1 source \"$SCRIPT\" || exit 99; {snippet}"
+        ))
+        .env("SCRIPT", e2e_dir().join("trusted-client.sh"))
+        .env_remove("R_HOME")
+        .env_remove("R_WORK")
+        .env("T_HOME", base.join("shepherd-e2e-restart-stub-home"))
+        .env("T_WORK", base.join("shepherd-e2e-restart-stub-work"))
+        .env("SHEPHERD_BIN", "/bin/sh");
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    let out = command.output().expect("run bash");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "snippet failed:\n{snippet}\n{text}");
+    text
+}
+
+/// The helpers that decide a verdict, run against canned replies: `_post` is replaced, so
+/// nothing connects anywhere, and a made-up audit file stands in for the server's.
+#[test]
+fn the_trusted_script_helpers_work_against_canned_replies() {
+    let base = std::env::temp_dir().join(format!("shepherd-doctest-stubs-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let audit = base.join("audit.jsonl");
+    let lines = [
+        r#"{"client":"orch","tool":"start_pane","phase":"call","pane":"x1","launch":"profile+args","extra_args_n":3,"flags":["-a","--model"]}"#,
+        r#"{"client":"trusted","tool":"start_pane","phase":"call","pane":"a-yes","launch":"argv","argv0":"sh","agent":"kiro"}"#,
+        r#"{"client":"ops","tool":"start_pane","phase":"denied","outcome":"denied"}"#,
+        "a partial line {",
+    ];
+    std::fs::write(&audit, lines.join("\n")).unwrap();
+    let snippet = r#"
+set -u
+fail() { echo "FAILED: $*"; exit 1; }
+# --- the reply parsers, with _post replaced ------------------------------------------------
+_post() { printf '%s' "$STUB_REPLY"; }
+export STUB_REPLY='{"jsonrpc":"2.0","id":1,"result":{"isError":true,"structuredContent":{"error":"forbidden","scope":"start:args"}}}'
+[ "$(t_error as ops mcp_tool start_pane profile=x)" = forbidden ] || fail t_error
+[ "$(as ops mcp_tool start_pane profile=x 2>/dev/null | t_py 'd["scope"]')" = start:args ] || fail t_py
+STUB_REPLY='{"jsonrpc":"2.0","id":1,"result":{"isError":false,"structuredContent":{"argv":["/bin/sh","-c","s","sandbox","-a"],"live":true}}}'
+[ "$(t_error as ops mcp_tool start_pane profile=x)" = "" ] || fail "t_error on success"
+t_json_is '["sandbox", "-a"]' 'd["argv"][3:]' as ops mcp_tool start_pane profile=x || fail t_json_is
+t_json_is true 'd["live"]' as ops get_status x || fail "t_json_is live"
+! t_json_is false 'd["live"]' as ops get_status x || fail "t_json_is negative"
+[ "$(echo 'not json' | t_py 'd["x"]')" = "" ] || fail "t_py on garbage"
+# --- t_no_pane, with a list_panes reply ----------------------------------------------------
+STUB_REPLY='{"jsonrpc":"2.0","id":1,"result":{"isError":false,"structuredContent":{"panes":[{"name": "x1"}]}}}'
+t_no_pane rej || fail "t_no_pane absent"
+! t_no_pane x1 || fail "t_no_pane present"
+# --- the bounded waits ---------------------------------------------------------------------
+dir="$T_SCRATCH"
+t_until 2 t_absent "$dir/never" || fail "t_until success"
+start=$SECONDS
+! t_until 2 t_file_is "$dir/never" x || fail "t_until must give up"
+[ $((SECONDS - start)) -le 4 ] || fail "t_until took too long"
+printf 'a
+b
+' > "$dir/two"
+t_file_is "$dir/two" "$(printf 'a
+b')" || fail t_file_is
+! t_file_is "$dir/two" a || fail "t_file_is mismatch"
+: > "$dir/empty"
+t_file_is "$dir/empty" "" || fail "t_file_is empty"
+# A file that appears after the first look is still found: this is the read-too-early case.
+( sleep 1; echo late > "$dir/late" ) &
+t_until 5 t_file_is "$dir/late" late || fail "t_until must wait for a late file"
+wait
+t_stays 1 t_absent "$dir/never" || fail "t_stays holds"
+( sleep 1; : > "$dir/appears" ) &
+! t_stays 4 t_absent "$dir/appears" || fail "t_stays must see a change in its window"
+wait
+# --- the audit check -----------------------------------------------------------------------
+T_AUDIT="$T_AUDIT_FILE"
+t_audit_check 'any(r["client"] == "orch" and r.get("flags") == ["-a", "--model"] for r in records)' || fail "audit true"
+! t_audit_check 'any(r["client"] == "nobody" for r in records)' || fail "audit false"
+t_audit_check '"CANARY" not in raw' || fail "audit raw"
+t_audit_check 'any(r["phase"] == "denied" for r in records)' || fail "audit denied"
+T_AUDIT="$dir/missing.jsonl"
+! t_audit_check 'True' || fail "audit missing file"
+T_AUDIT="$T_AUDIT_FILE"
+t_audit_wait 'len(records) == 3' || fail "audit wait"
+[ "$(t_list_json 2 3)" = '["xxx", "xxx"]' ] || fail t_list_json
+echo ALL-OK
+"#;
+    let scratch = base.join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let out = trusted_bash(
+        &base,
+        snippet,
+        &[
+            ("T_SCRATCH", scratch.as_os_str()),
+            ("T_AUDIT_FILE", audit.as_os_str()),
+        ],
+    );
+    assert!(out.contains("ALL-OK"), "{out}");
+    std::fs::remove_dir_all(&base).ok();
 }
