@@ -13,3 +13,13 @@ email, quota or credential text.
 | `web_fetch-1` | `web_fetch → example.com` | accept, cursor 0 |
 | `web_search-1` | `web_search` (no arrow) | refuse |
 | `shell_wrapped80-1` | `shell → …` wrapped over three continuation lines | refuse, "wrapped command" |
+
+## Trust-all startup warning (SYNTHETIC)
+
+`trust-all-warning-synthetic.screen.txt` is **synthetic**: it was written from the
+description of the warning in the `-a` investigation, not recorded from kiro-cli. It
+carries the phrase `trust all tools mode` and the three options (`No, exit` the
+default, `Yes, I accept`, `Yes, and don't ask again`). Replace it with a screen
+recorded by `docs/operator-e2e/record-replay-fixture.sh` from a real `-a` start, and
+keep the test that includes it. Whether `Yes, and don't ask again` persists is
+unmeasured.

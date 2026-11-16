@@ -207,8 +207,11 @@ profiles and is at most 1 MiB.
     `kiro`, because no Kiro mode was measured.
   - `bypass`: `devin` only, `devin --permission-mode dangerous`, which approves every
     tool. It is never a default: a profile must say `"permission_mode": "bypass"`.
-    For `kiro` it needs `"allow_bypass": true`, and Shepherd adds no flag. Kiro has no
-    bypass flag that was measured, so the Kiro arguments in `argv` still decide trust.
+    For `kiro` it needs `"allow_bypass": true`, and Shepherd adds no flag: the Kiro
+    arguments in `argv` still decide trust. kiro-cli 3.3.0 has `-a` /
+    `--trust-all-tools`; `permission_mode` does not add it, and a profile may carry `-a`
+    whatever its `permission_mode` says. See
+    [Kiro `-a` (trust all tools)](#kiro--a-trust-all-tools).
 - `allow_bypass` (optional, default false): lets a `kiro` profile declare
   `permission_mode` `bypass`. It has no effect on a `devin` profile.
 - `routine` (optional): a timer-driven nudge for unattended panes that stop with work
@@ -242,6 +245,44 @@ profiles and is at most 1 MiB.
 
 For how the operator signs in to the coding CLI or supplies its key, see
 [credentials.md](credentials.md).
+
+### Kiro `-a` (trust all tools)
+
+kiro-cli 3.3.0 accepts `-a` / `--trust-all-tools`. Shepherd passes it through like any
+other argument in a profile's `argv` or `extra_args` and does not police it; the Kiro
+arguments decide trust. `permission_mode: bypass` with `allow_bypass: true` adds no
+flag, so the label and the real behaviour can disagree. (Measured on 3.3.0: with `-a`
+no `requires approval` dialog appears and the status never reports `blocked`; 3.1.0, the
+version in the container image, was not measured.)
+
+**Every `-a` start shows a warning first.** Kiro prints "Kiro is running in trust all
+tools mode" with the choices `No, exit` (the default), `Yes, I accept` and `Yes, and
+don't ask again`. Kiro does not report it as blocked: the status stays `idle`. Typed text
+is ignored and Enter picks `No, exit`, which ends the session.
+
+Shepherd never answers this warning. Instead `send_input` (and a routine nudge) refuses
+with `pane_needs_trust_acceptance` and types nothing, when all three hold: the pane is a
+Kiro pane, it has not finished a turn (`turn` is absent or 0), and the visible screen
+contains `trust all tools mode`. The pane stays open. A person attaches, accepts the
+warning, and then `send_input` works. The check reads the screen once per send until the
+first turn, and not at all afterwards. It refuses only on a positive match: a blank
+screen (a send right after the start can beat the first render), a backend without screen
+text, or a failed read all send as before. If the phrase were still on screen after the
+warning was accepted, the pane would stay refused until its first turn; if you see that,
+report it.
+
+- **Unmeasured:** whether `Yes, and don't ask again` persists, and where Kiro stores it.
+  Until that is measured, treat every `-a` start as showing the warning, and do not plan
+  an unattended restart around the choice being remembered.
+- Accept by hand in a disposable directory: start the pane, attach, choose
+  `Yes, I accept`, detach.
+- The risks of an unattended trust-all pane: a routine nudge into it runs anything with
+  no gate; there is no `answer_dialog` audit record for what the model runs (only the
+  `send_input` text is audited); Kiro's tools inherit `KIRO_API_KEY`. Pair such a profile
+  with a disposable `cwd`, a small `max_consecutive_nudges` and no `dynamic_routines`.
+- The test fixture for the warning screen
+  (`tests/fixtures/kiro-3.3.0/trust-all-warning-synthetic.screen.txt`) is synthetic,
+  written from the description of the warning, until one is recorded.
 
 ### Routine (optional, per profile)
 
@@ -326,6 +367,7 @@ for debugging; do not parse it.
 | Code | When |
 |------|------|
 | `invalid_input` | An argument failed validation (nothing was sent), or the backend refused the request's parameters |
+| `pane_needs_trust_acceptance` | `send_input` (or a routine nudge) was refused because a Kiro pane that has not finished a turn shows Kiro's trust-all-tools warning. Nothing was typed: Enter there chooses `No, exit` and ends the session. Shepherd never answers this dialog; the pane stays open. A person attaches and accepts it, or the pane is started without `-a`. See [Kiro `-a`](#kiro--a-trust-all-tools) |
 | `pane_blocked` | Typing was refused because the program is blocked on a dialog; nothing was typed. `kind` names the dialog (for example `permission`) when known; `next` says to read the screen, then use `answer_dialog`; for `kind=auth`, `next` says to tell the operator, who must log in |
 | `not_found` | No pane is named `terminal` (a backend address is not a name); for `start_pane`, the program or working directory was not found |
 | `name_taken` | `start_pane` with a name that is already in use (or, rarely, a generated name that collided; retry) |
@@ -377,6 +419,8 @@ never forces input. While the program is blocked, nothing is typed and the tool
 returns error `pane_blocked` with `kind` (the dialog, for example `permission`) and
 `next`, which says to read the screen and use `answer_dialog`. For `kind=auth` the
 CLI is not logged in: `next` says to tell the operator, and `answer_dialog` is not the way.
+A Kiro pane that has not finished a turn and shows the trust-all-tools warning gets
+`pane_needs_trust_acceptance` instead; see [Kiro `-a`](#kiro--a-trust-all-tools).
 
 Who refuses depends on the backend's `conditional_input` capability. The native
 backend has it: its send refuses a blocked program in the same step as the write. If
@@ -1477,6 +1521,8 @@ try to update itself at run time).
   limit which program gets a credential and where it runs; they do not make the
   program keep it. With `allow_arbitrary_command`, a caller can still run anything as
   Shepherd's user, including reading files that user can read.
+- **Kiro `-a` starts at a warning that Shepherd does not answer.** See
+  [Kiro `-a` (trust all tools)](#kiro--a-trust-all-tools).
 - **Auto-allowing agents never block.** User Kiro agents whose `allowedTools` include
   `@builtin` (the default agent does) run builtin tools without a dialog, so the pane
   never reports `blocked` and `answer_dialog` has nothing to answer. `--trust-tools=`
