@@ -23,6 +23,28 @@ panes whose profile opted in with `dynamic_routines`; it does not imply `control
 agent, running as the same account, could read any token file that account can read, so
 the grant is a narrow separate token, not the operator's.
 
+## Trusted clients
+
+A client is not an attacker just because it is remote. A bot or an orchestrating agent that an operator trusts is inside the boundary for what it was granted, and Shepherd makes that explicit instead of switching the protections off. Three layers stay apart:
+
+1. **Authentication and attribution.** A bearer token per client, and an audit line for every state-changing call. These do not relax: the audit is how a trusted client stays accountable.
+2. **Launch shape.** What a client may start, and with which flags. This is the layer a trusted client widens, through grants the operator writes: `start` with a short `profiles` list (the operator's programs), `start:args` (flags appended to those programs, run with their credentials), and `start:arbitrary` with the server's `allow_arbitrary_command` (the caller's own program, never with a credential). Each is one more reason to read a clients file entry carefully, and none is on by default for a client or for the single token.
+3. **Correctness and trust-effect protections.** The blocked-pane guard, `answer_dialog`'s allow-once and deny-once choices, the input rules, the protected environment names, the pane cap and the rule that Shepherd never answers a dialog that grants trust (the Kiro trust-all warning, the Devin trust prompt). These keep a pane from receiving a wrong key whoever is calling, so a trusted client does not relax them.
+
+The recipe for a trusted orchestrator, using only existing settings:
+
+```
+profiles file:  {"allow_arbitrary_command": true, "profiles": [ ... ]}
+clients file:   {"id": "orchestrator",
+                 "scopes": ["observe", "read", "control", "start", "start:arbitrary",
+                            "start:args", "dialog", "remove"],
+                 "profiles": ["kiro-sandbox"]}
+```
+
+Leave `allow_arbitrary_command` false and drop `start:arbitrary` if the client should only steer the operator's profiles. There is no posture switch that does this in one setting: the three choices (server flag, scopes, profile list) are the posture, and a macro would hide which of them a client really has. A single-token deployment holds `start` and `start:arbitrary` but not `start:args`, so it cannot pass call-level flags; it needs a clients file (see [operations.md](../operations.md#who-can-use-it-a-single-token-cannot)).
+
+herdr passes any argument from any socket caller and Orca from any owner-socket caller; neither tells clients apart. Shepherd tells them apart over HTTP, so flags and programs are grants, not defaults.
+
 ## Decision test
 
 Keep a mitigation if it stops at least one of these:

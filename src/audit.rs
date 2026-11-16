@@ -334,6 +334,35 @@ fn str_arg<'a>(args: &'a Args, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
+/// The most flag names one record carries.
+const MAX_FLAGS: usize = 32;
+
+/// The flag names among `items`, and nothing else. Only `--name` forms (`[a-z0-9-]` after
+/// the dashes, cut at the first `=`) and the exact short flag `-a` qualify: a short option
+/// with a value glued on (`-pSECRET`), a bare value or a flag of any other shape is not
+/// recorded, because it may be or hold a secret. `--api-key SECRET` records `--api-key`.
+/// Repeats are kept once, in first-seen order.
+fn audit_flags(items: &[Value]) -> Vec<String> {
+    let mut flags: Vec<String> = Vec::new();
+    for item in items.iter().filter_map(Value::as_str) {
+        let name = item.split('=').next().unwrap_or(item);
+        let is_long = name.strip_prefix("--").is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        });
+        // `-a=x` is not `-a`: the short flag counts only as the whole element.
+        if (is_long || item == "-a") && !flags.iter().any(|f| f == name) {
+            flags.push(cap(name, SHORT));
+            if flags.len() == MAX_FLAGS {
+                break;
+            }
+        }
+    }
+    flags
+}
+
 fn put_capped(record: &mut Map<String, Value>, field: &str, args: &Args, key: &str, max: usize) {
     if let Some(text) = str_arg(args, key) {
         record.insert(field.into(), json!(cap(text, max)));
@@ -359,14 +388,18 @@ fn request_fields(actor: &str, tool: &str, args: &Args) -> Map<String, Value> {
         "start_pane" => {
             put_capped(&mut out, "profile", args, "profile", SHORT);
             put_capped(&mut out, "pane", args, "name", SHORT);
-            // How a program was chosen, only for a caller's own command: a
-            // profile start keeps the record it always had. Never the argv
-            // or the line, only the program's basename.
-            let argv0 = args
-                .get("argv")
-                .and_then(Value::as_array)
+            // How a program was chosen, only when the caller shaped the launch: a plain
+            // profile start keeps the record it always had. Never the argv, the line or
+            // the call's flag values: `argv0` is only the program's basename, and `flags`
+            // names a flag, never what follows it.
+            let argv_items = args.get("argv").and_then(Value::as_array);
+            let argv0 = argv_items
                 .and_then(|items| items.first())
                 .and_then(Value::as_str);
+            let extra_items = args
+                .get("extra_args")
+                .and_then(Value::as_array)
+                .filter(|items| !items.is_empty());
             if args.get("argv").is_some_and(|v| !v.is_null()) {
                 out.insert("launch".into(), json!("argv"));
                 if let Some(program) = argv0 {
@@ -375,6 +408,18 @@ fn request_fields(actor: &str, tool: &str, args: &Args) -> Map<String, Value> {
                 }
             } else if args.get("line").is_some_and(|v| !v.is_null()) {
                 out.insert("launch".into(), json!("line"));
+            } else if extra_items.is_some() {
+                out.insert("launch".into(), json!("profile+args"));
+            }
+            if let Some(items) = extra_items {
+                out.insert("extra_args_n".into(), json!(items.len()));
+            }
+            let flagged = extra_items.or(argv_items);
+            if let Some(flags) = flagged
+                .map(|items| audit_flags(items))
+                .filter(|f| !f.is_empty())
+            {
+                out.insert("flags".into(), json!(flags));
             }
             // The declared agent is a claim, recorded and never verified.
             put_capped(&mut out, "agent", args, "agent", SHORT);

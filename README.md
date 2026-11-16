@@ -15,7 +15,7 @@ which answers a permission dialog may receive.
   PTY, addressed by name. Under `openab-shepherd hold`, a holder process owns the PTYs and a
   restartable front serves MCP; a bare `openab-shepherd` does both in one process.
 - **Tools and scopes.** Fourteen tools. A client holds explicit scopes (`observe`, `read`,
-  `control`, `start`, `start:arbitrary`, `dialog`, `remove`, `routine`, and the reserved
+  `control`, `start`, `start:arbitrary`, `start:args`, `dialog`, `remove`, `routine`, and the reserved
   `attach`, `attach:write`, `lease:preempt`); no scope implies another. See
   [Scopes](docs/operations.md#scopes) and [docs/credentials.md](docs/credentials.md).
 - **Restart survival.** Under `hold`, the front can be killed or restarted with `SIGUSR2` and

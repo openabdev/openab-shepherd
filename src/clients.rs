@@ -62,6 +62,10 @@ pub enum Scope {
     Start,
     /// `start_pane` with `argv` or `line` (the server must also allow it).
     StartArbitrary,
+    /// `start_pane` with a call-level `extra_args` (issue #113): flags appended to a
+    /// profile's argv, run with the profile's credentials. Not implied by
+    /// `start:arbitrary`; the legacy token does not hold it.
+    StartArgs,
     /// `answer_dialog`.
     Dialog,
     /// `remove_pane`.
@@ -82,12 +86,13 @@ pub enum Scope {
 
 impl Scope {
     /// Every scope the clients file can name: the parser's universe.
-    pub const ALL: [Scope; 11] = [
+    pub const ALL: [Scope; 12] = [
         Scope::Observe,
         Scope::Read,
         Scope::Control,
         Scope::Start,
         Scope::StartArbitrary,
+        Scope::StartArgs,
         Scope::Dialog,
         Scope::Remove,
         Scope::Attach,
@@ -117,6 +122,7 @@ impl Scope {
             Scope::Control => "control",
             Scope::Start => "start",
             Scope::StartArbitrary => "start:arbitrary",
+            Scope::StartArgs => "start:args",
             Scope::Dialog => "dialog",
             Scope::Remove => "remove",
             Scope::Attach => "attach",
@@ -228,7 +234,7 @@ pub fn any_scope(tool: &str) -> Option<&'static [Scope]> {
         "list_panes" | "get_status" | "wait_status" => &[Scope::Observe],
         "read_output" => &[Scope::Read],
         "send_input" | "interrupt_pane" => &[Scope::Control],
-        "start_pane" => &[Scope::Start, Scope::StartArbitrary],
+        "start_pane" => &[Scope::Start, Scope::StartArbitrary, Scope::StartArgs],
         "answer_dialog" => &[Scope::Dialog],
         "remove_pane" => &[Scope::Remove],
         "draft_clear" => &[Scope::LeasePreempt],
@@ -274,7 +280,8 @@ impl Denied {
 ///
 /// `start_pane` needs `start` and a profile on the client's list when it
 /// names a `profile`, and `start:arbitrary` when it carries `argv` or `line`
-/// (a key that is present counts, even with a null value). Whether the server
+/// (a key that is present counts, even with a null value), and `start:args` when it
+/// carries a non-empty `extra_args` (see [`extra_args_present`]). Whether the server
 /// allows arbitrary commands at all stays a separate ceiling in the tool.
 pub fn authorize(caller: &Caller, tool: &str, args: &Args) -> Result<(), Denied> {
     let Some(needed) = any_scope(tool) else {
@@ -292,7 +299,9 @@ pub fn authorize(caller: &Caller, tool: &str, args: &Args) -> Result<(), Denied>
     }
     let arbitrary = args.contains_key("argv") || args.contains_key("line");
     let profile = args.get("profile").filter(|value| !value.is_null());
-    if profile.is_none() && !arbitrary && !needed.iter().any(|s| caller.has(*s)) {
+    // `start:args` alone starts nothing: it only widens a profile start.
+    let starts = [Scope::Start, Scope::StartArbitrary];
+    if profile.is_none() && !arbitrary && !starts.iter().any(|s| caller.has(*s)) {
         return Err(Denied::scope(tool, Scope::Start));
     }
     if let Some(profile) = profile {
@@ -315,7 +324,22 @@ pub fn authorize(caller: &Caller, tool: &str, args: &Args) -> Result<(), Denied>
     if arbitrary && !caller.has(Scope::StartArbitrary) {
         return Err(Denied::scope(tool, Scope::StartArbitrary));
     }
+    if extra_args_present(args) && !caller.has(Scope::StartArgs) {
+        return Err(Denied::scope(tool, Scope::StartArgs));
+    }
     Ok(())
+}
+
+/// Whether a `start_pane` call carries call-level `extra_args` that count: a non-empty
+/// array, or any other non-null value (which the tool then refuses as malformed, after
+/// the scope check). `null` and `[]` are absent: they add nothing, so an old client
+/// library that sends them is not denied. `authorize` and the tool share this predicate.
+pub fn extra_args_present(args: &Args) -> bool {
+    match args.get("extra_args") {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(_) => true,
+    }
 }
 
 /// Why a request was not authenticated. The HTTP layer answers 401 for all of
@@ -814,7 +838,7 @@ mod tests {
         assert!(!Scope::LEGACY.contains(&Scope::Routine));
         // ALL is the three shared-pane scopes and `routine` added to the
         // seven, in no way narrower.
-        assert_eq!(Scope::ALL.len(), Scope::LEGACY.len() + 4);
+        assert_eq!(Scope::ALL.len(), Scope::LEGACY.len() + 5);
         for scope in Scope::LEGACY
             .into_iter()
             .chain(SHARED_PANE_SCOPES)
@@ -938,6 +962,87 @@ mod tests {
         // With a profile the scope check is the profile's; the tool refuses the agent.
         let with_profile = args(json!({"profile": "ci", "agent": "kiro"}));
         assert!(authorize(&start, "start_pane", &with_profile).is_ok());
+    }
+
+    fn caller_with(scopes: &[Scope], profiles: &[&str]) -> Caller {
+        Caller::new(
+            "t",
+            scopes.iter().copied(),
+            ProfileAccess::Only(profiles.iter().map(|p| p.to_string()).collect()),
+        )
+    }
+
+    #[test]
+    fn extra_args_need_start_args_and_neither_start_nor_start_arbitrary_stands_in() {
+        let body = args(json!({"profile": "ci", "extra_args": ["-a"]}));
+        for caller in [
+            only(Scope::Start, &["ci"]),
+            caller_with(&[Scope::Start, Scope::StartArbitrary], &["ci"]),
+            caller_with(&[Scope::Start, Scope::Observe, Scope::Control], &["ci"]),
+        ] {
+            let denied = authorize(&caller, "start_pane", &body).unwrap_err();
+            assert_eq!(denied.scope, Some(Scope::StartArgs));
+            assert!(denied.reason.contains("start:args"), "{}", denied.reason);
+            assert_eq!(denied.to_tool_error().data["scope"], "start:args");
+        }
+        let trusted = caller_with(&[Scope::Start, Scope::StartArgs], &["ci"]);
+        assert!(authorize(&trusted, "start_pane", &body).is_ok());
+        // The client's profile list still applies to a call with flags.
+        let other = args(json!({"profile": "review", "extra_args": ["-a"]}));
+        let denied = authorize(&trusted, "start_pane", &other).unwrap_err();
+        assert!(denied.reason.contains("not on this client's list"));
+        // start:args alone starts nothing: a profile start still needs start.
+        let lone = only(Scope::StartArgs, &["ci"]);
+        let denied = authorize(&lone, "start_pane", &body).unwrap_err();
+        assert_eq!(denied.scope, Some(Scope::Start));
+        let plain = args(json!({"profile": "ci"}));
+        assert_eq!(
+            authorize(&lone, "start_pane", &plain).unwrap_err().scope,
+            Some(Scope::Start)
+        );
+        assert!(lone.may_list("start_pane"));
+        // A malformed value counts as present, so the scope is checked first.
+        let odd = args(json!({"profile": "ci", "extra_args": "-a"}));
+        assert!(authorize(&only(Scope::Start, &["ci"]), "start_pane", &odd).is_err());
+    }
+
+    #[test]
+    fn null_and_empty_extra_args_are_absent_and_need_no_scope() {
+        let start = only(Scope::Start, &["ci"]);
+        for value in [json!(null), json!([])] {
+            let body = args(json!({"profile": "ci", "extra_args": value}));
+            assert!(!extra_args_present(&body));
+            assert!(authorize(&start, "start_pane", &body).is_ok(), "{body:?}");
+        }
+        assert!(!extra_args_present(&args(json!({"profile": "ci"}))));
+        assert!(extra_args_present(&args(json!({"extra_args": ["x"]}))));
+        assert!(extra_args_present(&args(json!({"extra_args": [null]}))));
+        assert!(extra_args_present(&args(json!({"extra_args": "x"}))));
+    }
+
+    #[test]
+    fn start_args_is_in_all_and_not_in_legacy_and_the_file_parser_accepts_it() {
+        assert!(Scope::ALL.contains(&Scope::StartArgs));
+        assert!(!Scope::LEGACY.contains(&Scope::StartArgs));
+        assert_eq!(Scope::parse("start:args"), Some(Scope::StartArgs));
+        let legacy = Caller::default_client();
+        assert!(!legacy.has(Scope::StartArgs));
+        let body = args(json!({"profile": "ci", "extra_args": ["-a"]}));
+        let denied = authorize(&legacy, "start_pane", &body).unwrap_err();
+        assert_eq!(denied.scope, Some(Scope::StartArgs));
+        // Without flags the legacy token starts a profile exactly as before.
+        assert!(authorize(&legacy, "start_pane", &args(json!({"profile": "ci"}))).is_ok());
+        let clients = Clients::parse(&file_text(json!([client_json(
+            "orchestrator",
+            SECRET_A,
+            &["start", "start:args"]
+        )])))
+        .unwrap();
+        let caller = clients
+            .authenticate(Some(&bearer(&token("orchestrator", SECRET_A))), 0)
+            .unwrap();
+        assert!(caller.has(Scope::StartArgs) && caller.has(Scope::Start));
+        assert_eq!(caller.scopes().len(), 2);
     }
 
     #[test]
