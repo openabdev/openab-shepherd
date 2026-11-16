@@ -926,6 +926,21 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_agent_adds_no_scope_requirement() {
+        let start = only(Scope::Start, &["ci"]);
+        let argv = args(json!({"argv": ["kiro-cli"], "agent": "kiro"}));
+        let line = args(json!({"line": "kiro-cli", "agent": "kiro"}));
+        assert!(authorize(&start, "start_pane", &argv).is_err());
+        assert!(authorize(&start, "start_pane", &line).is_err());
+        let arbitrary = only(Scope::StartArbitrary, &[]);
+        assert!(authorize(&arbitrary, "start_pane", &argv).is_ok());
+        assert!(authorize(&arbitrary, "start_pane", &line).is_ok());
+        // With a profile the scope check is the profile's; the tool refuses the agent.
+        let with_profile = args(json!({"profile": "ci", "agent": "kiro"}));
+        assert!(authorize(&start, "start_pane", &with_profile).is_ok());
+    }
+
+    #[test]
     fn denial_becomes_a_forbidden_tool_error() {
         let denied = authorize(
             &only(Scope::Observe, &[]),

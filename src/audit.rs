@@ -359,6 +359,25 @@ fn request_fields(actor: &str, tool: &str, args: &Args) -> Map<String, Value> {
         "start_pane" => {
             put_capped(&mut out, "profile", args, "profile", SHORT);
             put_capped(&mut out, "pane", args, "name", SHORT);
+            // How a program was chosen, only for a caller's own command: a
+            // profile start keeps the record it always had. Never the argv
+            // or the line, only the program's basename.
+            let argv0 = args
+                .get("argv")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str);
+            if args.get("argv").is_some_and(|v| !v.is_null()) {
+                out.insert("launch".into(), json!("argv"));
+                if let Some(program) = argv0 {
+                    let base = program.rsplit('/').next().unwrap_or(program);
+                    out.insert("argv0".into(), json!(cap(base, SHORT)));
+                }
+            } else if args.get("line").is_some_and(|v| !v.is_null()) {
+                out.insert("launch".into(), json!("line"));
+            }
+            // The declared agent is a claim, recorded and never verified.
+            put_capped(&mut out, "agent", args, "agent", SHORT);
         }
         "send_input" => {
             put_capped(&mut out, "pane", args, "terminal", SHORT);
@@ -845,6 +864,31 @@ mod tests {
         for forbidden in ["osh_", "token", "Authorization", "Bearer", "API_KEY"] {
             assert!(!bytes.contains(forbidden), "{forbidden}");
         }
+    }
+
+    #[test]
+    fn a_start_with_argv_or_line_records_how_it_launched_and_never_its_values() {
+        let (audit, sink) = memory_audit();
+        let calls = [
+            json!({"argv": ["/usr/local/bin/kiro-cli", "chat", format!("--key={CANARY}")], "agent": "kiro", "name": "w"}),
+            json!({"line": format!("run {CANARY}"), "agent": "devin"}),
+            json!({"profile": "ci"}),
+        ];
+        for body in calls {
+            audit.before("a", "start_pane", &args(body)).unwrap();
+        }
+        let records = sink.records();
+        assert_eq!(records[0]["launch"], "argv");
+        assert_eq!(records[0]["argv0"], "kiro-cli");
+        assert_eq!(records[0]["agent"], "kiro");
+        assert_eq!(records[1]["launch"], "line");
+        assert_eq!(records[1]["agent"], "devin");
+        assert!(records[1].get("argv0").is_none());
+        for key in ["launch", "argv0", "agent"] {
+            assert!(records[2].get(key).is_none(), "{key}");
+        }
+        assert!(!sink.bytes().contains(CANARY));
+        assert!(!sink.bytes().contains("chat"));
     }
 
     #[test]

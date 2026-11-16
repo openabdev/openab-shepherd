@@ -1353,13 +1353,14 @@ pub fn definitions() -> Value {
     json!([
         {
             "name": "start_pane",
-            "description": "Start a program in a new pane. Give profile: the name of one of the operator's launch profiles (list_panes lists them with the directories each allows); the profile fixes the program, its arguments and its environment. cwd, when given, must be one of the profile's directories or below one (after resolving symlinks); without it the profile's first directory is used. argv (a program and its arguments) or line (a shell line run by sh -c) instead of profile work only when the operator allows arbitrary commands (list_panes: allow_arbitrary_command), and such a pane never gets a profile's environment. Later calls address the pane by its name: give one, or Shepherd picks one (pane-<hex>) and returns it. Returns the pane (name, live, status, reported, turn, status_ms, exit_code, argv, cwd). Input is trimmed and limited to 4096 bytes per field. Control characters (except TAB) are refused, not removed.",
+            "description": "Start a program in a new pane. Give profile: the name of one of the operator's launch profiles (list_panes lists them with the directories each allows); the profile fixes the program, its arguments and its environment. cwd, when given, must be one of the profile's directories or below one (after resolving symlinks); without it the profile's first directory is used. argv (a program and its arguments) or line (a shell line run by sh -c) instead of profile work only when the operator allows arbitrary commands (list_panes: allow_arbitrary_command), and such a pane never gets a profile's environment. With argv or line, agent (kiro, devin or opencode) says which agent the pane runs, so answer_dialog and the agent's other guards apply to it; it is the caller's claim, recorded in the audit and not checked against the program. A pane without a profile has no routine, no dynamic routines and no permission_mode. Later calls address the pane by its name: give one, or Shepherd picks one (pane-<hex>) and returns it. Returns the pane (name, live, status, reported, turn, status_ms, exit_code, argv, cwd). Input is trimmed and limited to 4096 bytes per field. Control characters (except TAB) are refused, not removed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "profile": {"type": "string", "description": "Launch profile name, as list_panes shows it."},
                     "argv": {"type": "array", "items": {"type": "string"}, "description": "Program and arguments; non-empty. Only when arbitrary commands are allowed."},
                     "line": {"type": "string", "description": "Shell line run by sh -c. Only when arbitrary commands are allowed."},
+                    "agent": {"type": "string", "enum": ["kiro", "devin", "opencode"], "description": "With argv or line only (refused with profile, which fixes its agent): the agent the program is. Optional; without it the pane has no agent and answer_dialog refuses it."},
                     "cwd": {"type": "string", "description": "Working directory (absolute)."},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra environment variables for an argv or line pane only (refused with profile): at most 32, names [A-Z_][A-Z0-9_]*, values under the same input rules (empty allowed; leading and trailing whitespace is trimmed). A backend may refuse protected names (the native backend refuses HOME, PATH, USER, LANG, TERM and DYLD_*/LD_*); a backend without per-run environments returns unsupported."},
                     "name": {"type": "string", "description": "Pane name: 1-32 of a-z, 0-9, '-', '_', '.'. Optional; Shepherd picks one when it is missing."}
@@ -1560,7 +1561,15 @@ pub fn call_as(sh: &Shepherd, client: &str, name: &str, args: &Args) -> Result<V
 }
 
 fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
+    let declared_agent = declared_agent(args)?;
     let mut spec = match optional_str(args, "profile")? {
+        Some(_) if declared_agent.is_some() => {
+            return Err(
+                "agent is not accepted with a profile; a profile fixes its agent"
+                    .to_string()
+                    .into(),
+            )
+        }
         Some(profile) => profile_spec(sh, args, profile)?,
         None => command_spec(sh, args)?,
     };
@@ -1590,12 +1599,14 @@ fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         .with("backend_detail", err.detail),
         _ => backend_failure(spec.name.as_deref(), err),
     })?;
-    // The profile's agent decides the dialect answer_dialog reads for this pane.
+    // The profile's agent, or the one an argv or line start declared, decides
+    // the dialect answer_dialog reads for this pane.
     let profile_agent = spec
         .profile
         .as_deref()
         .and_then(|p| sh.policy.profile(p))
-        .map(|p| p.agent);
+        .map(|p| p.agent)
+        .or(declared_agent);
     if info.name.is_none() {
         info.name = spec.name.clone();
     }
@@ -1668,6 +1679,22 @@ fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         }
     }
     Ok(info.to_json())
+}
+
+/// `agent`: one of the three agent names, or absent (`null` counts as absent).
+/// An unknown value is refused, naming the three.
+fn declared_agent(args: &Args) -> Result<Option<Agent>, ToolError> {
+    match args.get("agent") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => Agent::parse(name).map(Some).ok_or_else(|| {
+            "agent must be one of kiro, devin or opencode"
+                .to_string()
+                .into()
+        }),
+        Some(_) => Err("agent must be one of kiro, devin or opencode"
+            .to_string()
+            .into()),
+    }
 }
 
 /// The Devin prompt that asks whether to trust a directory before Devin runs
@@ -4734,6 +4761,174 @@ mod tests {
         assert_eq!(sh.agent_of("work"), None);
     }
 
+    /// A start with `argv` and, when given, a declared `agent`, as pane `work`.
+    fn start_declared(sh: &Shepherd, agent: Option<&str>) -> Result<Value, ToolError> {
+        let mut body = json!({"argv": ["kiro-cli", "chat"], "name": "work"});
+        if let Some(agent) = agent {
+            body["agent"] = json!(agent);
+        }
+        call(sh, "start_pane", &args(body))
+    }
+
+    /// Make pane `work` of the fake blocked on a Kiro permission dialog.
+    fn block_work_on_a_dialog(fake: &FakeBackend) {
+        let mut state = fake.state.lock().unwrap();
+        state.panes[0].status = Some(ProgramStatus {
+            state: State::Blocked,
+            kind: Some("permission".to_string()),
+        });
+        state.screen = Some(crate::dialog::fixtures::dialog_on_allow());
+    }
+
+    #[test]
+    fn a_declared_agent_gives_an_argv_pane_the_dialect_and_without_it_nothing_is_sent() {
+        let answer = args(json!({"terminal": "work", "choice": "allow_once"}));
+        let fake = FakeBackend::new(false);
+        fake.state.lock().unwrap().runnable = true;
+        let sh = shepherd(&fake);
+        start_declared(&sh, Some("kiro")).unwrap();
+        assert_eq!(sh.agent_of("work"), Some(Agent::Kiro));
+        assert_eq!(sh.profile_of("work"), None);
+        block_work_on_a_dialog(&fake);
+        let out = call(&sh, "answer_dialog", &answer).unwrap();
+        assert_eq!(out["selected"], "Allow once");
+        assert_eq!(key_names(&fake), [["enter"]]);
+
+        // The same start without `agent`: answer_dialog refuses and sends no key.
+        let fake = FakeBackend::new(false);
+        fake.state.lock().unwrap().runnable = true;
+        let sh = shepherd(&fake);
+        start_declared(&sh, None).unwrap();
+        assert_eq!(sh.agent_of("work"), None);
+        block_work_on_a_dialog(&fake);
+        let err = call(&sh, "answer_dialog", &answer).unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        assert!(key_names(&fake).is_empty());
+    }
+
+    #[test]
+    fn a_null_agent_is_the_same_as_none() {
+        let fake = FakeBackend::new(false);
+        fake.state.lock().unwrap().runnable = true;
+        let sh = shepherd(&fake);
+        call(
+            &sh,
+            "start_pane",
+            &args(json!({"argv": ["true"], "name": "work", "agent": null})),
+        )
+        .unwrap();
+        assert_eq!(sh.agent_of("work"), None);
+    }
+
+    #[test]
+    fn agent_with_a_profile_or_an_unknown_value_is_invalid_input_and_runs_nothing() {
+        let dir = crate::testutil::TempDir::new("tools-declared-agent-refuse");
+        let fake = FakeBackend::new(true);
+        let sh = Shepherd::with_policy(fake.clone(), kiro_policy(dir.path(), true));
+        for (start, needle) in [
+            (
+                json!({"profile": "kiro", "agent": "kiro"}),
+                "a profile fixes its agent",
+            ),
+            (
+                json!({"argv": ["x"], "agent": "claude"}),
+                "kiro, devin or opencode",
+            ),
+            (
+                json!({"argv": ["x"], "agent": "Kiro"}),
+                "kiro, devin or opencode",
+            ),
+            (json!({"line": "x", "agent": 7}), "kiro, devin or opencode"),
+            (
+                json!({"line": "x", "agent": ["kiro"]}),
+                "kiro, devin or opencode",
+            ),
+        ] {
+            let err = call(&sh, "start_pane", &args(start.clone())).unwrap_err();
+            assert_eq!(err.data["error"], "invalid_input", "{start}");
+            assert!(
+                err.data["message"].as_str().unwrap().contains(needle),
+                "{start}: {err:?}"
+            );
+        }
+        // An agent with neither argv nor line is the existing missing-input error.
+        let err = call(&sh, "start_pane", &args(json!({"agent": "kiro"}))).unwrap_err();
+        assert_eq!(err.data["error"], "invalid_input");
+        assert!(err.data["message"].as_str().unwrap().contains("argv"));
+        assert!(fake.state.lock().unwrap().runs.is_empty());
+        // With the server flag off, a declared agent does not open argv or line.
+        let sh = Shepherd::with_policy(fake.clone(), kiro_policy(dir.path(), false));
+        let err = call(
+            &sh,
+            "start_pane",
+            &args(json!({"argv": ["kiro-cli"], "agent": "kiro"})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "profile_required");
+        assert!(fake.state.lock().unwrap().runs.is_empty());
+    }
+
+    #[test]
+    fn a_declared_devin_pane_refuses_yolo() {
+        let fake = FakeBackend::new(false);
+        fake.state.lock().unwrap().runnable = true;
+        let sh = shepherd(&fake);
+        call(
+            &sh,
+            "start_pane",
+            &args(json!({"line": "devin", "name": "work", "agent": "devin"})),
+        )
+        .unwrap();
+        let err = call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "work", "text": "/yolo"})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "refused");
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn routine_create_on_a_declared_agent_pane_is_routines_not_allowed() {
+        let fake = FakeBackend::new(false);
+        fake.state.lock().unwrap().runnable = true;
+        let sh = shepherd(&fake);
+        start_declared(&sh, Some("kiro")).unwrap();
+        fake.state.lock().unwrap().panes[0].status = Some(ProgramStatus {
+            state: State::Done,
+            kind: None,
+        });
+        let err = call(
+            &sh,
+            "routine_create",
+            &args(json!({
+                "terminal": "work",
+                "trigger": {"type": "every", "every_secs": 60},
+                "text": "check whether any todo work is left"
+            })),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "routines_not_allowed");
+    }
+
+    #[test]
+    fn a_name_reused_without_agent_forgets_the_declared_agent_and_remove_forgets_it() {
+        let fake = FakeBackend::new(false);
+        fake.state.lock().unwrap().runnable = true;
+        let sh = shepherd(&fake);
+        start_declared(&sh, Some("devin")).unwrap();
+        assert_eq!(sh.agent_of("work"), Some(Agent::Devin));
+        fake.state.lock().unwrap().panes.clear();
+        start_declared(&sh, None).unwrap();
+        assert_eq!(sh.agent_of("work"), None);
+        fake.state.lock().unwrap().panes.clear();
+        start_declared(&sh, Some("opencode")).unwrap();
+        assert_eq!(sh.agent_of("work"), Some(Agent::OpenCode));
+        call(&sh, "remove_pane", &args(json!({"terminal": "work"}))).unwrap();
+        assert_eq!(sh.agent_of("work"), None);
+    }
+
     #[test]
     fn kiro_mismatch_refuses_without_an_escape() {
         let fake = FakeBackend::new(false);
@@ -5848,6 +6043,31 @@ mod tests {
         assert_eq!(rec.profile.as_deref(), Some("kiro"));
         assert_eq!(rec.routine, Some(RoutineState::default()));
         assert!(!rec.answered);
+    }
+
+    #[test]
+    fn a_declared_agent_start_is_recorded_without_a_profile_and_restored() {
+        let fake = FakeBackend::new(true);
+        fake.state.lock().unwrap().runnable = true;
+        let reg = Arc::new(MemoryRegistry::default());
+        let sh = Shepherd::with_policy(fake.clone(), LaunchPolicy::arbitrary())
+            .with_registry(reg.clone());
+        fake.state.lock().unwrap().locks = Some(Arc::clone(sh.pane_locks()));
+        call(
+            &sh,
+            "start_pane",
+            &args(json!({"argv": ["kiro-cli", "chat"], "name": "work", "agent": "kiro"})),
+        )
+        .unwrap();
+        let rec = reg.get("id-work").expect("the start was recorded");
+        assert_eq!(rec.agent.as_deref(), Some("kiro"));
+        assert_eq!(rec.profile, None);
+        assert_eq!(rec.routine, None);
+        drop(sh);
+        let sh = restarted(reg, &fake, LaunchPolicy::arbitrary());
+        assert_eq!(sh.agent_of("work"), Some(Agent::Kiro));
+        assert_eq!(sh.profile_of("work"), None);
+        assert!(sh.routine_map().get("work").is_none());
     }
 
     #[test]
