@@ -1694,6 +1694,25 @@ fn trust_prompt_shown(sh: &Shepherd, pane: &TerminalRef) -> bool {
     false
 }
 
+/// What Kiro prints at every start with `-a` / `--trust-all-tools` (measured on
+/// kiro-cli 3.3.0). A short fragment so a wrapped line still matches.
+const KIRO_TRUST_WARNING: &str = "trust all tools mode";
+
+const TRUST_ACCEPTANCE_NEXT: &str =
+    "a person attaches and accepts the warning, or start the pane without -a; nothing was typed";
+
+/// True when the visible screen shows Kiro's trust-all-tools warning. One read,
+/// no waiting: a blank screen, a backend without screen text and a failed read
+/// are all "not shown", so the guard refuses only on a positive match.
+fn kiro_trust_warning_shown(sh: &Shepherd, pane: &TerminalRef) -> bool {
+    if !sh.backend.capabilities().screen_text {
+        return false;
+    }
+    sh.backend
+        .read(pane, 0)
+        .is_ok_and(|screen| strip_terminal_escapes(&screen.text).contains(KIRO_TRUST_WARNING))
+}
+
 /// A launch profile's run: its fixed argv, a cwd it allows, no caller env.
 fn profile_spec(sh: &Shepherd, args: &Args, profile: &str) -> Result<RunSpec, ToolError> {
     let given = |key: &str| !matches!(args.get(key), None | Some(Value::Null));
@@ -1987,6 +2006,19 @@ fn send_text_inner(
             "refused by the Devin mode-switch rule: /yolo can switch Devin into Bypass mode, which Shepherd never allows; nothing was sent",
         )
         .with("terminal", terminal));
+    }
+    if sh.agent_of(terminal) == Some(Agent::Kiro)
+        && matches!(now.turn, None | Some(0))
+        && kiro_trust_warning_shown(sh, &pane)
+    {
+        return Err(ToolError::new(
+            "pane_needs_trust_acceptance",
+            format!(
+                "{terminal} shows Kiro's trust-all-tools warning, so nothing was typed: a key here would choose `No, exit` and end the session. Shepherd never answers this dialog. A person must accept it by attaching to the pane, or start the pane without -a"
+            ),
+        )
+        .with("terminal", terminal)
+        .with("next", TRUST_ACCEPTANCE_NEXT));
     }
     // Idle and done are both sendable; a blocked program is never typed into.
     let guard = match extra_guard {
@@ -3615,6 +3647,136 @@ mod tests {
         assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
     }
 
+    const KIRO_TRUST_WARNING_SCREEN: &str =
+        include_str!("../tests/fixtures/kiro-3.3.0/trust-all-warning-synthetic.screen.txt");
+
+    /// A Kiro pane named `work` at `turn`, showing `screen`.
+    fn kiro_pane(turn: Option<u64>, screen: Option<&str>) -> (Shepherd, FakeBackend) {
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", State::Idle, None);
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.panes[0].turn = turn;
+            state.screen = screen.map(str::to_string);
+        }
+        let sh = shepherd(&fake);
+        sh.assume_agent("work", Agent::Kiro);
+        (sh, fake)
+    }
+
+    fn send_hello(sh: &Shepherd) -> Result<Value, ToolError> {
+        call(
+            sh,
+            "send_input",
+            &args(json!({"terminal": "work", "text": "hello"})),
+        )
+    }
+
+    #[test]
+    fn send_input_refuses_a_kiro_pane_showing_the_trust_all_warning_at_turn_zero() {
+        for turn in [None, Some(0)] {
+            let (sh, fake) = kiro_pane(turn, Some(KIRO_TRUST_WARNING_SCREEN));
+            let err = send_hello(&sh).unwrap_err();
+            assert_eq!(err.data["error"], "pane_needs_trust_acceptance", "{turn:?}");
+            assert_eq!(err.data["terminal"], "work");
+            assert_eq!(err.data["next"], TRUST_ACCEPTANCE_NEXT);
+            assert!(fake.state.lock().unwrap().sent.is_empty(), "{turn:?}");
+            assert!(fake.state.lock().unwrap().keys.is_empty(), "{turn:?}");
+            // The pane is left open for a person to accept the warning.
+            assert!(fake.state.lock().unwrap().panes[0].live);
+        }
+    }
+
+    #[test]
+    fn the_kiro_trust_guard_sees_through_escapes_in_the_phrase() {
+        let screen = "\x1b[1mKiro is running in trust all\x1b[0m tools mode";
+        let (sh, fake) = kiro_pane(Some(0), Some(screen));
+        let err = send_hello(&sh).unwrap_err();
+        assert_eq!(err.data["error"], "pane_needs_trust_acceptance");
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn the_kiro_trust_guard_is_off_after_the_first_turn() {
+        let (sh, fake) = kiro_pane(Some(1), Some(KIRO_TRUST_WARNING_SCREEN));
+        send_hello(&sh).unwrap();
+        assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
+        // No per-send read once a turn has happened.
+        assert!(!fake.calls().contains(&"read"));
+    }
+
+    #[test]
+    fn the_kiro_trust_guard_sends_on_a_blank_or_other_screen() {
+        for screen in ["", "   \n\n", "kiro-cli 3.3.0\n> "] {
+            let (sh, fake) = kiro_pane(Some(0), Some(screen));
+            send_hello(&sh).unwrap();
+            assert_eq!(fake.state.lock().unwrap().sent.len(), 1, "{screen:?}");
+        }
+    }
+
+    #[test]
+    fn the_kiro_trust_guard_sends_when_the_read_is_unsupported_or_the_backend_has_no_screen() {
+        // `read` unsupported: no screen set.
+        let (sh, fake) = kiro_pane(Some(0), None);
+        send_hello(&sh).unwrap();
+        assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
+        // The backend says it has no screen text: no read is even tried.
+        let fake = FakeBackend::new(false);
+        fake.add_pane("work", State::Idle, None);
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.panes[0].turn = Some(0);
+            state.screen = Some(KIRO_TRUST_WARNING_SCREEN.to_string());
+        }
+        let mut quiet = fake.clone();
+        quiet.caps.screen_text = false;
+        let sh = Shepherd::with_policy(quiet, LaunchPolicy::arbitrary());
+        sh.assume_agent("work", Agent::Kiro);
+        send_hello(&sh).unwrap();
+        assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
+        assert!(!fake.calls().contains(&"read"));
+    }
+
+    #[test]
+    fn the_kiro_trust_guard_ignores_other_agents_and_unknown_agents() {
+        for agent in [Some(Agent::Devin), Some(Agent::OpenCode), None] {
+            let (sh, fake) = kiro_pane(Some(0), Some(KIRO_TRUST_WARNING_SCREEN));
+            sh.forget_agent("work");
+            if let Some(agent) = agent {
+                sh.assume_agent("work", agent);
+            }
+            send_hello(&sh).unwrap();
+            assert_eq!(fake.state.lock().unwrap().sent.len(), 1, "{agent:?}");
+        }
+    }
+
+    #[test]
+    fn answer_dialog_on_a_pane_at_the_trust_warning_is_the_not_blocked_refusal() {
+        let (sh, fake) = kiro_pane(Some(0), Some(KIRO_TRUST_WARNING_SCREEN));
+        let err = call(
+            &sh,
+            "answer_dialog",
+            &args(json!({"terminal": "work", "choice": "allow_once"})),
+        )
+        .unwrap_err();
+        assert!(
+            err.text.contains("not blocked on a permission dialog"),
+            "{}",
+            err.text
+        );
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+        assert!(fake.state.lock().unwrap().keys.is_empty());
+    }
+
+    #[test]
+    fn a_routine_send_hits_the_same_kiro_trust_refusal() {
+        // The routine sends through `send_text_guarded`, as `send_input` does.
+        let (sh, fake) = kiro_pane(Some(0), Some(KIRO_TRUST_WARNING_SCREEN));
+        let err = send_text_guarded(&sh, "work", "continue", None, None).unwrap_err();
+        assert_eq!(err.data["error"], "pane_needs_trust_acceptance");
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
     #[test]
     fn send_input_with_conditional_input_leaves_the_refusal_to_the_backend() {
         let fake = FakeBackend::new(true);
@@ -5072,6 +5234,27 @@ mod tests {
     }
 
     #[test]
+    fn a_routine_tick_at_the_kiro_trust_warning_types_nothing() {
+        let (sh, fake, _dir) = watched_pane(
+            json!({"idle_timeout_secs": 10, "cooldown_secs": 10, "nudge_text": "continue"}),
+            "tools-routine-trust-warning",
+        );
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.panes[0].turn = Some(0);
+            state.screen = Some(
+                include_str!("../tests/fixtures/kiro-3.3.0/trust-all-warning-synthetic.screen.txt")
+                    .to_string(),
+            );
+        }
+        let t0 = Instant::now();
+        sh.routine_tick_at(t0);
+        sh.routine_tick_at(t0 + Duration::from_secs(11));
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+        assert!(fake.calls().contains(&"read"));
+    }
+
+    #[test]
     fn the_routine_never_nudges_a_blocked_pane() {
         let (sh, fake, _dir) = watched_pane(
             json!({"idle_timeout_secs": 10, "nudge_text": "continue"}),
@@ -5683,6 +5866,37 @@ mod tests {
                 .map(|w| w.pane_id().to_string()),
             Some("id-work".to_string())
         );
+    }
+
+    #[test]
+    fn a_restored_kiro_pane_at_turn_zero_is_still_guarded() {
+        let dir = crate::testutil::TempDir::new("tools-registry-trust-guard");
+        let fake = FakeBackend::new(true);
+        let reg = Arc::new(MemoryRegistry::default());
+        let old = registered_pane(reg.clone(), &fake, &dir);
+        drop(old);
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.panes[0].status = Some(ProgramStatus {
+                state: State::Idle,
+                kind: None,
+            });
+            state.panes[0].turn = Some(0);
+            state.screen = Some(
+                include_str!("../tests/fixtures/kiro-3.3.0/trust-all-warning-synthetic.screen.txt")
+                    .to_string(),
+            );
+        }
+        let sh = restarted(reg, &fake, routine_policy(dir.path(), RESTART_ROUTINE()));
+        assert_eq!(sh.agent_of("work"), Some(Agent::Kiro));
+        let err = call(
+            &sh,
+            "send_input",
+            &args(json!({"terminal": "work", "text": "hello"})),
+        )
+        .unwrap_err();
+        assert_eq!(err.data["error"], "pane_needs_trust_acceptance");
+        assert_eq!(sent_count(&fake), 0);
     }
 
     #[test]
