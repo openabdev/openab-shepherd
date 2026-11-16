@@ -1297,7 +1297,7 @@ machine that has kiro-cli (it takes only `--keep-dir` and opens no listener).
 
 `Dockerfile` builds a linux/amd64 or linux/arm64 image: a Rust build stage, then a Debian trixie-slim
 runtime with kiro-cli, git and tini, running as uid 1000. kiro-cli is pinned to
-3.1.0 (`KIRO_CLI_VERSION`) and its download is checked against a SHA-256 for amd64
+3.3.0 (`KIRO_CLI_VERSION`, the version the Kiro dialog parser was measured on) and its download is checked against a SHA-256 for amd64
 and for arm64. The image holds no token and
 no profiles file. Build it on the build host:
 
