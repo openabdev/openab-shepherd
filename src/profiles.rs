@@ -558,6 +558,41 @@ fn strings(value: Option<&Value>, what: &str) -> Result<Vec<String>, ConfigError
         .collect()
 }
 
+/// The argv refusals that depend on the agent: OpenCode auto-approve flags, and for Devin the
+/// two flags Shepherd owns (`--permission-mode`, `--respect-workspace-trust`). The text is the
+/// part after the caller's prefix. Pass the argv the operator or caller wrote, never the
+/// `--permission-mode` Shepherd adds itself.
+pub fn check_agent_argv(agent: Agent, argv: &[String]) -> Result<(), String> {
+    // The argv decides whether this is OpenCode, not only the declared agent: a profile
+    // with no `agent` field still defaults to Kiro, and a wrapper such as `sh -c` or `npx`
+    // runs OpenCode from a later element.
+    let runs_opencode = argv.iter().any(|a| names_opencode(a));
+    if agent == Agent::OpenCode || runs_opencode {
+        if let Some(arg) = argv.iter().find(|a| is_opencode_auto_flag(a)) {
+            return Err(format!(
+                "argv and extra_args may not pass {arg} for opencode: OpenCode auto-approve flags are refused"
+            ));
+        }
+    }
+    if agent == Agent::Devin {
+        if argv
+            .iter()
+            .any(|a| a == "--permission-mode" || a.starts_with("--permission-mode="))
+        {
+            return Err(
+                "argv and extra_args may not set --permission-mode for devin; use permission_mode"
+                    .to_string(),
+            );
+        }
+        if argv.iter().any(|a| {
+            a == "--respect-workspace-trust" || a.starts_with("--respect-workspace-trust=")
+        }) {
+            return Err("argv and extra_args may not set --respect-workspace-trust for devin: the trust check stays on, and a new directory must be trusted in Devin first".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profile, ConfigError> {
     let map = item
         .as_object()
@@ -629,17 +664,7 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         Some(Value::Bool(allow)) => *allow,
         Some(_) => return Err(err(format!("{at}: allow_bypass must be true or false"))),
     };
-    // The argv decides whether this is OpenCode, not only the declared agent: a profile
-    // with no `agent` field still defaults to Kiro, and a wrapper such as `sh -c` or `npx`
-    // runs OpenCode from a later element.
-    let runs_opencode = argv.iter().any(|a| names_opencode(a));
-    if agent == Agent::OpenCode || runs_opencode {
-        if let Some(arg) = argv.iter().find(|a| is_opencode_auto_flag(a)) {
-            return Err(err(format!(
-                "{at}: argv and extra_args may not pass {arg} for opencode: OpenCode auto-approve flags are refused"
-            )));
-        }
-    }
+    check_agent_argv(agent, &argv).map_err(|reason| err(format!("{at}: {reason}")))?;
     match (agent, permission_mode) {
         (Agent::Kiro, PermissionMode::AcceptEdits) => {
             return Err(err(format!(
@@ -654,24 +679,6 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         (Agent::OpenCode, PermissionMode::AcceptEdits | PermissionMode::Bypass) => {
             return Err(err(format!(
                 "{at}: permission_mode must be normal for opencode: no OpenCode permission mode was measured"
-            )))
-        }
-        (Agent::Devin, _)
-            if argv
-                .iter()
-                .any(|a| a == "--permission-mode" || a.starts_with("--permission-mode=")) =>
-        {
-            return Err(err(format!(
-                "{at}: argv and extra_args may not set --permission-mode for devin; use permission_mode"
-            )))
-        }
-        (Agent::Devin, _)
-            if argv.iter().any(|a| {
-                a == "--respect-workspace-trust" || a.starts_with("--respect-workspace-trust=")
-            }) =>
-        {
-            return Err(err(format!(
-                "{at}: argv and extra_args may not set --respect-workspace-trust for devin: the trust check stays on, and a new directory must be trusted in Devin first"
             )))
         }
         _ => {}
@@ -1303,6 +1310,37 @@ mod tests {
             json!({"profiles": [{"name": "k", "argv": ["kiro-cli", "--auto"], "cwds": [d]}]})
                 .to_string();
         assert!(parse(&kiro, true).is_ok());
+    }
+
+    #[test]
+    fn check_agent_argv_applies_each_agent_rule_and_nothing_else() {
+        let argv = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // OpenCode, declared or named by the program.
+        let reason = check_agent_argv(Agent::OpenCode, &argv(&["opencode", "--auto"])).unwrap_err();
+        assert_eq!(
+            reason,
+            "argv and extra_args may not pass --auto for opencode: OpenCode auto-approve flags are refused"
+        );
+        assert!(check_agent_argv(Agent::Kiro, &argv(&["opencode", "--auto-approve"])).is_err());
+        assert!(check_agent_argv(Agent::Kiro, &argv(&["kiro-cli", "--auto"])).is_ok());
+        // Devin: the two flags Shepherd owns, bare or with `=`.
+        for flag in ["--permission-mode", "--permission-mode=dangerous"] {
+            let reason = check_agent_argv(Agent::Devin, &argv(&["devin", flag])).unwrap_err();
+            assert_eq!(
+                reason,
+                "argv and extra_args may not set --permission-mode for devin; use permission_mode"
+            );
+        }
+        for flag in [
+            "--respect-workspace-trust",
+            "--respect-workspace-trust=true",
+        ] {
+            let reason = check_agent_argv(Agent::Devin, &argv(&["devin", flag])).unwrap_err();
+            assert!(reason.contains("--respect-workspace-trust for devin"));
+        }
+        // The same flags are not another agent's business, and harmless arguments pass.
+        assert!(check_agent_argv(Agent::Kiro, &argv(&["kiro-cli", "--permission-mode"])).is_ok());
+        assert!(check_agent_argv(Agent::Devin, &argv(&["devin", "--model", "x"])).is_ok());
     }
 
     #[test]
