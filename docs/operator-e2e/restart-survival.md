@@ -63,7 +63,7 @@ bash service-restart-linux.sh    # p1
 IMAGE=<registry>/openab-shepherd:<version> bash zombie-under-tini.sh   # p1; DOCKER=~/.orbstack/bin/docker on a Mac
 ```
 
-Run one at a time: they share the port and the throwaway directories.
+Run one at a time: they share the port and the throwaway directories. The routine scenario for agent-created routines, `routine-dynamic.sh`, has its own runbook, [routine-dynamic.md](routine-dynamic.md), and its own port and directories.
 
 ## What a FAIL usually means
 

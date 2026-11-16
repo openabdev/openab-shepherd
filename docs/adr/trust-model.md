@@ -17,6 +17,12 @@ herdr and Orca also trust the agent in the pane and the account it runs under. S
 - A guarded `answer_dialog`. It holds the pane lock from the first read to the Enter key and re-checks status, dialog kind and turn, so a person typing in the same pane and a parser misread do not produce a wrong approval.
 - Restart survival, so a Shepherd restart does not end every pane. This is planned (#66) and does not exist yet.
 
+A pane's agent holds no Shepherd credential unless the operator gives it a client of its
+own. The `routine` scope lets such a client make Shepherd type a fixed, bounded line into
+panes whose profile opted in with `dynamic_routines`; it does not imply `control`, and the
+agent, running as the same account, could read any token file that account can read, so
+the grant is a narrow separate token, not the operator's.
+
 ## Decision test
 
 Keep a mitigation if it stops at least one of these:
