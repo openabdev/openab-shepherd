@@ -81,7 +81,7 @@ which answers a permission dialog may receive.
   about every 250 ms, so a process that fully detaches faster than that is missed
   (see [Status and known limits](#status-and-known-limits)).
 - **Container image.** The `Dockerfile` builds a Debian image that runs as uid 1000
-  under tini, with kiro-cli pinned to 3.1.0 (the image does not ship 3.3.0, where the Kiro dialog parser was measured) and checked against a SHA-256. The image
+  under tini, with kiro-cli pinned to 3.3.0 (the version the Kiro dialog parser was measured on) and checked against a SHA-256. The image
   holds no token and no profiles file. Its default command runs the pane holder
   (`openab-shepherd hold -- ...`); override the command with the bare
   `openab-shepherd --host ... --port ...` for the single-process behaviour.
