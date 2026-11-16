@@ -1571,8 +1571,13 @@ fn only_an_enter_outside_a_paste_clears_the_draft() {
         ("CR, then text", &[b"x\ry"], false),
         ("CR, then CR", &[b"x\ry\r"], true),
     ] {
-        for chunk in chunks {
+        for (n, chunk) in chunks.iter().enumerate() {
             b.human_write(&t, id, chunk).unwrap();
+            // Only the last call may clear it: an earlier Enter that counted
+            // would clear the draft here, and the next call set it again.
+            if !(clears && n + 1 == chunks.len()) {
+                assert!(draft_of(b, &t), "{name}: call {n}");
+            }
         }
         assert_eq!(!draft_of(b, &t), clears, "{name}");
         // Back to a known state: the paste closed, the draft cleared.
