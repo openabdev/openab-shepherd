@@ -23,6 +23,7 @@ pub mod profiles;
 pub mod registry;
 pub mod routine;
 pub mod routine_model;
+pub mod schedule;
 pub mod shared_panes;
 pub mod tools;
 
