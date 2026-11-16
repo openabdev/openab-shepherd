@@ -152,7 +152,7 @@ fn call_tool(
             return Ok(tool_result(Err(unavailable.to_tool_error())));
         }
     }
-    let outcome = tools::call(sh, name, &args);
+    let outcome = tools::call_as(sh, caller.client(), name, &args);
     if let Some(audit) = audit {
         audit.after(caller.client(), name, &args, &outcome);
     }
@@ -251,10 +251,11 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         // The legacy caller of a bare deployment holds no `lease:preempt`, so
-        // `draft_clear` is not listed for it (issue #77).
+        // `draft_clear` is not listed for it (issue #77), and no `routine`,
+        // so the four routine tools are not listed either (issue #98).
         let legacy: Vec<&str> = tools::TOOL_NAMES
             .into_iter()
-            .filter(|name| *name != "draft_clear")
+            .filter(|name| *name != "draft_clear" && !name.starts_with("routine_"))
             .collect();
         assert_eq!(names, legacy);
     }
@@ -458,6 +459,9 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod routine_tests;
+
 /// Issue #4, PR 1: authorization and audit seen through `handle_message_as`,
 /// over the project's `FakeBackend`. Run with `cargo test issue4_pr1`.
 #[cfg(test)]
@@ -604,6 +608,23 @@ mod issue4_pr1_mcp {
                 "draft_clear",
                 json!({"terminal": "work"}),
                 Scope::LeasePreempt,
+            ),
+            (
+                "routine_create",
+                json!({"terminal": "work", "text": "check the todo list",
+                       "trigger": {"type": "every", "every_secs": 600}}),
+                Scope::Routine,
+            ),
+            ("routine_list", json!({"terminal": "work"}), Scope::Routine),
+            (
+                "routine_update",
+                json!({"terminal": "work", "id": "r1", "text": "check again"}),
+                Scope::Routine,
+            ),
+            (
+                "routine_delete",
+                json!({"terminal": "work", "id": "r1"}),
+                Scope::Routine,
             ),
         ]
     }
@@ -901,11 +922,12 @@ mod issue4_pr1_mcp {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        // Every tool but `draft_clear` (issue #77): that one needs
-        // `lease:preempt`, which the legacy caller does not hold.
+        // Every tool but `draft_clear` (issue #77), which needs
+        // `lease:preempt`, and the routine tools (issue #98), which need
+        // `routine`: the legacy caller holds neither.
         let legacy: Vec<&str> = tools::TOOL_NAMES
             .into_iter()
-            .filter(|name| *name != "draft_clear")
+            .filter(|name| *name != "draft_clear" && !name.starts_with("routine_"))
             .collect();
         assert_eq!(names, legacy);
         assert_eq!(handle_message(&sh, &list), Some(reply));
@@ -916,6 +938,9 @@ mod issue4_pr1_mcp {
             if tool == "draft_clear" {
                 assert_eq!(code(&out), "forbidden", "{out}");
                 assert_eq!(out["structuredContent"]["scope"], "lease:preempt");
+            } else if tool.starts_with("routine_") {
+                assert_eq!(code(&out), "forbidden", "{out}");
+                assert_eq!(out["structuredContent"]["scope"], "routine");
             } else {
                 assert_ne!(code(&out), "forbidden", "{tool}: {out}");
             }
