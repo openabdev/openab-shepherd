@@ -62,6 +62,7 @@ struct Rec {
     calls: Mutex<Vec<Call>>,
     fail_write: AtomicBool,
     fail_meta: AtomicBool,
+    fail_resize: AtomicBool,
     /// A pane to end right after the next `list`, as if it exited between the
     /// front's `list` and its table lock.
     end_after_list: Mutex<Option<String>>,
@@ -108,6 +109,7 @@ impl Rec {
             calls: Mutex::new(Vec::new()),
             fail_write: AtomicBool::new(false),
             fail_meta: AtomicBool::new(false),
+            fail_resize: AtomicBool::new(false),
             end_after_list: Mutex::new(None),
             exits_seen: Arc::new(AtomicUsize::new(0)),
         })
@@ -189,6 +191,9 @@ impl PtyHost for Rec {
     }
     fn resize(&self, id: &str, cols: u16, rows: u16) -> io::Result<()> {
         self.log(Call::Resize(cols, rows));
+        if self.fail_resize.load(Ordering::SeqCst) {
+            return Err(io::Error::other("injected resize failure"));
+        }
         self.inner().resize(id, cols, rows)
     }
     fn signal(&self, id: &str, signal: i32) -> io::Result<()> {
@@ -1507,6 +1512,182 @@ fn a_second_holder_is_refused_unless_it_preempts_and_the_old_one_is_then_lost() 
     assert!(s.b().lease_release(&t, second.id).unwrap());
     assert!(!s.b().lease_release(&t, second.id).unwrap());
     assert!(!lease_of(s.b(), &t) && draft_of(s.b(), &t));
+}
+
+// ---------------------------------------------------------------------------
+// Geometry (issue #77): only the lease holder resizes
+// ---------------------------------------------------------------------------
+
+/// A pane that prints its size each time its terminal changes size.
+const WINCH_SIZE: &str = "trap 'echo SIZE=$(stty size)' WINCH; echo READY; \
+                          while :; do sleep 0.02; done";
+
+fn resizes_since(host: &Rec, mark: usize) -> Vec<Call> {
+    host.calls()[mark..]
+        .iter()
+        .filter(|c| matches!(c, Call::Resize(..)))
+        .cloned()
+        .collect()
+}
+
+fn emulator_size(b: &NativeBackend, info: &TerminalInfo) -> (u16, u16) {
+    with_state(b, info, |st| st.emu.size())
+}
+
+#[test]
+fn the_lease_holder_resizes_the_terminal_and_the_emulator_together() {
+    let s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", WINCH_SIZE);
+    let t = tref(&info);
+    wait_screen(s.b(), &info, "READY");
+    assert_eq!(
+        emulator_size(s.b(), &info),
+        (COLS, ROWS),
+        "200x120 until a holder"
+    );
+    let id = s.b().lease_acquire(&t, "person", false).unwrap().id;
+    let mark = s.host.mark();
+    assert_eq!(s.b().resize(&t, id, 100, 30).unwrap(), (100, 30));
+    assert_eq!(resizes_since(&s.host, mark), vec![Call::Resize(100, 30)]);
+    assert_eq!(emulator_size(s.b(), &info), (100, 30));
+    let listed = s.host.list();
+    assert_eq!((listed[0].cols, listed[0].rows), (100, 30));
+    // The program saw the new size, and the screen a bot reads has its rows.
+    wait_screen(s.b(), &info, "SIZE=30 100");
+    let styled = with_state(s.b(), &info, |st| st.emu.styled_screen());
+    assert_eq!((styled.rows.len(), styled.rows[0].len()), (30, 100));
+    // The scrollback read pages by the new height and still works.
+    let history = s.b().read(&t, 50).unwrap();
+    assert!(history.text.contains("SIZE=30 100"), "{}", history.text);
+}
+
+#[test]
+fn a_size_is_clamped_to_the_limits() {
+    let s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", "cat > /dev/null");
+    let t = tref(&info);
+    let id = s.b().lease_acquire(&t, "person", false).unwrap().id;
+    assert_eq!(s.b().resize(&t, id, 0, 0).unwrap(), (10, 5));
+    assert_eq!(emulator_size(s.b(), &info), (10, 5));
+    assert_eq!(s.b().resize(&t, id, 60000, 60000).unwrap(), (500, 300));
+    assert_eq!(emulator_size(s.b(), &info), (500, 300));
+    let listed = s.host.list();
+    assert_eq!((listed[0].cols, listed[0].rows), (500, 300));
+}
+
+#[test]
+fn nobody_but_the_live_lease_holder_resizes() {
+    let clock = TestClock::new();
+    let s = Split::with_config(1 << 20, clock.config());
+    let script = format!("printf '{IDLE}'; cat > /dev/null");
+    let (info, _dir) = s.run("p", &script);
+    let t = tref(&info);
+    eventually("idle", || {
+        state_is_idle(&s.b().get(&t).unwrap()).then_some(())
+    });
+    let mark = s.host.mark();
+    let refused = |s: &Split, id: u64| {
+        let err = s.b().resize(&t, id, 100, 30).unwrap_err();
+        assert!(
+            !matches!(err.kind, ErrorKind::Other),
+            "a refusal, not a failure: {err}"
+        );
+        assert_eq!(emulator_size(s.b(), &info), (COLS, ROWS));
+        assert!(
+            resizes_since(&s.host, mark).is_empty(),
+            "the host was not resized"
+        );
+    };
+    // Nobody holds a lease: an id made up, and a bot's every operation.
+    refused(&s, 1);
+    refused(&s, 0);
+    s.b().send(&t, "bot", &default_guard()).unwrap();
+    s.b().keys(&t, &[Key::Enter], &default_guard()).unwrap();
+    s.b().interrupt(&t, Some(Duration::from_millis(300))).ok();
+    assert!(
+        resizes_since(&s.host, mark).is_empty(),
+        "no bot operation resizes"
+    );
+    // A holder, then a second one that preempts: the first id is stale.
+    let first = s.b().lease_acquire(&t, "one", false).unwrap().id;
+    let second = s.b().lease_acquire(&t, "two", true).unwrap().id;
+    refused(&s, first);
+    assert_eq!(s.b().resize(&t, second, 100, 30).unwrap(), (100, 30));
+    let after_second = resizes_since(&s.host, mark);
+    assert_eq!(after_second, vec![Call::Resize(100, 30)]);
+    // A released lease, an idled-out lease.
+    s.b().lease_release(&t, second).unwrap();
+    assert!(s.b().resize(&t, second, 90, 20).is_err());
+    let third = s.b().lease_acquire(&t, "three", false).unwrap().id;
+    clock.advance(Duration::from_secs(301));
+    assert!(s.b().resize(&t, third, 90, 20).is_err());
+    assert_eq!(resizes_since(&s.host, mark), after_second);
+    assert_eq!(emulator_size(s.b(), &info), (100, 30));
+}
+
+#[test]
+fn a_failed_host_resize_leaves_the_emulator_alone() {
+    let s = Split::new(1 << 20);
+    let (info, _dir) = s.run("p", "cat > /dev/null");
+    let t = tref(&info);
+    let id = s.b().lease_acquire(&t, "person", false).unwrap().id;
+    s.host.fail_resize.store(true, Ordering::SeqCst);
+    assert!(s.b().resize(&t, id, 100, 30).is_err());
+    assert_eq!(emulator_size(s.b(), &info), (COLS, ROWS));
+    s.host.fail_resize.store(false, Ordering::SeqCst);
+    assert_eq!(s.b().resize(&t, id, 100, 30).unwrap(), (100, 30));
+}
+
+#[test]
+fn a_resize_does_not_renew_the_lease() {
+    let clock = TestClock::new();
+    let s = Split::with_config(1 << 20, clock.config());
+    let (info, _dir) = s.run("p", "cat > /dev/null");
+    let t = tref(&info);
+    let id = s.b().lease_acquire(&t, "person", false).unwrap().id;
+    clock.advance(Duration::from_secs(200));
+    s.b().resize(&t, id, 100, 30).unwrap();
+    clock.advance(Duration::from_secs(150));
+    // 350 s since the acquire: only input would have renewed it.
+    assert_eq!(s.b().lease_status(&t, id).unwrap(), LeaseStatus::Idle);
+}
+
+#[test]
+fn the_size_stays_when_the_lease_ends_and_a_restart_nudges_it_back_to_200x120() {
+    let clock = TestClock::new();
+    let mut s = Split::with_config(1 << 20, clock.config());
+    let (info, _dir) = s.run("p", "echo READY; cat > /dev/null");
+    let t = tref(&info);
+    wait_screen(s.b(), &info, "READY");
+    let id = s.b().lease_acquire(&t, "person", false).unwrap().id;
+    s.b().resize(&t, id, 100, 30).unwrap();
+    // No restore on release, on idle expiry or on a bot's write: the host
+    // sees no further resize and the emulator keeps the holder's size.
+    let mark = s.host.mark();
+    s.b().lease_release(&t, id).unwrap();
+    clock.advance(Duration::from_secs(3600));
+    s.b().keys(&t, &[Key::Enter], &default_guard()).unwrap();
+    assert!(resizes_since(&s.host, mark).is_empty());
+    assert_eq!(emulator_size(s.b(), &info), (100, 30));
+    let listed = s.host.list();
+    assert_eq!((listed[0].cols, listed[0].rows), (100, 30));
+    // A front restart: adoption is unchanged. The pane is not at 200x120, so
+    // it is replayed, and the nudge (the one lease-less resize) returns it.
+    s.kill_front();
+    let mark = s.host.mark();
+    let adoption = s.new_front();
+    assert_eq!(adoption.adopted.len(), 1);
+    assert_eq!(
+        resizes_since(&s.host, mark),
+        vec![Call::Resize(COLS, ROWS - 1), Call::Resize(COLS, ROWS)]
+    );
+    assert_eq!(emulator_size(s.b(), &info), (COLS, ROWS));
+    let listed = s.host.list();
+    assert_eq!((listed[0].cols, listed[0].rows), (COLS, ROWS));
+    assert!(
+        !lease_of(s.b(), &t),
+        "the lease did not survive, so nobody holds the size"
+    );
 }
 
 #[test]

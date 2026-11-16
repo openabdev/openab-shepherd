@@ -631,7 +631,7 @@ impl Inner {
 impl Inner {
     /// Make each pane repaint: shrink its terminal by one row, give the
     /// program a moment, then restore the size. Only the terminal changes;
-    /// the emulator stays at its fixed size. Output at or after the offset
+    /// the emulator of an adopted pane is new, at 200x120. Output at or after the offset
     /// the host has when the return resize goes out clears `replayed`, so a
     /// repaint answering the smaller size never does.
     fn nudge(&self, panes: &[Arc<Pane>]) {

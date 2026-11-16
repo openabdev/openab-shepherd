@@ -196,6 +196,21 @@ impl Emulator {
         }
     }
 
+    /// The grid's size, columns by rows. 200 by 120 until a lease holder
+    /// resizes the pane.
+    pub(crate) fn size(&self) -> (u16, u16) {
+        let (rows, cols) = self.parser.screen().size();
+        (cols.get(), rows.get())
+    }
+
+    /// Resize the grid in step with the pane's terminal (issue #77). Zero is
+    /// raised to one; the caller clamps to its own limits.
+    pub(crate) fn resize(&mut self, cols: u16, rows: u16) {
+        let rows = NonZeroU16::new(rows.max(1)).expect("raised to one");
+        let cols = NonZeroU16::new(cols.max(1)).expect("raised to one");
+        self.parser.set_size(rows, cols);
+    }
+
     /// Feed program output. CAN and SUB are fed on their own, so an OSC they
     /// end is known to be aborted rather than terminated.
     pub(crate) fn process(&mut self, bytes: &[u8]) {
@@ -255,9 +270,10 @@ impl Emulator {
     /// from the same cells `screen_text` reads.
     pub(crate) fn styled_screen(&self) -> StyledScreen {
         let screen = self.parser.screen();
-        let rows = (0..ROWS)
+        let (cols, rows) = self.size();
+        let rows = (0..rows)
             .map(|row| {
-                (0..COLS)
+                (0..cols)
                     .map(|col| match screen.cell(row, col) {
                         Some(cell) => StyledCell {
                             text: cell.contents().to_string(),
@@ -282,9 +298,9 @@ impl Emulator {
     /// screen. `complete` is false when more was asked for than is kept and
     /// rows have been dropped. The scrollback offset is back at 0 on return.
     pub(crate) fn history_text(&mut self, lines: usize) -> (String, bool) {
+        let page = usize::from(self.size().1);
         let screen = self.parser.screen_mut();
         let len = screen.scrollback_len();
-        let page = usize::from(ROWS);
         let mut rows = Vec::new();
         let mut offset = lines.min(len);
         while offset > 0 {
@@ -309,7 +325,7 @@ fn color(c: vt100::Color) -> Color {
 
 fn visible_rows(screen: &vt100::Screen) -> Vec<String> {
     screen
-        .rows(0, COLS)
+        .rows(0, screen.size().1.get())
         .map(|row| row.trim_end().to_string())
         .collect()
 }
@@ -707,6 +723,38 @@ mod tests {
         assert!(complete);
         assert_eq!(text.lines().next(), Some("line 0"));
         assert_eq!(text.lines().count(), 200);
+    }
+
+    #[test]
+    fn a_new_emulator_is_200_by_120_and_resize_moves_the_grid_with_it() {
+        let mut emu = Emulator::new();
+        assert_eq!(emu.size(), (COLS, ROWS));
+        emu.process(b"hello\r\nworld");
+        emu.resize(40, 10);
+        assert_eq!(emu.size(), (40, 10));
+        assert_eq!(emu.screen_text(), "hello\nworld");
+        let styled = emu.styled_screen();
+        assert_eq!((styled.rows.len(), styled.rows[0].len()), (10, 40));
+        // New output wraps at the new width.
+        emu.process(b"\r\n");
+        emu.process(&[b'x'; 45]);
+        assert!(emu
+            .screen_text()
+            .ends_with(&format!("{}\n{}", "x".repeat(40), "x".repeat(5))));
+        // The scrollback is paged by the new height.
+        emu.process("\r\nrow".repeat(30).as_bytes());
+        let (text, _) = emu.history_text(25);
+        assert!(text.lines().count() > 10, "{text}");
+        emu.resize(COLS, ROWS);
+        assert_eq!(emu.size(), (COLS, ROWS));
+        assert_eq!(emu.styled_screen().rows.len(), usize::from(ROWS));
+    }
+
+    #[test]
+    fn resize_raises_zero_to_one_instead_of_panicking() {
+        let mut emu = Emulator::new();
+        emu.resize(0, 0);
+        assert_eq!(emu.size(), (1, 1));
     }
 }
 
