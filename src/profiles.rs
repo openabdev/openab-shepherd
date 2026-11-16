@@ -18,7 +18,12 @@
 use crate::agent::{Agent, PermissionMode};
 use crate::backend::Secret;
 use crate::config::{check_outside_repo, ConfigError};
-use crate::input::{validate_input, validate_name};
+use crate::input::{is_bare_confirmation, validate_input, validate_name};
+use crate::routine_model::{
+    CEILING_EXPIRES_MIN_SECS, DEFAULT_MAX_EXPIRES_SECS, DEFAULT_MAX_PER_PANE,
+    DEFAULT_MIN_EVERY_SECS, EVERY_MAX_SECS, EVERY_MIN_SECS, EXPIRES_MAX_SECS, PER_PANE_MAX,
+    PER_PANE_MIN,
+};
 use serde_json::{json, Map, Value};
 use std::fmt;
 use std::fs;
@@ -92,6 +97,29 @@ pub struct RoutineConfig {
     pub nudge_text: String,
 }
 
+/// The ceiling a profile sets for routines an agent creates over MCP (issue
+/// #98). Off unless the profile has a `dynamic_routines` section; `{}` turns
+/// it on with these defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicRoutines {
+    /// The shortest `every` interval, in seconds (60 to 604800).
+    pub min_every_secs: u64,
+    /// Active routines on one pane (1 to 10).
+    pub max_per_pane: u32,
+    /// The longest a routine may live before it expires (3600 to 2592000).
+    pub max_expires_secs: u64,
+}
+
+impl Default for DynamicRoutines {
+    fn default() -> Self {
+        Self {
+            min_every_secs: DEFAULT_MIN_EVERY_SECS,
+            max_per_pane: DEFAULT_MAX_PER_PANE,
+            max_expires_secs: DEFAULT_MAX_EXPIRES_SECS,
+        }
+    }
+}
+
 /// One launch profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
@@ -108,6 +136,9 @@ pub struct Profile {
     pub allow_bypass: bool,
     /// The profile's routine, when it sets one.
     pub routine: Option<RoutineConfig>,
+    /// The ceiling for routines an agent creates; `None` means the profile
+    /// does not allow any.
+    pub dynamic_routines: Option<DynamicRoutines>,
 }
 
 impl Profile {
@@ -287,6 +318,11 @@ impl LaunchPolicy {
     /// Whether any profile sets a routine.
     pub fn has_routine(&self) -> bool {
         self.profiles.iter().any(|p| p.routine.is_some())
+    }
+
+    /// Whether any profile allows agent-created routines.
+    pub fn has_dynamic_routines(&self) -> bool {
+        self.profiles.iter().any(|p| p.dynamic_routines.is_some())
     }
 
     /// What a caller may start: profile names and allowed directories, and
@@ -545,6 +581,7 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
             "env",
             "routine",
             "watchdog",
+            "dynamic_routines",
         ],
         &at,
     )?;
@@ -706,6 +743,7 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         }
         (new, None) => parse_routine(new, &at, agent)?,
     };
+    let dynamic_routines = parse_dynamic_routines(map.get("dynamic_routines"), &at)?;
     Ok(Profile {
         name,
         argv,
@@ -715,7 +753,57 @@ fn parse_profile(item: &Value, index: usize, keychain_ok: bool) -> Result<Profil
         permission_mode,
         allow_bypass,
         routine,
+        dynamic_routines,
     })
+}
+
+/// A profile's `dynamic_routines` section: absent is off, `{}` is on with the
+/// defaults, and each of the three keys is bounded.
+fn parse_dynamic_routines(
+    value: Option<&Value>,
+    at: &str,
+) -> Result<Option<DynamicRoutines>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let map = value
+        .as_object()
+        .ok_or_else(|| err(format!("{at}: dynamic_routines must be an object")))?;
+    only_keys(
+        map,
+        &["min_every_secs", "max_per_pane", "max_expires_secs"],
+        &format!("{at}: dynamic_routines"),
+    )?;
+    let number = |field: &str, min: u64, max: u64| -> Result<Option<u64>, ConfigError> {
+        let Some(value) = map.get(field) else {
+            return Ok(None);
+        };
+        let n = value.as_u64().ok_or_else(|| {
+            err(format!(
+                "{at}: dynamic_routines: {field} must be a whole number"
+            ))
+        })?;
+        if !(min..=max).contains(&n) {
+            return Err(err(format!(
+                "{at}: dynamic_routines: {field} must be between {min} and {max}"
+            )));
+        }
+        Ok(Some(n))
+    };
+    let defaults = DynamicRoutines::default();
+    Ok(Some(DynamicRoutines {
+        min_every_secs: number("min_every_secs", EVERY_MIN_SECS, EVERY_MAX_SECS)?
+            .unwrap_or(defaults.min_every_secs),
+        max_per_pane: number("max_per_pane", PER_PANE_MIN, PER_PANE_MAX)?
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(defaults.max_per_pane),
+        max_expires_secs: number(
+            "max_expires_secs",
+            CEILING_EXPIRES_MIN_SECS,
+            EXPIRES_MAX_SECS,
+        )?
+        .unwrap_or(defaults.max_expires_secs),
+    }))
 }
 
 /// A whole number of seconds from a `routine` field, when the field is set.
@@ -750,56 +838,6 @@ fn routine_count(
             .map(Some)
             .ok_or_else(|| err(format!("{at}: routine: {field} must be a whole number"))),
     }
-}
-
-/// Whether `text` is a bare answer to a prompt rather than an instruction:
-/// a single character (`y`, `n`, `1`, `a`), a word the supported agents'
-/// dialogs and common confirmations take as an answer (`yes`, `ok`, `enter`,
-/// `allow`, `always`, `deny`, `reject`, `bypass`, `trust`, ...), or a short
-/// number. Compared after trimming, lowercasing and dropping trailing
-/// punctuation. The nudge goes through the state/turn guard, so this is a
-/// second line of defence against an operator mistake, not the only one.
-fn is_bare_confirmation(text: &str) -> bool {
-    const ANSWERS: &[&str] = &[
-        "yes",
-        "no",
-        "ok",
-        "okay",
-        "yep",
-        "sure",
-        "enter",
-        "return",
-        "confirm",
-        "accept",
-        "approve",
-        "proceed",
-        "true",
-        "false",
-        "allow",
-        "allow once",
-        "always",
-        "always allow",
-        "deny",
-        "deny once",
-        "reject",
-        "bypass",
-        "bypass mode",
-        "trust",
-        "once",
-        "cancel",
-        "esc",
-        "escape",
-        "tab",
-        "space",
-    ];
-    let word = text
-        .trim()
-        .trim_end_matches(|c: char| c.is_ascii_punctuation())
-        .trim()
-        .to_lowercase();
-    word.chars().count() <= 1
-        || ANSWERS.contains(&word.as_str())
-        || (word.len() <= 2 && word.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn watchdog_alias_warning(at: &str) -> String {
@@ -1748,6 +1786,148 @@ mod tests {
                     .nudge_text,
                 good
             );
+        }
+    }
+
+    // ---- issue #98, PR2: the `dynamic_routines` ceiling ----
+
+    fn dynamic_policy(dir: &Path, section: Value) -> String {
+        json!({"profiles": [{"name": "kiro", "argv": ["kiro-cli", "chat"],
+            "cwds": [dir], "dynamic_routines": section}]})
+        .to_string()
+    }
+
+    #[test]
+    fn a_profile_without_dynamic_routines_is_off() {
+        let dir = TempDir::new("profiles-dynamic-absent");
+        let p = policy(
+            &json!({"profiles": [{"name": "kiro",
+            "argv": ["kiro-cli", "chat"], "cwds": [dir.path()]}]})
+            .to_string(),
+        );
+        assert_eq!(p.profile("kiro").unwrap().dynamic_routines, None);
+        assert!(!p.has_dynamic_routines());
+    }
+
+    #[test]
+    fn a_profiles_file_from_before_dynamic_routines_parses_exactly_as_it_did() {
+        // Golden: every key an existing file may use, none of the new one.
+        let dir = TempDir::new("profiles-dynamic-golden");
+        let text = json!({"profiles": [
+            {"name": "kiro", "argv": ["kiro-cli", "chat"], "extra_args": ["--x"],
+             "cwds": [dir.path()], "agent": "kiro", "env": {"A": "b"},
+             "routine": {"idle_timeout_secs": 120, "cooldown_secs": 45,
+                         "max_consecutive_nudges": 5, "todo_file": "notes/TODO.md",
+                         "nudge_text": "keep going"}},
+            {"name": "plain", "argv": ["kiro-cli"], "cwds": [dir.path()]},
+        ]})
+        .to_string();
+        let p = policy(&text);
+        let kiro = p.profile("kiro").unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            *kiro,
+            Profile {
+                name: "kiro".to_string(),
+                argv: vec!["kiro-cli".into(), "chat".into(), "--x".into()],
+                cwds: vec![canonical.clone()],
+                env: vec![("A".to_string(), EnvSource::Literal("b".to_string()))],
+                agent: Agent::Kiro,
+                permission_mode: kiro.permission_mode,
+                allow_bypass: false,
+                routine: Some(RoutineConfig {
+                    idle_timeout: Duration::from_secs(120),
+                    cooldown: Duration::from_secs(45),
+                    max_consecutive_nudges: 5,
+                    todo_file: Some(PathBuf::from("notes/TODO.md")),
+                    nudge_text: "keep going".to_string(),
+                }),
+                dynamic_routines: None,
+            }
+        );
+        assert_eq!(p.profile("plain").unwrap().dynamic_routines, None);
+        assert!(p.has_routine());
+        assert!(!p.has_dynamic_routines());
+        // What a caller sees of the policy does not change either.
+        assert_eq!(
+            p.to_json(),
+            json!({"profiles": [
+                {"name": "kiro", "cwds": [canonical.to_string_lossy()]},
+                {"name": "plain", "cwds": [canonical.to_string_lossy()]},
+            ], "allow_arbitrary_command": false})
+        );
+    }
+
+    #[test]
+    fn an_empty_dynamic_routines_section_turns_it_on_with_the_defaults() {
+        let dir = TempDir::new("profiles-dynamic-empty");
+        let p = policy(&dynamic_policy(dir.path(), json!({})));
+        assert_eq!(
+            p.profile("kiro").unwrap().dynamic_routines,
+            Some(DynamicRoutines {
+                min_every_secs: 600,
+                max_per_pane: 3,
+                max_expires_secs: 604_800,
+            })
+        );
+        assert!(p.has_dynamic_routines());
+        // It does not need a static routine.
+        assert!(!p.has_routine());
+    }
+
+    #[test]
+    fn dynamic_routines_parses_every_key() {
+        let dir = TempDir::new("profiles-dynamic-full");
+        let p = policy(&dynamic_policy(
+            dir.path(),
+            json!({"min_every_secs": 60, "max_per_pane": 10, "max_expires_secs": 3600}),
+        ));
+        assert_eq!(
+            p.profile("kiro").unwrap().dynamic_routines,
+            Some(DynamicRoutines {
+                min_every_secs: 60,
+                max_per_pane: 10,
+                max_expires_secs: 3600,
+            })
+        );
+        let top = policy(&dynamic_policy(
+            dir.path(),
+            json!({"min_every_secs": 604_800, "max_per_pane": 1, "max_expires_secs": 2_592_000}),
+        ));
+        let d = top
+            .profile("kiro")
+            .unwrap()
+            .dynamic_routines
+            .clone()
+            .unwrap();
+        assert_eq!(
+            (d.min_every_secs, d.max_per_pane, d.max_expires_secs),
+            (604_800, 1, 2_592_000)
+        );
+    }
+
+    #[test]
+    fn dynamic_routines_is_refused_when_wrong() {
+        let dir = TempDir::new("profiles-dynamic-refused");
+        let cases: Vec<Value> = vec![
+            json!("on"),
+            json!(true),
+            json!(null),
+            json!({"min_every_secs": 59}),
+            json!({"min_every_secs": 604_801}),
+            json!({"max_per_pane": 0}),
+            json!({"max_per_pane": 11}),
+            json!({"max_expires_secs": 3599}),
+            json!({"max_expires_secs": 2_592_001}),
+            json!({"min_every_secs": 1.5}),
+            json!({"max_per_pane": "3"}),
+            json!({"min_every_secs": -1}),
+            json!({"max_text_bytes": 100}),
+            json!({"bogus": 1}),
+        ];
+        for case in cases {
+            let message = refused(&dynamic_policy(dir.path(), case.clone()));
+            assert!(message.contains("dynamic_routines"), "{case}: {message}");
         }
     }
 }

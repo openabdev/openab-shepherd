@@ -127,6 +127,9 @@ struct PaneAgent {
     /// is a cancel (see [`wait_outcome`]). Cleared once wait_status reaches a
     /// final outcome, so a timeout or other intermediate result keeps it.
     answered: bool,
+    /// The launch profile that started the pane, when known. Routines an
+    /// agent creates are allowed by this profile's `dynamic_routines`.
+    profile: Option<String>,
 }
 
 impl Shepherd {
@@ -246,6 +249,7 @@ impl Shepherd {
                     agent,
                     pane_id: Some(pane.pane_id.clone()),
                     answered: pane.answered,
+                    profile: pane.profile.clone(),
                 },
             );
             let Some(state) = pane.routine.as_ref().filter(|_| pane.live) else {
@@ -306,22 +310,35 @@ impl Shepherd {
     /// Record that the pane `name` runs `agent`, as if a profile had started it.
     #[cfg(test)]
     pub fn assume_agent(&self, name: &str, agent: Agent) {
-        self.remember_agent(name, agent, None);
+        self.remember_agent(name, agent, None, None);
     }
 
     fn panes(&self) -> MutexGuard<'_, HashMap<String, PaneAgent>> {
         self.panes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn remember_agent(&self, name: &str, agent: Agent, pane_id: Option<String>) {
+    fn remember_agent(
+        &self,
+        name: &str,
+        agent: Agent,
+        pane_id: Option<String>,
+        profile: Option<String>,
+    ) {
         self.panes().insert(
             name.to_string(),
             PaneAgent {
                 agent,
                 pane_id,
                 answered: false,
+                profile,
             },
         );
+    }
+
+    /// The launch profile that started the pane `name`. None for a pane
+    /// this process did not start from a profile.
+    pub fn profile_of(&self, name: &str) -> Option<String> {
+        self.panes().get(name).and_then(|pane| pane.profile.clone())
     }
 
     /// The agent of a pane this process started from a profile. None for a
@@ -962,7 +979,7 @@ fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     if let Some(name) = info.name.as_deref() {
         match profile_agent {
             Some(agent) => {
-                sh.remember_agent(name, agent, Some(info.id.clone()));
+                sh.remember_agent(name, agent, Some(info.id.clone()), spec.profile.clone());
                 sh.registry_write(&info.id, "agent", |r| {
                     r.set_agent(
                         &info.id,
@@ -4389,7 +4406,7 @@ mod tests {
         );
         // And its agent record: dropping it would disable the Devin
         // mode-switch refusal for the new pane.
-        sh.remember_agent("work", Agent::Devin, Some("id-work-2".to_string()));
+        sh.remember_agent("work", Agent::Devin, Some("id-work-2".to_string()), None);
         proceed_tx.send(()).unwrap();
         remover.join().unwrap().unwrap();
         let map = sh.routine_map();
@@ -4668,6 +4685,13 @@ mod tests {
             }
             self.inner.set_routine(pane_id, routine)
         }
+        fn set_routines(
+            &self,
+            pane_id: &str,
+            routines: &crate::registry::RoutineSet,
+        ) -> Result<(), BackendError> {
+            self.inner.set_routines(pane_id, routines)
+        }
         fn forget(&self, pane_id: &str) -> Result<(), BackendError> {
             self.inner.forget(pane_id)
         }
@@ -4851,6 +4875,7 @@ mod tests {
             profile: Some("kiro".to_string()),
             answered: false,
             routine: Some(RoutineState::default()),
+            routines: Default::default(),
             live: true,
         });
         let sh = restarted(reg, &fake, routine_policy(dir.path(), RESTART_ROUTINE()));
@@ -4877,6 +4902,7 @@ mod tests {
                 profile: Some("kiro".to_string()),
                 answered: true,
                 routine,
+                routines: Default::default(),
                 live: true,
             });
             let sh = restarted(

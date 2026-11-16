@@ -52,6 +52,56 @@ pub fn validate_input(text: &str) -> Result<String, InputError> {
     Ok(trimmed.to_string())
 }
 
+/// Whether `text` is a bare answer to a prompt rather than an instruction:
+/// a single character (`y`, `n`, `1`, `a`), a word the supported agents'
+/// dialogs and common confirmations take as an answer (`yes`, `ok`, `enter`,
+/// `allow`, `always`, `deny`, `reject`, `bypass`, `trust`, ...), or a short
+/// number. Compared after trimming, lowercasing and dropping trailing
+/// punctuation. The nudge goes through the state/turn guard, so this is a
+/// second line of defence against an operator mistake, not the only one.
+pub fn is_bare_confirmation(text: &str) -> bool {
+    const ANSWERS: &[&str] = &[
+        "yes",
+        "no",
+        "ok",
+        "okay",
+        "yep",
+        "sure",
+        "enter",
+        "return",
+        "confirm",
+        "accept",
+        "approve",
+        "proceed",
+        "true",
+        "false",
+        "allow",
+        "allow once",
+        "always",
+        "always allow",
+        "deny",
+        "deny once",
+        "reject",
+        "bypass",
+        "bypass mode",
+        "trust",
+        "once",
+        "cancel",
+        "esc",
+        "escape",
+        "tab",
+        "space",
+    ];
+    let word = text
+        .trim()
+        .trim_end_matches(|c: char| c.is_ascii_punctuation())
+        .trim()
+        .to_lowercase();
+    word.chars().count() <= 1
+        || ANSWERS.contains(&word.as_str())
+        || (word.len() <= 2 && word.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Terminal names: the input rules, then 1-32 characters of a-z, 0-9, '-', '_', '.'.
 pub fn validate_name(text: &str) -> Result<String, InputError> {
     let cleaned = validate_input(text)?;
@@ -154,5 +204,15 @@ mod tests {
         assert!(validate_name(&"a".repeat(33)).is_err());
         assert!(validate_name(&"a".repeat(32)).is_ok());
         assert!(validate_name("   ").is_err());
+    }
+
+    #[test]
+    fn bare_confirmations_are_recognised() {
+        for bad in ["y", "Yes.", " OK! ", "1", "12", "Allow once", "", "/"] {
+            assert!(is_bare_confirmation(bad), "{bad:?}");
+        }
+        for good in ["continue", "yes, go on", "100", "check your todo list"] {
+            assert!(!is_bare_confirmation(good), "{good:?}");
+        }
     }
 }
