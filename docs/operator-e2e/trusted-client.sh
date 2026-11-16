@@ -269,6 +269,9 @@ t_screen_lacks() { ! t_screen_has "$1" "$2"; }
 # t_no_pane NAME : list_panes shows no pane of that name (a refused start leaves none).
 t_no_pane() { ! list_panes true 2>/dev/null | grep -q "\"name\": \"$1\""; }
 
+# t_has_pane NAME : list_panes shows a pane of that name (the control for t_no_pane).
+t_has_pane() { list_panes true 2>/dev/null | grep -q "\"name\": \"$1\""; }
+
 # t_list_json COUNT WIDTH : a JSON list of COUNT strings of WIDTH x characters, for a long argument.
 t_list_json() {
   python3 -c 'import json, sys
@@ -349,7 +352,9 @@ t_main() {
   r_check "orch: a profile that is not on its list is forbidden even with start:args" \
     test "$(t_error t_start orch rej other 'extra_args:=["-a"]')" = forbidden
   r_check "start:arbitrary does not stand in for start:args" \
-    test "$(t_error t_start trusted rej guard 'extra_args:=["-a"]')" = forbidden
+    test "$(t_error t_start trusted rej sandbox 'extra_args:=["-a"]')" = forbidden
+  r_check "...and the error names the scope start:args, not the profile list" \
+    test "$(t_start trusted rej sandbox 'extra_args:=["-a"]' 2>/dev/null | t_py 'd["scope"]')" = start:args
   r_check "extra_args null is the same as none: ops may start" \
     r_quiet t_start ops x2 sandbox 'extra_args:=null'
   r_check "extra_args [] is the same as none: ops may start" \
@@ -422,6 +427,8 @@ t_main() {
   r_check "an unknown agent is invalid_input" \
     test "$(t_error t_start_argv trusted rej "$argv" agent=emacs)" = invalid_input
   r_check "no refused start left a pane" t_no_pane rej
+  r_check "...and the check can see a pane that exists (control: x1 is listed)" \
+    t_has_pane x1
 
   # --- Step 6: the audit file ---------------------------------------------------------------
   # A canary in the values: a flag value, a short flag with its value attached, a long flag
@@ -440,9 +447,11 @@ t_main() {
     t_audit_wait 'any(r["client"] == "ops" and r["tool"] == "start_pane" and r["phase"] == "denied" for r in records)'
   r_check "audit: a plain profile start has no launch field" \
     t_audit_wait 'any(r["client"] == "ops" and r["tool"] == "start_pane" and r["phase"] == "call" and r.get("pane") == "x2" and "launch" not in r for r in records)'
+  # Absence checks hold over a window (the positive checks above already waited for the lines).
   r_check "audit: no argument value is in the file (canary, model name, script text)" \
-    t_audit_wait '"CANARY" not in raw and "claude-sonnet-4" not in raw and "dialog.txt" not in raw and "printf" not in raw'
-  r_check "audit: the typed text is not in the file" t_audit_wait '"hello" not in raw'
+    t_stays "$T_WINDOW" t_audit_check '"CANARY" not in raw and "claude-sonnet-4" not in raw and "dialog.txt" not in raw and "printf" not in raw'
+  r_check "audit: the typed text is not in the file" \
+    t_stays "$T_WINDOW" t_audit_check '"hello" not in raw'
 
   r_finish
 }
