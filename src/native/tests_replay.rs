@@ -2122,6 +2122,19 @@ mod tools_layer {
         LaunchPolicy::from_json(&json!({"profiles": [profile]}).to_string()).unwrap()
     }
 
+    /// [`policy`] for a profile that allows agent-created routines, as the
+    /// ones planted in a pane's record need (issue #98): the adoption rule
+    /// stops a stored routine the current profile does not allow.
+    fn policy_with_dynamic_routines(dir: &TempDir, script: &str) -> LaunchPolicy {
+        let profile = json!({
+            "name": "kiro",
+            "argv": ["/bin/sh", "-c", script],
+            "cwds": [dir.path()],
+            "dynamic_routines": {},
+        });
+        LaunchPolicy::from_json(&json!({"profiles": [profile]}).to_string()).unwrap()
+    }
+
     /// The tools over the split's current front, with the front as registry.
     fn tools(s: &Split, policy: LaunchPolicy) -> Shepherd {
         let b = s.b().clone();
@@ -2408,7 +2421,7 @@ mod tools_layer {
     fn routines_and_the_profile_come_back_after_a_front_restart() {
         let mut s = Split::new(1 << 20);
         let dir = TempDir::new("pr98-routines-restart");
-        let sh = tools(&s, policy(&dir, "sleep 30", None));
+        let sh = tools(&s, policy_with_dynamic_routines(&dir, "sleep 30"));
         start(&sh, "w");
         assert_eq!(sh.profile_of("w").as_deref(), Some("kiro"));
         let info = s.b().get(&TerminalRef::new("w")).unwrap();
@@ -2419,7 +2432,7 @@ mod tools_layer {
         PaneRegistry::set_routines(s.b(), &info.id, &set).unwrap();
         assert_eq!(load(&*s.host, &info.id).unwrap().routines, set);
 
-        let sh = restart(&mut s, sh, policy(&dir, "sleep 30", None));
+        let sh = restart(&mut s, sh, policy_with_dynamic_routines(&dir, "sleep 30"));
         let registered = PaneRegistry::registered(s.b());
         assert_eq!(registered.len(), 1);
         assert_eq!(registered[0].routines, set);

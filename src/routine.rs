@@ -277,6 +277,28 @@ pub enum WatchEvent {
     GaveUp,
 }
 
+/// The status state that is `agent`'s finished turn.
+pub fn finished_state_of(agent: Agent) -> State {
+    match agent {
+        Agent::OpenCode => State::Idle,
+        Agent::Kiro | Agent::Devin => State::Done,
+    }
+}
+
+/// Whether this reading of a pane is `agent`'s finished turn. Most agents
+/// report `done`; OpenCode reports no done, so an `idle` after at least one
+/// turn is its finished turn (the same rule `wait_status` applies). Shared
+/// by the idle routine and the `every` scheduler.
+pub fn turn_finished(agent: Agent, info: &TerminalInfo) -> bool {
+    let Some(status) = info.status.as_ref() else {
+        return false;
+    };
+    match agent {
+        Agent::OpenCode => status.state == State::Idle && info.turn.is_some_and(|turn| turn > 0),
+        Agent::Kiro | Agent::Devin => status.state == State::Done,
+    }
+}
+
 /// One pane's routine state: its profile's configuration, where it runs,
 /// and what the routine has seen and done so far.
 #[derive(Debug)]
@@ -437,25 +459,14 @@ impl PaneWatch {
     /// The status state that is this watch's agent's finished turn, for
     /// conditioning a nudge send on the state that was observed.
     pub fn finished_state(&self) -> State {
-        match self.agent {
-            Agent::OpenCode => State::Idle,
-            Agent::Kiro | Agent::Devin => State::Done,
-        }
+        finished_state_of(self.agent)
     }
 
     /// Whether this reading of the pane is a finished turn. Most agents
     /// report `done`; OpenCode reports no done, so an `idle` after at least
     /// one turn is its finished turn (the same rule `wait_status` applies).
     fn turn_finished(&self, info: &TerminalInfo) -> bool {
-        let Some(status) = info.status.as_ref() else {
-            return false;
-        };
-        match self.agent {
-            Agent::OpenCode => {
-                status.state == State::Idle && info.turn.is_some_and(|turn| turn > 0)
-            }
-            Agent::Kiro | Agent::Devin => status.state == State::Done,
-        }
+        turn_finished(self.agent, info)
     }
 
     /// Observe the pane once. `todo` is the todo file's state at this
@@ -541,6 +552,16 @@ impl PaneWatch {
         self.nudge_allowance = NUDGE_TURN_ALLOWANCE;
         self.replayed_noted = false;
         self.held_noted = false;
+    }
+
+    /// Record that a nudge of another trigger (an `every` routine) went
+    /// into the pane at `now`. The turns it causes are its doing, not
+    /// progress, so they must not clear this watch's cap or a give-up; the
+    /// cooldown spaces after it too. Nothing is counted toward the cap: the
+    /// cap is the idle trigger's own.
+    pub fn note_foreign_nudge(&mut self, now: Instant) {
+        self.last_nudge = Some(now);
+        self.nudge_allowance = NUDGE_TURN_ALLOWANCE;
     }
 
     /// Record that a nudge was refused or failed at `now`. A failed attempt

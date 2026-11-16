@@ -29,12 +29,14 @@ use crate::input::{validate_input, validate_name};
 use crate::opencode_dialog;
 use crate::panelock::{PaneGuard, PaneLocks};
 use crate::profiles::{CwdError, LaunchPolicy, RoutineConfig};
-use crate::registry::{PaneRegistry, RoutineState};
+use crate::registry::{PaneRegistry, RegisteredPane, RoutineSet, RoutineState};
 use crate::routine::{self, PaneWatch, Todo, WatchEvent};
+use crate::routine_model::Routine;
+use crate::schedule::{self, CreateError, NewEvery, Note, PaneSchedule, Verdict};
 use crate::shared_panes::SharedPanes;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -96,6 +98,10 @@ pub struct Shepherd {
     policy: Arc<LaunchPolicy>,
     panes: Arc<Mutex<HashMap<String, PaneAgent>>>,
     routine: Arc<Mutex<HashMap<String, PaneWatch>>>,
+    /// The `every` routines an agent created (issue #98), by pane name.
+    schedules: Arc<Mutex<HashMap<String, PaneSchedule>>>,
+    /// Unix time for the `every` routines: due times and expiry.
+    wall: audit::Clock,
     /// How long the routine waits for a pane's lock before it skips the
     /// pane for this tick (see [`routine::LOCK_WAIT`]); tests shorten it.
     routine_lock_wait: Duration,
@@ -147,6 +153,8 @@ impl Shepherd {
             policy: Arc::new(policy),
             panes: Arc::new(Mutex::new(HashMap::new())),
             routine: Arc::new(Mutex::new(HashMap::new())),
+            schedules: Arc::new(Mutex::new(HashMap::new())),
+            wall: audit::system_clock(),
             routine_lock_wait: routine::LOCK_WAIT,
             audit: None,
             registry: None,
@@ -170,6 +178,16 @@ impl Shepherd {
     pub fn with_registry(mut self, registry: Arc<dyn PaneRegistry>) -> Self {
         self.registry = Some(registry);
         self
+    }
+
+    /// Read the wall clock of the `every` routines from `clock` (tests).
+    pub fn with_wall_clock(mut self, clock: audit::Clock) -> Self {
+        self.wall = clock;
+        self
+    }
+
+    fn wall_secs(&self) -> u64 {
+        (self.wall)().as_secs()
     }
 
     /// Run a registry write. A failure is logged and the call goes on: the
@@ -200,6 +218,10 @@ impl Shepherd {
         self.registry_write(pane_id, "routine state", |r| {
             r.set_routine(pane_id, Some(state))
         })
+    }
+
+    fn persist_routines(&self, pane_id: &str, set: &RoutineSet) -> bool {
+        self.registry_write(pane_id, "routines", |r| r.set_routines(pane_id, set))
     }
 
     /// Rebuild what this process knew about its panes from the registry:
@@ -252,6 +274,7 @@ impl Shepherd {
                     profile: pane.profile.clone(),
                 },
             );
+            self.adopt_schedule(name, &pane, agent);
             let Some(state) = pane.routine.as_ref().filter(|_| pane.live) else {
                 self.forget_routine(name);
                 continue;
@@ -288,6 +311,47 @@ impl Shepherd {
                 ),
             );
         }
+    }
+
+    /// Rebuild the `every` routines of a live pane from its record. The
+    /// ceiling is the current profile's: a routine it no longer allows is
+    /// stopped with the reason `profile_changed` (kept, so the agent sees
+    /// it), never typed again. A profile that is gone restores nothing.
+    fn adopt_schedule(&self, name: &str, pane: &RegisteredPane, agent: Agent) {
+        self.forget_schedule(name);
+        if !pane.live {
+            return;
+        }
+        let Some(profile) = pane.profile.as_deref().and_then(|p| self.policy.profile(p)) else {
+            if !pane.routines.is_empty() {
+                eprintln!(
+                    "openab-shepherd: routine: pane {name}: its profile is gone, so its \
+                     agent-created routines are not restored"
+                );
+            }
+            return;
+        };
+        let ceiling = profile.dynamic_routines.as_ref();
+        if ceiling.is_none() && pane.routines.is_empty() {
+            return;
+        }
+        let cwd = (!pane.cwd.is_empty()).then(|| Path::new(&pane.cwd));
+        let (mut schedule, notes) =
+            PaneSchedule::restored(pane.pane_id.clone(), agent, cwd, &pane.routines);
+        for note in &notes {
+            eprintln!("openab-shepherd: routine: pane {name}: {note}");
+        }
+        let stopped = schedule.apply_ceiling(ceiling);
+        for (id, why) in &stopped {
+            eprintln!(
+                "openab-shepherd: routine: pane {name}: routine {id} stopped (profile_changed): \
+                 {why}; it is kept but never typed again"
+            );
+        }
+        if !stopped.is_empty() || !notes.is_empty() {
+            self.persist_routines(&pane.pane_id, &schedule.to_set());
+        }
+        self.register_schedule(name, schedule);
     }
 
     /// Record calls to `audit`. Set before the routine starts, so its
@@ -401,6 +465,92 @@ impl Shepherd {
         self.routine.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn schedules(&self) -> MutexGuard<'_, HashMap<String, PaneSchedule>> {
+        self.schedules
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn register_schedule(&self, name: &str, schedule: PaneSchedule) {
+        self.schedules().insert(name.to_string(), schedule);
+    }
+
+    fn forget_schedule(&self, name: &str) {
+        self.schedules().remove(name);
+    }
+
+    /// Forget the schedule for `name` only when it is still pane
+    /// `pane_id`'s (see [`Shepherd::forget_routine_if`]).
+    fn forget_schedule_if(&self, name: &str, pane_id: &str) {
+        let mut map = self.schedules();
+        if map.get(name).is_some_and(|s| s.pane_id() == pane_id) {
+            map.remove(name);
+        }
+    }
+
+    /// Run `change` on the schedule of `name` when it is still pane
+    /// `pane_id`'s. The registry write belongs inside `change`, under the
+    /// lock, so a later write never carries an older snapshot.
+    fn with_schedule<R>(
+        &self,
+        name: &str,
+        pane_id: &str,
+        change: impl FnOnce(&mut PaneSchedule) -> R,
+    ) -> Option<R> {
+        let mut map = self.schedules();
+        map.get_mut(name)
+            .filter(|s| s.pane_id() == pane_id)
+            .map(change)
+    }
+
+    fn keep_schedule(&self, schedule: &PaneSchedule) -> bool {
+        self.persist_routines(schedule.pane_id(), &schedule.to_set())
+    }
+
+    /// The `every` routines on pane `name`, newest state. Empty for a pane
+    /// that has none or does not allow them.
+    pub fn routines_of(&self, name: &str) -> Vec<Routine> {
+        self.schedules()
+            .get(name)
+            .map(|s| s.routines().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Create an `every` routine on pane `name` under its profile's
+    /// `dynamic_routines` ceiling. The routine is kept in the registry first;
+    /// when that write fails nothing changes (an acknowledged routine that
+    /// would vanish at the next restart is the worst failure here). No tool
+    /// calls this yet.
+    pub fn create_every(&self, name: &str, request: NewEvery) -> Result<Routine, CreateError> {
+        let ceiling = self
+            .profile_of(name)
+            .and_then(|p| {
+                self.policy
+                    .profile(&p)
+                    .and_then(|p| p.dynamic_routines.clone())
+            })
+            .ok_or(CreateError::NotAllowed)?;
+        let wall = self.wall_secs();
+        let mut map = self.schedules();
+        let schedule = map.get_mut(name).ok_or(CreateError::NotAllowed)?;
+        let (routines, seq, routine) = schedule.plan_create(&request, &ceiling, wall)?;
+        if let Some(registry) = &self.registry {
+            let planned = RoutineSet {
+                seq,
+                items: routines.iter().filter_map(Routine::to_record).collect(),
+            };
+            registry
+                .set_routines(schedule.pane_id(), &planned)
+                .map_err(|err| CreateError::NotSaved(err.detail))?;
+        }
+        schedule.commit(routines, seq);
+        eprintln!(
+            "openab-shepherd: routine: pane {name}: routine {} created by {}",
+            routine.id, routine.created_by
+        );
+        Ok(routine)
+    }
+
     fn register_routine(
         &self,
         name: &str,
@@ -433,11 +583,12 @@ impl Shepherd {
     }
 
     /// Start the routine thread (see `routine`), when any launch profile
-    /// sets a routine. With none there is no thread and nothing to watch.
+    /// sets a routine or allows agent-created ones. With none there is no
+    /// thread and nothing to watch.
     /// The binary calls this once at startup; tests drive
     /// [`Shepherd::routine_tick_at`] with a fixed clock instead.
     pub fn spawn_routine(&self) {
-        if !self.policy.has_routine() {
+        if !self.policy.has_routine() && !self.policy.has_dynamic_routines() {
             return;
         }
         let sh = self.clone();
@@ -459,6 +610,13 @@ impl Shepherd {
         self.routine_tick_with(&|| now);
     }
 
+    /// [`Shepherd::routine_tick_at`] with the `every` routines' clock fixed
+    /// at `wall` (unix seconds) too.
+    #[cfg(test)]
+    pub(crate) fn routine_tick_at_wall(&self, now: Instant, wall: u64) {
+        self.routine_tick_full(&|| now, &|| wall);
+    }
+
     /// One routine pass: read every watched pane once and act on what its
     /// observation decided. A pane that no longer resolves is forgotten.
     ///
@@ -469,6 +627,28 @@ impl Shepherd {
     /// record nudges earlier than they happened, cutting the cooldown
     /// short.
     pub(crate) fn routine_tick_with(&self, clock: &dyn Fn() -> Instant) {
+        self.routine_tick_full(clock, &|| self.wall_secs());
+    }
+
+    /// One pass of both engines: the idle routine on `clock` (monotonic),
+    /// then the `every` routines on `wall` (unix seconds).
+    pub(crate) fn routine_tick_full(&self, clock: &dyn Fn() -> Instant, wall: &dyn Fn() -> u64) {
+        self.idle_tick(clock);
+        let names: Vec<String> = self.schedules().keys().cloned().collect();
+        for name in names {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.schedule_check(&name, clock, wall);
+            }));
+            if result.is_err() {
+                eprintln!(
+                    "openab-shepherd: routine: pane {name}: the schedule check panicked; \
+                     skipping this pane for this tick"
+                );
+            }
+        }
+    }
+
+    fn idle_tick(&self, clock: &dyn Fn() -> Instant) {
         let names: Vec<String> = self.routine_map().keys().cloned().collect();
         for name in names {
             // One pane's panic must not end the routine thread (or the
@@ -730,6 +910,277 @@ impl Shepherd {
             }
         }
     }
+
+    /// One pass over the `every` routines of pane `name` (issue #98). The
+    /// cheap checks run first and read no pane: expiry, `max_runs`, a tick
+    /// not yet due, a tick missed by more than an interval. Only a due
+    /// routine reads the pane.
+    fn schedule_check(&self, name: &str, clock: &dyn Fn() -> Instant, wall: &dyn Fn() -> u64) {
+        let (pane_id, agent, due) = {
+            let mut map = self.schedules();
+            let Some(schedule) = map.get_mut(name) else {
+                return;
+            };
+            let now = wall();
+            let mut changed = false;
+            let mut due = Vec::new();
+            for routine in schedule.routines_mut() {
+                match schedule::assess(routine, now) {
+                    Verdict::NotYet => {}
+                    Verdict::Changed(note) => {
+                        changed = true;
+                        log_schedule_note(name, &routine.id, note);
+                    }
+                    Verdict::Due => due.push(routine.id.clone()),
+                }
+            }
+            if changed {
+                self.keep_schedule(schedule);
+            }
+            (schedule.pane_id().to_string(), schedule.agent(), due)
+        };
+        if due.is_empty() {
+            return;
+        }
+        let info = match resolve(self, name) {
+            Ok(info) => info,
+            Err(err) => {
+                if err.data["error"] == "not_found" {
+                    self.forget_schedule_if(name, &pane_id);
+                }
+                // Anything else is a read that failed: the routine stays due
+                // and the next pass tries again.
+                return;
+            }
+        };
+        if info.id != pane_id {
+            return;
+        }
+        if !info.live {
+            self.forget_schedule_if(name, &pane_id);
+            return;
+        }
+        let mut sent = false;
+        for id in due {
+            sent |= self.fire_every(name, &pane_id, agent, &id, &info, sent, clock, wall);
+        }
+    }
+
+    /// Decide and act on one due routine. True when its text went in.
+    ///
+    /// A skip (working, blocked, a person, nothing left on the todo list, a
+    /// replayed pane) consumes the tick: `next_due` moves to the next grid
+    /// time and nothing is queued. The next grid time is kept before the
+    /// text is typed, and a send is never tried when it cannot be kept: a
+    /// crash then loses one tick and can never fire it twice. `pane_busy`
+    /// is not a decision and consumes nothing: the next pass retries.
+    #[allow(clippy::too_many_arguments)]
+    fn fire_every(
+        &self,
+        name: &str,
+        pane_id: &str,
+        agent: Agent,
+        id: &str,
+        info: &TerminalInfo,
+        sent_this_pass: bool,
+        clock: &dyn Fn() -> Instant,
+        wall: &dyn Fn() -> u64,
+    ) -> bool {
+        let snapshot = self.with_schedule(name, pane_id, |schedule| {
+            schedule
+                .routines()
+                .iter()
+                .find(|r| r.id == id && r.status.is_active())
+                .map(|r| {
+                    let crate::routine_model::Action::Type { text } = &r.action;
+                    (
+                        text.clone(),
+                        r.todo_file.clone(),
+                        r.created_by.clone(),
+                        schedule.work_dir(),
+                    )
+                })
+        });
+        let Some(Some((text, todo_file, created_by, work_dir))) = snapshot else {
+            return false;
+        };
+        let blocked = info
+            .status
+            .as_ref()
+            .is_some_and(|status| status.state == State::Blocked);
+        let held = || {
+            self.shared.as_ref().is_some_and(|shared| {
+                shared
+                    .human_state(&info.reference())
+                    .is_ok_and(|state| state.is_held())
+            })
+        };
+        let skip = if blocked {
+            Some("blocked")
+        } else if sent_this_pass || !routine::turn_finished(agent, info) {
+            Some("working")
+        } else if held() {
+            Some("person")
+        } else if todo_file.as_deref().is_some_and(|rel| {
+            let todo = work_dir.as_ref().map_or(Todo::Unreadable, |dir| {
+                routine::read_todo_in(dir, Path::new(rel))
+            });
+            matches!(todo, Todo::Finished | Todo::Unreadable)
+        }) {
+            Some("todo_done")
+        } else {
+            None
+        };
+        if let Some(reason) = skip {
+            self.consume_tick(name, pane_id, id, wall, reason);
+            return false;
+        }
+        // Keep the next grid time first; a failed write means no send.
+        let begun = self.with_schedule(name, pane_id, |schedule| {
+            let Some(routine) = schedule.get_mut(id) else {
+                return Err(());
+            };
+            let previous = schedule::advance(routine, wall());
+            if self.keep_schedule(schedule) {
+                Ok(previous)
+            } else {
+                if let Some(routine) = schedule.get_mut(id) {
+                    schedule::restore_due(routine, previous);
+                }
+                Err(())
+            }
+        });
+        let Some(Ok(previous)) = begun else {
+            eprintln!(
+                "openab-shepherd: routine: pane {name}: routine {id} not sent: its next \
+                 time could not be kept"
+            );
+            return false;
+        };
+        let guard = InputGuard {
+            refuse_when_blocked: true,
+            if_state: Some(routine::finished_state_of(agent)),
+            expect_turn: info.turn,
+            ..InputGuard::default()
+        };
+        let result = send_text_within(
+            self,
+            name,
+            &text,
+            Some(guard),
+            Some(pane_id),
+            Some(self.routine_lock_wait),
+            Some(RoutineAudit {
+                routine: id,
+                created_by: &created_by,
+            }),
+        );
+        let code = |err: &ToolError| err.data["error"].as_str().unwrap_or("error").to_string();
+        match result {
+            Ok(_) => {
+                let at = wall();
+                let runs = self.with_schedule(name, pane_id, |schedule| {
+                    let runs = schedule.get_mut(id).map(|routine| {
+                        schedule::record_sent(routine, at);
+                        routine.runs
+                    });
+                    self.keep_schedule(schedule);
+                    runs
+                });
+                // The idle routine's watch must not take the turns this text
+                // causes for the agent's own progress.
+                let sent_at = clock();
+                self.settle_routine(name, pane_id, |watch| watch.note_foreign_nudge(sent_at));
+                eprintln!(
+                    "openab-shepherd: routine nudge: pane {name} (routine {id}, run {})",
+                    runs.flatten().unwrap_or(0)
+                );
+                true
+            }
+            Err(err) if code(&err) == "pane_busy" => {
+                self.with_schedule(name, pane_id, |schedule| {
+                    if let Some(routine) = schedule.get_mut(id) {
+                        schedule::restore_due(routine, previous);
+                    }
+                });
+                false
+            }
+            Err(err) if code(&err) == "pane_replayed" => {
+                self.record_skip_after_advance(name, pane_id, id, "replayed");
+                false
+            }
+            Err(err)
+                if code(&err) == "pane_human_controlled" || code(&err) == "pane_draft_pending" =>
+            {
+                self.record_skip_after_advance(name, pane_id, id, "person");
+                false
+            }
+            Err(err) => {
+                let pasted = err.data["backend_detail"]
+                    .as_str()
+                    .is_some_and(crate::backend::is_pasted_unsubmitted);
+                let failed = code(&err);
+                let gave_up = self
+                    .with_schedule(name, pane_id, |schedule| {
+                        let gave_up = schedule.get_mut(id).is_some_and(|routine| {
+                            if pasted {
+                                schedule::record_give_up(routine, &failed, &err.text);
+                                true
+                            } else {
+                                schedule::record_failure(routine, &failed, &err.text)
+                            }
+                        });
+                        self.keep_schedule(schedule);
+                        gave_up
+                    })
+                    .unwrap_or(false);
+                if gave_up {
+                    eprintln!(
+                        "openab-shepherd: routine gave up: pane {name}: routine {id}: {}",
+                        err.text
+                    );
+                } else {
+                    eprintln!(
+                        "openab-shepherd: routine: pane {name}: routine {id} was not sent: {}",
+                        err.text
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    /// A skipped tick: move to the next grid time, note why, keep both.
+    fn consume_tick(&self, name: &str, pane_id: &str, id: &str, wall: &dyn Fn() -> u64, why: &str) {
+        self.with_schedule(name, pane_id, |schedule| {
+            if let Some(routine) = schedule.get_mut(id) {
+                schedule::advance(routine, wall());
+                schedule::record_skip(routine, why);
+            }
+            self.keep_schedule(schedule);
+        });
+    }
+
+    /// The tick was already consumed (and kept) before the send; note why
+    /// the send did not go and keep that.
+    fn record_skip_after_advance(&self, name: &str, pane_id: &str, id: &str, why: &str) {
+        self.with_schedule(name, pane_id, |schedule| {
+            if let Some(routine) = schedule.get_mut(id) {
+                schedule::record_skip(routine, why);
+            }
+            self.keep_schedule(schedule);
+        });
+    }
+}
+
+fn log_schedule_note(name: &str, id: &str, note: Note) {
+    let what = match note {
+        Note::Expired => "expired",
+        Note::Done => "is done (max_runs reached)",
+        Note::Missed => "missed a tick; skipped it and kept the grid",
+        Note::Clamped => "had a next time too far ahead (the clock went back); clamped it",
+    };
+    eprintln!("openab-shepherd: routine: pane {name}: routine {id} {what}");
 }
 
 /// A tool failure: the text shown to the MCP client, and structured data
@@ -1013,6 +1464,21 @@ fn start_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
                 sh.forget_routine(name);
             }
             _ => sh.forget_routine(name),
+        }
+        // The `every` scheduler watches only a pane whose profile allows
+        // agent-created routines; any other start under this name drops an
+        // earlier schedule.
+        sh.forget_schedule(name);
+        let allows_dynamic = spec
+            .profile
+            .as_deref()
+            .and_then(|p| sh.policy.profile(p))
+            .is_some_and(|p| p.dynamic_routines.is_some());
+        if let (true, Some(agent)) = (allows_dynamic, profile_agent) {
+            sh.register_schedule(
+                name,
+                PaneSchedule::new(info.id.clone(), agent, spec.cwd.as_deref().map(Path::new)),
+            );
         }
     }
     Ok(info.to_json())
@@ -1732,6 +2198,7 @@ fn remove_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     // mode-switch refusal for it.
     sh.forget_agent_if(&terminal, pane.as_str());
     sh.forget_routine_if(&terminal, pane.as_str());
+    sh.forget_schedule_if(&terminal, pane.as_str());
     sh.registry_write(pane.as_str(), "removal", |r| r.forget(pane.as_str()));
     Ok(json!({
         "name": terminal,
@@ -2555,6 +3022,9 @@ fn optional_number(args: &Args, key: &str, min: f64, max: f64) -> Result<Option<
         }
     }
 }
+
+#[cfg(test)]
+mod every_tests;
 
 #[cfg(test)]
 mod tests {
