@@ -554,6 +554,47 @@ impl PaneWatch {
         self.held_noted = false;
     }
 
+    /// The profile's idle routine as `routine_list` shows it: read-only, with
+    /// the live counters of this front. `last_result` is `sent` once a nudge
+    /// went out since this front started (a failed nudge counts too: the
+    /// cap does) or `gave_up`; `next_due_in_secs` is the idle time still to
+    /// run on the finished turn being timed, `null` while none is.
+    pub fn view(&self, now: Instant) -> serde_json::Value {
+        let remaining = self
+            .idle_for(now)
+            .filter(|_| !self.gave_up)
+            .map(|idle| self.config.idle_timeout.saturating_sub(idle).as_secs());
+        let last_result = if self.gave_up {
+            Some("gave_up")
+        } else {
+            self.last_nudge.map(|_| "sent")
+        };
+        serde_json::json!({
+            "id": "profile",
+            "source": "profile",
+            "trigger": {
+                "type": "idle",
+                "idle_secs": self.config.idle_timeout.as_secs(),
+                "cooldown_secs": self.config.cooldown.as_secs(),
+                "max_consecutive": self.config.max_consecutive_nudges,
+            },
+            "action": {"type": "text", "text": self.config.nudge_text},
+            "todo_file": self.config.todo_file.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "created_by": "profile",
+            "created_at": null,
+            "expires_at": null,
+            "max_runs": null,
+            "runs": self.consecutive,
+            "status": if self.gave_up { "gave_up" } else { "active" },
+            "stop_reason": null,
+            "last_run_at": null,
+            "last_result": last_result,
+            "next_due_at": null,
+            "next_due_in_secs": remaining,
+            "expires_in_secs": null,
+        })
+    }
+
     /// Record that a nudge of another trigger (an `every` routine) went
     /// into the pane at `now`. The turns it causes are its doing, not
     /// progress, so they must not clear this watch's cap or a give-up; the

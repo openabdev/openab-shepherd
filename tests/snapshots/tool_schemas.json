@@ -126,6 +126,145 @@
     {
       "inputSchema": {
         "properties": {
+          "expires_secs": {
+            "description": "Seconds until the routine expires; default and maximum come from the profile (default 7 days).",
+            "maximum": 2592000,
+            "minimum": 60,
+            "type": "integer"
+          },
+          "max_runs": {
+            "description": "Stop after this many sends.",
+            "maximum": 10000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "terminal": {
+            "description": "Pane name, as start_pane or list_panes returned it.",
+            "type": "string"
+          },
+          "text": {
+            "description": "The line to type; at most 1024 bytes; not a bare yes, no, ok or number.",
+            "type": "string"
+          },
+          "todo_file": {
+            "description": "Relative path of a todo file in the pane's working directory; the line is typed only while it has an unchecked item.",
+            "type": "string"
+          },
+          "trigger": {
+            "description": "When to type. Only an every trigger exists.",
+            "properties": {
+              "every_secs": {
+                "description": "Seconds between lines; the profile may set a higher minimum (default 600).",
+                "maximum": 604800,
+                "minimum": 60,
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "every"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "every_secs"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "terminal",
+          "trigger",
+          "text"
+        ],
+        "type": "object"
+      },
+      "name": "routine_create"
+    },
+    {
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "description": "Routine id, as routine_create or routine_list showed it.",
+            "type": "string"
+          },
+          "terminal": {
+            "description": "Pane name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal",
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "routine_delete"
+    },
+    {
+      "inputSchema": {
+        "properties": {
+          "terminal": {
+            "description": "Pane name. Omit to list every pane that has routines.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "routine_list"
+    },
+    {
+      "inputSchema": {
+        "properties": {
+          "every_secs": {
+            "maximum": 604800,
+            "minimum": 60,
+            "type": "integer"
+          },
+          "expires_secs": {
+            "maximum": 2592000,
+            "minimum": 60,
+            "type": "integer"
+          },
+          "id": {
+            "description": "Routine id, as routine_create or routine_list showed it.",
+            "type": "string"
+          },
+          "max_runs": {
+            "maximum": 10000,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "terminal": {
+            "description": "Pane name.",
+            "type": "string"
+          },
+          "text": {
+            "description": "At most 1024 bytes; not a bare yes, no, ok or number.",
+            "type": "string"
+          },
+          "todo_file": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "terminal",
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "routine_update"
+    },
+    {
+      "inputSchema": {
+        "properties": {
           "terminal": {
             "description": "Pane name, as start_pane or list_panes returned it.",
             "type": "string"

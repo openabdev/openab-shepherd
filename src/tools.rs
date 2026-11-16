@@ -28,11 +28,13 @@ use crate::dialog::Choice;
 use crate::input::{validate_input, validate_name};
 use crate::opencode_dialog;
 use crate::panelock::{PaneGuard, PaneLocks};
-use crate::profiles::{CwdError, LaunchPolicy, RoutineConfig};
+use crate::profiles::{CwdError, DynamicRoutines, LaunchPolicy, RoutineConfig};
 use crate::registry::{PaneRegistry, RegisteredPane, RoutineSet, RoutineState};
 use crate::routine::{self, PaneWatch, Todo, WatchEvent};
-use crate::routine_model::Routine;
-use crate::schedule::{self, CreateError, NewEvery, Note, PaneSchedule, Verdict};
+use crate::routine_model::{Invalid, Routine, Trigger};
+use crate::schedule::{
+    self, CreateError, EveryUpdate, NewEvery, Note, PaneSchedule, UpdateError, Verdict,
+};
 use crate::shared_panes::SharedPanes;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -41,7 +43,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const TOOL_NAMES: [&str; 10] = [
+pub const TOOL_NAMES: [&str; 14] = [
     "start_pane",
     "send_input",
     "read_output",
@@ -52,6 +54,10 @@ pub const TOOL_NAMES: [&str; 10] = [
     "answer_dialog",
     "remove_pane",
     "draft_clear",
+    "routine_create",
+    "routine_list",
+    "routine_update",
+    "routine_delete",
 ];
 pub const READ_MAX_LINES: u64 = 10_000;
 pub const WAIT_MIN_SECONDS: f64 = 1.0;
@@ -471,7 +477,7 @@ impl Shepherd {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn register_schedule(&self, name: &str, schedule: PaneSchedule) {
+    pub(crate) fn register_schedule(&self, name: &str, schedule: PaneSchedule) {
         self.schedules().insert(name.to_string(), schedule);
     }
 
@@ -516,23 +522,39 @@ impl Shepherd {
             .unwrap_or_default()
     }
 
+    /// The `dynamic_routines` ceiling of pane `name`'s profile, when it has
+    /// one.
+    pub fn ceiling_of(&self, name: &str) -> Option<DynamicRoutines> {
+        self.profile_of(name).and_then(|p| {
+            self.policy
+                .profile(&p)
+                .and_then(|p| p.dynamic_routines.clone())
+        })
+    }
+
     /// Create an `every` routine on pane `name` under its profile's
     /// `dynamic_routines` ceiling. The routine is kept in the registry first;
     /// when that write fails nothing changes (an acknowledged routine that
-    /// would vanish at the next restart is the worst failure here). No tool
-    /// calls this yet.
+    /// would vanish at the next restart is the worst failure here).
     pub fn create_every(&self, name: &str, request: NewEvery) -> Result<Routine, CreateError> {
-        let ceiling = self
-            .profile_of(name)
-            .and_then(|p| {
-                self.policy
-                    .profile(&p)
-                    .and_then(|p| p.dynamic_routines.clone())
-            })
-            .ok_or(CreateError::NotAllowed)?;
+        self.create_every_on(name, None, request)
+    }
+
+    /// [`Shepherd::create_every`], refusing a schedule that belongs to a
+    /// pane other than `pane_id` (a name reused since the caller looked).
+    pub fn create_every_on(
+        &self,
+        name: &str,
+        pane_id: Option<&str>,
+        request: NewEvery,
+    ) -> Result<Routine, CreateError> {
+        let ceiling = self.ceiling_of(name).ok_or(CreateError::NotAllowed)?;
         let wall = self.wall_secs();
         let mut map = self.schedules();
-        let schedule = map.get_mut(name).ok_or(CreateError::NotAllowed)?;
+        let schedule = map
+            .get_mut(name)
+            .filter(|s| pane_id.is_none_or(|id| s.pane_id() == id))
+            .ok_or(CreateError::NotAllowed)?;
         let (routines, seq, routine) = schedule.plan_create(&request, &ceiling, wall)?;
         if let Some(registry) = &self.registry {
             let planned = RoutineSet {
@@ -549,6 +571,97 @@ impl Shepherd {
             routine.id, routine.created_by
         );
         Ok(routine)
+    }
+
+    /// Change routine `id` on pane `name` (see [`PaneSchedule::plan_update`]).
+    /// Kept in the registry before memory changes, like a create.
+    pub fn update_every(
+        &self,
+        name: &str,
+        pane_id: &str,
+        id: &str,
+        request: &EveryUpdate,
+    ) -> Result<Routine, UpdateError> {
+        let ceiling = self.ceiling_of(name);
+        let wall = self.wall_secs();
+        let mut map = self.schedules();
+        let schedule = map
+            .get_mut(name)
+            .filter(|s| s.pane_id() == pane_id)
+            .ok_or(UpdateError::NotFound)?;
+        let Some(ceiling) = ceiling else {
+            // The profile no longer allows routines: the ones left can be
+            // listed and deleted, not changed.
+            return Err(if schedule.routines().iter().any(|r| r.id == id) {
+                UpdateError::Invalid(Invalid {
+                    field: "routine",
+                    limit: "a profile with dynamic_routines".to_string(),
+                    message: "the pane's profile no longer allows routines; delete this one"
+                        .to_string(),
+                })
+            } else {
+                UpdateError::NotFound
+            });
+        };
+        let (routines, routine) = schedule.plan_update(id, request, &ceiling, wall)?;
+        self.save_planned(schedule, &routines)?;
+        schedule.commit_routines(routines);
+        eprintln!("openab-shepherd: routine: pane {name}: routine {id} updated");
+        Ok(routine)
+    }
+
+    /// Remove routine `id` from pane `name`. Works whatever its status, and
+    /// whether or not the profile still allows routines.
+    pub fn delete_every(&self, name: &str, pane_id: &str, id: &str) -> Result<(), UpdateError> {
+        let mut map = self.schedules();
+        let schedule = map
+            .get_mut(name)
+            .filter(|s| s.pane_id() == pane_id)
+            .ok_or(UpdateError::NotFound)?;
+        let routines = schedule.plan_delete(id)?;
+        self.save_planned(schedule, &routines)?;
+        schedule.commit_routines(routines);
+        eprintln!("openab-shepherd: routine: pane {name}: routine {id} deleted");
+        Ok(())
+    }
+
+    /// Write the planned set to the registry; memory is untouched either way.
+    fn save_planned(
+        &self,
+        schedule: &PaneSchedule,
+        routines: &[Routine],
+    ) -> Result<(), UpdateError> {
+        if let Some(registry) = &self.registry {
+            registry
+                .set_routines(schedule.pane_id(), &schedule.set_with(routines))
+                .map_err(|err| UpdateError::NotSaved(err.detail))?;
+        }
+        Ok(())
+    }
+
+    /// The names of the panes that have any routine to show: an `every`
+    /// routine of any status, or the profile's idle routine.
+    fn panes_with_routines(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .schedules()
+            .iter()
+            .filter(|(_, s)| !s.routines().is_empty())
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.extend(self.routine_map().keys().cloned());
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The profile's idle routine on pane `name`, as `routine_list` shows it.
+    fn profile_routine_view(&self, name: &str, now: Instant) -> Option<Value> {
+        self.routine_map().get(name).map(|watch| watch.view(now))
+    }
+
+    /// Whether pane `name` has the profile's idle routine.
+    fn has_profile_routine(&self, name: &str) -> bool {
+        self.routine_map().contains_key(name)
     }
 
     fn register_routine(
@@ -1352,12 +1465,81 @@ pub fn definitions() -> Value {
                 },
                 "required": ["terminal"]
             }
+        },
+        {
+            "name": "routine_create",
+            "description": "Create a routine on a pane: Shepherd types text into it every every_secs seconds, like a reminder you set for yourself. Only for a pane started from a launch profile that allows it (dynamic_routines); otherwise it is refused with routines_not_allowed. The text is typed unchanged, as if send_input sent it, and only when the pane's turn is finished: a pane that is working, blocked, held by a person or still repainting after a restart is skipped, and a skipped tick is not queued or made up later, so a routine never interrupts a running turn. Ticks missed while Shepherd was down are not made up either. The routine runs on a fixed grid from its creation and ends at expiry (expires_secs, at most the profile's limit) or after max_runs sends; three failed sends in a row stop it. Values outside the profile's limits are refused with routine_invalid (field and limit say which), never adjusted; the result shows the limits (ceiling). Text must be an instruction, not a bare answer such as yes or 1, and at most 1024 bytes. todo_file (a relative path in the pane's working directory) makes a tick type only while that file has an unchecked item (- [ ]). A routine does not survive its pane. Call routine_list to see status, last_result, next_due_in_secs and why one stopped; nothing is pushed to you when a routine ends. Needs the routine scope. Your own pane name is in the SHEPHERD_PANE environment variable.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "terminal": {"type": "string", "description": "Pane name, as start_pane or list_panes returned it."},
+                    "trigger": {
+                        "type": "object",
+                        "description": "When to type. Only an every trigger exists.",
+                        "properties": {
+                            "type": {"type": "string", "enum": ["every"]},
+                            "every_secs": {"type": "integer", "minimum": 60, "maximum": 604800, "description": "Seconds between lines; the profile may set a higher minimum (default 600)."}
+                        },
+                        "required": ["type", "every_secs"]
+                    },
+                    "text": {"type": "string", "description": "The line to type; at most 1024 bytes; not a bare yes, no, ok or number."},
+                    "todo_file": {"type": "string", "description": "Relative path of a todo file in the pane's working directory; the line is typed only while it has an unchecked item."},
+                    "expires_secs": {"type": "integer", "minimum": 60, "maximum": 2592000, "description": "Seconds until the routine expires; default and maximum come from the profile (default 7 days)."},
+                    "max_runs": {"type": "integer", "minimum": 1, "maximum": 10000, "description": "Stop after this many sends."}
+                },
+                "required": ["terminal", "trigger", "text"]
+            }
+        },
+        {
+            "name": "routine_list",
+            "description": "List the routines of one pane, or of every pane that has any when terminal is left out. Includes the pane profile's own idle routine (id profile, source profile), which is read-only: its runs are the nudges since the agent last made progress, and last_result is sent or gave_up. Each routine shows id, source, trigger, action, status (active, expired, done, gave_up, stopped), stop_reason (profile_changed: the profile no longer allows it), runs, last_run_at, last_result (sent, skipped:working, skipped:blocked, skipped:replayed, skipped:person, skipped:todo_done, failed:<code>), next_due_at, next_due_in_secs and expires_in_secs. Needs the routine scope.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "terminal": {"type": "string", "description": "Pane name. Omit to list every pane that has routines."}
+                }
+            }
+        },
+        {
+            "name": "routine_update",
+            "description": "Change a routine you or another client created, by id. Give at least one of every_secs, text, todo_file (null removes it), expires_secs and max_runs (null removes it). A new every_secs or expires_secs restarts the grid from now. expires_secs on an expired, done, gave_up or stopped routine makes it active again. The same limits as routine_create apply and an out-of-range value is refused, not adjusted. The profile's own routine (id profile) cannot be changed. Needs the routine scope.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "terminal": {"type": "string", "description": "Pane name."},
+                    "id": {"type": "string", "description": "Routine id, as routine_create or routine_list showed it."},
+                    "every_secs": {"type": "integer", "minimum": 60, "maximum": 604800},
+                    "text": {"type": "string", "description": "At most 1024 bytes; not a bare yes, no, ok or number."},
+                    "todo_file": {"type": ["string", "null"]},
+                    "expires_secs": {"type": "integer", "minimum": 60, "maximum": 2592000},
+                    "max_runs": {"type": ["integer", "null"], "minimum": 1, "maximum": 10000}
+                },
+                "required": ["terminal", "id"]
+            }
+        },
+        {
+            "name": "routine_delete",
+            "description": "Delete a routine by id. It works on a routine of any status, also when the profile no longer allows routines. The profile's own routine (id profile) cannot be deleted. Needs the routine scope.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "terminal": {"type": "string", "description": "Pane name."},
+                    "id": {"type": "string", "description": "Routine id, as routine_create or routine_list showed it."}
+                },
+                "required": ["terminal", "id"]
+            }
         }
     ])
 }
 
 /// Run one tool. `Err` carries what is shown to the MCP client with `isError`.
 pub fn call(sh: &Shepherd, name: &str, args: &Args) -> Result<Value, ToolError> {
+    call_as(sh, crate::clients::DEFAULT_ID, name, args)
+}
+
+/// Run one tool for `client`, the id of the matched caller. Most tools do
+/// not care who asked; the routine tools record who created a routine.
+pub fn call_as(sh: &Shepherd, client: &str, name: &str, args: &Args) -> Result<Value, ToolError> {
     match name {
         "start_pane" => start_pane(sh, args),
         "send_input" => send_input(sh, args),
@@ -1369,6 +1551,10 @@ pub fn call(sh: &Shepherd, name: &str, args: &Args) -> Result<Value, ToolError> 
         "answer_dialog" => answer_dialog(sh, args),
         "remove_pane" => remove_pane(sh, args),
         "draft_clear" => draft_clear(sh, args),
+        "routine_create" => routine_create(sh, client, args),
+        "routine_list" => routine_list(sh, args),
+        "routine_update" => routine_update(sh, args),
+        "routine_delete" => routine_delete(sh, args),
         other => Err(format!("unknown tool: {other}").into()),
     }
 }
@@ -2222,6 +2408,259 @@ fn draft_clear(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         .draft_clear(&pane)
         .map_err(|err| backend_failure(Some(&terminal), err))?;
     Ok(json!({"terminal": terminal, "cleared": cleared}))
+}
+
+/// What `routine_create` and friends return for one routine.
+fn routine_json(terminal: &str, routine: &Routine, wall: u64) -> Value {
+    let Trigger::Every { every_secs } = routine.trigger else {
+        return json!({"terminal": terminal, "id": routine.id});
+    };
+    let crate::routine_model::Action::Type { text } = &routine.action;
+    let active = routine.status.is_active();
+    json!({
+        "terminal": terminal,
+        "id": routine.id,
+        "source": "agent",
+        "trigger": {"type": "every", "every_secs": every_secs},
+        "action": {"type": "text", "text": text},
+        "todo_file": routine.todo_file,
+        "created_by": routine.created_by,
+        "created_at": routine.created_at,
+        "expires_at": routine.expires_at,
+        "max_runs": routine.max_runs,
+        "runs": routine.runs,
+        "status": routine.status.as_str(),
+        "stop_reason": routine.stop_reason,
+        "last_run_at": routine.last_run_at,
+        "last_result": routine.last_result,
+        "next_due_at": routine.next_due.filter(|_| active),
+        "next_due_in_secs": routine.next_due.filter(|_| active).map(|due| due.saturating_sub(wall)),
+        "expires_in_secs": routine.expires_at.filter(|_| active).map(|at| at.saturating_sub(wall)),
+    })
+}
+
+/// An integer argument: absent or null is `None`.
+fn optional_u64(args: &Args, key: &str) -> Result<Option<u64>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be a non-negative integer").into()),
+    }
+}
+
+/// The pane a routine tool names: it must exist and still run.
+fn routine_pane(sh: &Shepherd, terminal: &str) -> Result<TerminalInfo, ToolError> {
+    let info = resolve(sh, terminal)?;
+    if !info.live {
+        return Err(ToolError::new(
+            "pane_not_live",
+            format!("{terminal} has finished; routines end with their pane"),
+        )
+        .with("terminal", terminal));
+    }
+    Ok(info)
+}
+
+fn invalid_routine(why: Invalid) -> ToolError {
+    ToolError::new("routine_invalid", why.message)
+        .with("field", why.field)
+        .with("limit", why.limit)
+}
+
+fn limit_routine(why: Invalid) -> ToolError {
+    let max = why.limit.parse::<u64>().ok();
+    let err = ToolError::new("routine_limit", why.message)
+        .with("field", why.field)
+        .with("limit", why.limit);
+    match max {
+        Some(max) => err.with("max", max),
+        None => err,
+    }
+}
+
+fn not_saved(detail: String) -> ToolError {
+    ToolError::new(
+        "routine_not_saved",
+        "the routine could not be kept for a restart, so nothing was changed; try again",
+    )
+    .with("backend_detail", detail)
+}
+
+fn routine_not_found(terminal: &str, id: &str) -> ToolError {
+    ToolError::new(
+        "routine_not_found",
+        format!("{terminal} has no routine {id}; routine_list shows them"),
+    )
+    .with("terminal", terminal)
+    .with("id", id)
+}
+
+fn update_failure(terminal: &str, id: &str, err: UpdateError) -> ToolError {
+    match err {
+        UpdateError::NotFound => routine_not_found(terminal, id),
+        UpdateError::Invalid(why) => invalid_routine(why),
+        UpdateError::Limit(why) => limit_routine(why),
+        UpdateError::NotSaved(detail) => not_saved(detail),
+    }
+}
+
+/// `profile` names the pane's read-only idle routine, never an agent routine.
+fn refuse_profile_routine(sh: &Shepherd, terminal: &str, id: &str) -> Result<(), ToolError> {
+    if id == "profile" && sh.has_profile_routine(terminal) {
+        return Err(ToolError::new(
+            "routine_read_only",
+            "the profile's own routine is set in the launch profile and cannot be changed here",
+        )
+        .with("terminal", terminal)
+        .with("id", id));
+    }
+    Ok(())
+}
+
+fn routine_create(sh: &Shepherd, client: &str, args: &Args) -> Result<Value, ToolError> {
+    let terminal = terminal_arg(args)?;
+    let trigger = match args.get("trigger") {
+        Some(Value::Object(trigger)) => trigger,
+        Some(_) => return Err("trigger must be an object".to_string().into()),
+        None => return Err("trigger is required".to_string().into()),
+    };
+    match optional_str(trigger, "type")? {
+        Some("every") => {}
+        Some(other) => {
+            return Err(ToolError::new(
+                "routine_invalid",
+                format!("trigger.type {other:?} is not supported; only every is"),
+            )
+            .with("field", "trigger.type")
+            .with("limit", "every"))
+        }
+        None => return Err("trigger.type is required".to_string().into()),
+    }
+    let every_secs = optional_u64(trigger, "every_secs")?
+        .ok_or_else(|| "trigger.every_secs is required".to_string())?;
+    let text = required_str(args, "text")?.to_string();
+    let todo_file = optional_str(args, "todo_file")?.map(str::to_string);
+    let expires_secs = optional_u64(args, "expires_secs")?;
+    let max_runs = optional_u64(args, "max_runs")?;
+    let info = routine_pane(sh, &terminal)?;
+    let request = NewEvery {
+        every_secs,
+        text,
+        todo_file,
+        expires_secs,
+        max_runs,
+        created_by: client.to_string(),
+    };
+    let routine = sh
+        .create_every_on(&terminal, Some(&info.id), request)
+        .map_err(|err| match err {
+            CreateError::NotAllowed => ToolError::new(
+                "routines_not_allowed",
+                format!(
+                    "{terminal} was not started from a launch profile that allows routines \
+                     (dynamic_routines); ask the operator to enable it"
+                ),
+            )
+            .with("terminal", terminal.as_str()),
+            CreateError::Invalid(why) => invalid_routine(why),
+            CreateError::Limit(why) => limit_routine(why),
+            CreateError::NotSaved(detail) => not_saved(detail),
+        })?;
+    let wall = sh.wall_secs();
+    let ceiling = sh.ceiling_of(&terminal).unwrap_or_default();
+    let active = sh
+        .routines_of(&terminal)
+        .iter()
+        .filter(|r| r.status.is_active())
+        .count();
+    let max = usize::try_from(ceiling.max_per_pane).unwrap_or(usize::MAX);
+    Ok(json!({
+        "routine": routine_json(&terminal, &routine, wall),
+        "ceiling": {
+            "min_every_secs": ceiling.min_every_secs,
+            "max_per_pane": ceiling.max_per_pane,
+            "max_expires_secs": ceiling.max_expires_secs,
+            "active": active,
+            "free": max.saturating_sub(active),
+        },
+    }))
+}
+
+fn routine_list(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
+    let names = match optional_str(args, "terminal")? {
+        Some(raw) => {
+            let terminal = validate_input(raw).map_err(|err| format!("terminal: {err}"))?;
+            routine_pane(sh, &terminal)?;
+            vec![terminal]
+        }
+        None => sh.panes_with_routines(),
+    };
+    let wall = sh.wall_secs();
+    let now = Instant::now();
+    let mut routines = Vec::new();
+    for name in names {
+        if let Some(mut profile) = sh.profile_routine_view(&name, now) {
+            profile["terminal"] = json!(name);
+            routines.push(profile);
+        }
+        for routine in sh.routines_of(&name) {
+            routines.push(routine_json(&name, &routine, wall));
+        }
+    }
+    Ok(json!({"routines": routines}))
+}
+
+fn routine_update(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
+    let terminal = terminal_arg(args)?;
+    let id = required_str(args, "id")?.to_string();
+    let present = |key: &str| args.contains_key(key);
+    let text = optional_str(args, "text")?.map(str::to_string);
+    let request = EveryUpdate {
+        every_secs: optional_u64(args, "every_secs")?,
+        text,
+        todo_file: if present("todo_file") {
+            Some(optional_str(args, "todo_file")?.map(str::to_string))
+        } else {
+            None
+        },
+        expires_secs: optional_u64(args, "expires_secs")?,
+        max_runs: if present("max_runs") {
+            Some(optional_u64(args, "max_runs")?)
+        } else {
+            None
+        },
+    };
+    // A null `every_secs`, `text` or `expires_secs` means "not given".
+    let given = request.every_secs.is_some()
+        || request.text.is_some()
+        || request.todo_file.is_some()
+        || request.expires_secs.is_some()
+        || request.max_runs.is_some();
+    if !given {
+        return Err(
+            "give at least one of every_secs, text, todo_file, expires_secs and max_runs"
+                .to_string()
+                .into(),
+        );
+    }
+    let info = routine_pane(sh, &terminal)?;
+    refuse_profile_routine(sh, &terminal, &id)?;
+    let routine = sh
+        .update_every(&terminal, &info.id, &id, &request)
+        .map_err(|err| update_failure(&terminal, &id, err))?;
+    Ok(json!({"routine": routine_json(&terminal, &routine, sh.wall_secs())}))
+}
+
+fn routine_delete(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
+    let terminal = terminal_arg(args)?;
+    let id = required_str(args, "id")?.to_string();
+    let info = routine_pane(sh, &terminal)?;
+    refuse_profile_routine(sh, &terminal, &id)?;
+    sh.delete_every(&terminal, &info.id, &id)
+        .map_err(|err| update_failure(&terminal, &id, err))?;
+    Ok(json!({"terminal": terminal, "id": id, "deleted": true}))
 }
 
 /// A backend failure in Shepherd's words. The backend's own text is kept only

@@ -9,15 +9,16 @@
 //! clients, not tamper-proofing.
 //!
 //! Shape of a call: each mutating tool (`start_pane`, `send_input`,
-//! `answer_dialog`, `remove_pane`, `interrupt_pane`, `draft_clear`) writes a
-//! `call` line before it runs and a best-effort `outcome` line after.
-//! `read_output` writes an `outcome` line after. `list_panes`, `get_status` and `wait_status` write
+//! `answer_dialog`, `remove_pane`, `interrupt_pane`, `draft_clear`, `routine_create`,
+//! `routine_update`, `routine_delete`) writes a `call` line before it runs and a
+//! best-effort `outcome` line after. `read_output` writes an `outcome` line
+//! after. `list_panes`, `get_status`, `wait_status` and `routine_list` write
 //! nothing. A call refused by the scope check writes a `denied` line.
 //! Failed authentications go to stderr, not to this file.
 //!
-//! Failure policy: `start_pane`, `send_input`, `answer_dialog`, `remove_pane`
-//! and `draft_clear` are refused with `audit_unavailable` when the `call`
-//! record cannot be written, so a failing sink means no backend call for them.
+//! Failure policy: `start_pane`, `send_input`, `answer_dialog`, `remove_pane`,
+//! `draft_clear`, `routine_create`, `routine_update` and `routine_delete` are
+//! refused with `audit_unavailable` when the `call` record cannot be written, so a failing sink means no backend call for them.
 //! `interrupt_pane` (the human's way to stop a runaway agent) and the reads go
 //! ahead when the write fails; the failure is counted and reported on stderr
 //! at most once a minute.
@@ -103,9 +104,8 @@ pub enum Policy {
 /// The failure policy of a tool. A tool not listed fails closed.
 pub fn policy(tool: &str) -> Policy {
     match tool {
-        "interrupt_pane" | "read_output" | "get_status" | "wait_status" | "list_panes" => {
-            Policy::FailOpen
-        }
+        "interrupt_pane" | "read_output" | "get_status" | "wait_status" | "list_panes"
+        | "routine_list" => Policy::FailOpen,
         _ => Policy::FailClosed,
     }
 }
@@ -120,6 +120,9 @@ fn writes_call(tool: &str) -> bool {
             | "remove_pane"
             | "interrupt_pane"
             | "draft_clear"
+            | "routine_create"
+            | "routine_update"
+            | "routine_delete"
     )
 }
 
@@ -290,6 +293,11 @@ impl Audit {
                 record.insert("pane".into(), json!(cap(&name, SHORT)));
             }
         }
+        if tool == "routine_create" {
+            if let Some(id) = result_routine_id(result) {
+                record.insert("routine".into(), json!(cap(&id, SHORT)));
+            }
+        }
         record.insert("outcome".into(), json!(outcome_text(result)));
         self.emit_or_count(record);
     }
@@ -332,6 +340,18 @@ fn put_capped(record: &mut Map<String, Value>, field: &str, args: &Args, key: &s
     }
 }
 
+fn put_text_len(record: &mut Map<String, Value>, args: &Args) {
+    if let Some(text) = str_arg(args, "text") {
+        record.insert("text_len".into(), json!(text.len()));
+    }
+}
+
+fn put_number(record: &mut Map<String, Value>, args: &Args, key: &str) {
+    if let Some(n) = args.get(key).and_then(Value::as_u64) {
+        record.insert(key.into(), json!(n));
+    }
+}
+
 /// The allowlisted fields of a request. Anything not named here is dropped.
 fn request_fields(actor: &str, tool: &str, args: &Args) -> Map<String, Value> {
     let mut out = Map::new();
@@ -359,6 +379,49 @@ fn request_fields(actor: &str, tool: &str, args: &Args) -> Map<String, Value> {
         "read_output" | "interrupt_pane" | "remove_pane" | "draft_clear" => {
             put_capped(&mut out, "pane", args, "terminal", SHORT);
         }
+        // Never the text, only its length. `routine_create` names the trigger
+        // by its type and numbers; the id of what it created joins the
+        // outcome line.
+        "routine_create" => {
+            put_capped(&mut out, "pane", args, "terminal", SHORT);
+            let trigger = args.get("trigger").and_then(Value::as_object);
+            if let Some(kind) = trigger.and_then(|t| t.get("type")).and_then(Value::as_str) {
+                out.insert("trigger".into(), json!(cap(kind, 16)));
+            }
+            if let Some(secs) = trigger
+                .and_then(|t| t.get("every_secs"))
+                .and_then(Value::as_u64)
+            {
+                out.insert("every_secs".into(), json!(secs));
+            }
+            put_text_len(&mut out, args);
+            put_number(&mut out, args, "expires_secs");
+            put_number(&mut out, args, "max_runs");
+            out.insert(
+                "todo".into(),
+                json!(args.get("todo_file").is_some_and(|v| !v.is_null())),
+            );
+        }
+        "routine_update" => {
+            put_capped(&mut out, "pane", args, "terminal", SHORT);
+            put_capped(&mut out, "routine", args, "id", SHORT);
+            let changed: Vec<&str> = [
+                "every_secs",
+                "text",
+                "todo_file",
+                "expires_secs",
+                "max_runs",
+            ]
+            .into_iter()
+            .filter(|key| args.contains_key(*key))
+            .collect();
+            out.insert("changed".into(), json!(changed));
+            put_text_len(&mut out, args);
+        }
+        "routine_delete" => {
+            put_capped(&mut out, "pane", args, "terminal", SHORT);
+            put_capped(&mut out, "routine", args, "id", SHORT);
+        }
         _ => {}
     }
     out
@@ -370,6 +433,17 @@ fn result_name(result: &Result<Value, ToolError>) -> Option<String> {
         .as_ref()
         .ok()?
         .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The id of the routine a successful `routine_create` made.
+fn result_routine_id(result: &Result<Value, ToolError>) -> Option<String> {
+    result
+        .as_ref()
+        .ok()?
+        .get("routine")?
+        .get("id")
         .and_then(Value::as_str)
         .map(str::to_string)
 }
@@ -596,6 +670,28 @@ mod tests {
         let error = refused.to_tool_error();
         assert_eq!(error.data["error"], UNAVAILABLE_CODE, "{tool}");
         assert_eq!(audit.dropped(), 1, "{tool}");
+    }
+
+    #[test]
+    fn the_routine_mutators_fail_closed_and_the_list_writes_nothing() {
+        for tool in ["routine_create", "routine_update", "routine_delete"] {
+            assert_fail_closed(tool);
+            let (audit, sink) = memory_audit();
+            let a = args(json!({"terminal": "w", "id": "r1", "text": "do the thing",
+                                "trigger": {"type": "every", "every_secs": 600}}));
+            audit.before("a", tool, &a).unwrap();
+            audit.after("a", tool, &a, &Ok(json!({"routine": {"id": "r1"}})));
+            let phases: Vec<_> = sink.records().iter().map(|r| r["phase"].clone()).collect();
+            assert_eq!(phases, ["call", "outcome"], "{tool}");
+            assert!(!sink.bytes().contains("do the thing"), "{tool}");
+        }
+        // A failing sink does not stop the list, which writes nothing.
+        let audit = failing_audit();
+        assert_eq!(policy("routine_list"), Policy::FailOpen);
+        audit
+            .before("a", "routine_list", &sample("routine_list"))
+            .unwrap();
+        assert_eq!(audit.dropped(), 0);
     }
 
     #[test]

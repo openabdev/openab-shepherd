@@ -198,6 +198,43 @@ pub enum CreateError {
     NotSaved(String),
 }
 
+/// What an update asks for. `Some(None)` clears `todo_file` / `max_runs`.
+#[derive(Debug, Clone, Default)]
+pub struct EveryUpdate {
+    pub every_secs: Option<u64>,
+    pub text: Option<String>,
+    pub todo_file: Option<Option<String>>,
+    pub expires_secs: Option<u64>,
+    pub max_runs: Option<Option<u64>>,
+}
+
+/// Why an update or delete was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateError {
+    /// The pane has no routine with that id (or no schedule at all).
+    NotFound,
+    Invalid(Invalid),
+    /// Renewing would exceed `max_per_pane`.
+    Limit(Invalid),
+    /// The write to the registry failed; nothing changed.
+    NotSaved(String),
+}
+
+fn current_every(routine: &Routine) -> u64 {
+    match routine.trigger {
+        Trigger::Every { every_secs } => every_secs,
+        Trigger::Idle { .. } => 0,
+    }
+}
+
+fn no_local_dir() -> Invalid {
+    Invalid {
+        field: "todo_file",
+        limit: "a pane with a local working directory".to_string(),
+        message: "todo_file needs a pane with a local working directory".to_string(),
+    }
+}
+
 /// One pane's routines of the `every` kind, and what the tick needs to act
 /// on them. Kept in memory and mirrored to the registry whole.
 #[derive(Debug)]
@@ -402,10 +439,137 @@ impl PaneSchedule {
         Ok((routines, seq, routine))
     }
 
+    /// Check an update against `ceiling` and plan it: the routines as they
+    /// would be, and the changed routine. Nothing changes here.
+    ///
+    /// A new `every_secs` or `expires_secs` re-anchors the grid at `wall`
+    /// (`created_at` and `next_due` move), so the expiry horizon the
+    /// adoption rule measures from creation stays true. An `expires_secs` on
+    /// a finished routine brings it back to `active` (the renew path) when
+    /// the pane has room and the result still fits the ceiling.
+    pub fn plan_update(
+        &self,
+        id: &str,
+        request: &EveryUpdate,
+        ceiling: &DynamicRoutines,
+        wall: u64,
+    ) -> Result<(Vec<Routine>, Routine), UpdateError> {
+        let index = self
+            .routines
+            .iter()
+            .position(|r| r.id == id)
+            .ok_or(UpdateError::NotFound)?;
+        let mut routine = self.routines[index].clone();
+        let invalid = UpdateError::Invalid;
+        if let Some(text) = &request.text {
+            routine.action = Action::Type {
+                text: validate_text(text, self.agent).map_err(invalid)?,
+            };
+        }
+        match &request.todo_file {
+            Some(Some(file)) => {
+                let file = validate_todo_file(file).map_err(invalid)?;
+                if self.work_dir.is_none() {
+                    return Err(invalid(no_local_dir()));
+                }
+                routine.todo_file = Some(file);
+            }
+            Some(None) => routine.todo_file = None,
+            None => {}
+        }
+        match request.max_runs {
+            Some(Some(runs)) => routine.max_runs = Some(validate_max_runs(runs).map_err(invalid)?),
+            Some(None) => routine.max_runs = None,
+            None => {}
+        }
+        let mut reanchor = false;
+        if let Some(secs) = request.every_secs {
+            let secs = validate_every_secs(secs, ceiling).map_err(invalid)?;
+            reanchor |= secs != current_every(&routine);
+            routine.trigger = Trigger::Every { every_secs: secs };
+        }
+        if let Some(secs) = request.expires_secs {
+            let secs = validate_expires_secs(Some(secs), ceiling).map_err(invalid)?;
+            routine.expires_at = Some(wall.saturating_add(secs));
+            reanchor = true;
+            if !routine.status.is_active() {
+                let others = self
+                    .routines
+                    .iter()
+                    .filter(|r| r.id != id && r.status.is_active())
+                    .count();
+                check_count(others, ceiling).map_err(UpdateError::Limit)?;
+                routine.status = Status::Active;
+                routine.stop_reason = None;
+                routine.fail_streak = 0;
+            }
+        }
+        if reanchor {
+            let every = current_every(&routine);
+            routine.created_at = wall;
+            routine.next_due = Some(wall.saturating_add(every));
+        }
+        if routine.status.is_active() {
+            if let Some(record) = routine.to_record() {
+                if let Some(why) =
+                    crate::routine_model::ceiling_violation(&record, ceiling, self.agent)
+                {
+                    return Err(invalid(Invalid {
+                        field: "routine",
+                        limit: "the profile's dynamic_routines ceiling".to_string(),
+                        message: format!("the routine would break the profile's ceiling: {why}"),
+                    }));
+                }
+            }
+            if routine
+                .max_runs
+                .is_some_and(|max| routine.runs >= u64::from(max))
+            {
+                return Err(invalid(Invalid {
+                    field: "max_runs",
+                    limit: format!("more than the {} runs so far", routine.runs),
+                    message: format!(
+                        "max_runs must exceed the {} runs this routine has made",
+                        routine.runs
+                    ),
+                }));
+            }
+        }
+        let mut routines = self.routines.clone();
+        routines[index] = routine.clone();
+        Ok((routines, routine))
+    }
+
+    /// Plan removing routine `id`: the routines as they would be.
+    pub fn plan_delete(&self, id: &str) -> Result<Vec<Routine>, UpdateError> {
+        if !self.routines.iter().any(|r| r.id == id) {
+            return Err(UpdateError::NotFound);
+        }
+        Ok(self
+            .routines
+            .iter()
+            .filter(|r| r.id != id)
+            .cloned()
+            .collect())
+    }
+
     /// Keep what [`PaneSchedule::plan_create`] planned.
     pub fn commit(&mut self, routines: Vec<Routine>, seq: u64) {
         self.routines = routines;
         self.seq = seq;
+    }
+
+    /// Keep what an update or delete planned; the counter stays.
+    pub fn commit_routines(&mut self, routines: Vec<Routine>) {
+        self.routines = routines;
+    }
+
+    /// The set as it would be stored with `routines` in place.
+    pub fn set_with(&self, routines: &[Routine]) -> RoutineSet {
+        RoutineSet {
+            seq: self.seq,
+            items: routines.iter().filter_map(Routine::to_record).collect(),
+        }
     }
 }
 

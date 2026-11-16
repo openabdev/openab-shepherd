@@ -17,7 +17,7 @@
 //!
 //! Without a clients file, the single bearer token is the client `default`
 //! with the seven scopes that existed before shared panes (not `attach`,
-//! `attach:write` or `lease:preempt`). With one, a token file or env token is
+//! `attach:write`, `lease:preempt` or `routine`). With one, a token file or env token is
 //! a startup error (see `config.rs`).
 //!
 //! Not here yet (later phases of issue #4): pane ownership, reload without a
@@ -73,11 +73,16 @@ pub enum Scope {
     /// Take the input lease from a person who holds it, and `draft_clear`
     /// (issue #77). A person's scope: the legacy token and bots do not get it.
     LeasePreempt,
+    /// `routine_create`, `routine_list`, `routine_update`, `routine_delete`
+    /// (issue #98): routines that type a fixed line into a pane on a clock,
+    /// on panes whose profile opted in. Does not imply `control`; the legacy
+    /// token does not hold it.
+    Routine,
 }
 
 impl Scope {
     /// Every scope the clients file can name: the parser's universe.
-    pub const ALL: [Scope; 10] = [
+    pub const ALL: [Scope; 11] = [
         Scope::Observe,
         Scope::Read,
         Scope::Control,
@@ -88,6 +93,7 @@ impl Scope {
         Scope::Attach,
         Scope::AttachWrite,
         Scope::LeasePreempt,
+        Scope::Routine,
     ];
 
     /// What the single legacy token holds: the scopes that existed before
@@ -116,6 +122,7 @@ impl Scope {
             Scope::Attach => "attach",
             Scope::AttachWrite => "attach:write",
             Scope::LeasePreempt => "lease:preempt",
+            Scope::Routine => "routine",
         }
     }
 
@@ -225,6 +232,9 @@ pub fn any_scope(tool: &str) -> Option<&'static [Scope]> {
         "answer_dialog" => &[Scope::Dialog],
         "remove_pane" => &[Scope::Remove],
         "draft_clear" => &[Scope::LeasePreempt],
+        "routine_create" | "routine_list" | "routine_update" | "routine_delete" => {
+            &[Scope::Routine]
+        }
         _ => return None,
     })
 }
@@ -732,6 +742,9 @@ mod tests {
                     "answer_dialog" => scope == Scope::Dialog,
                     "remove_pane" => scope == Scope::Remove,
                     "draft_clear" => scope == Scope::LeasePreempt,
+                    "routine_create" | "routine_list" | "routine_update" | "routine_delete" => {
+                        scope == Scope::Routine
+                    }
                     other => panic!("unmapped tool {other}"),
                 };
                 assert_eq!(allowed, expected, "{tool} with only {scope}");
@@ -763,8 +776,12 @@ mod tests {
         let caller = Caller::default_client();
         assert_eq!(caller.client(), "default");
         // Every tool that existed before shared panes; `draft_clear` needs
-        // `lease:preempt`, which the legacy caller does not hold.
-        for tool in TOOL_NAMES.into_iter().filter(|tool| *tool != "draft_clear") {
+        // `lease:preempt` and the routine tools need `routine`, which the
+        // legacy caller does not hold.
+        for tool in TOOL_NAMES
+            .into_iter()
+            .filter(|tool| *tool != "draft_clear" && !tool.starts_with("routine_"))
+        {
             assert!(
                 authorize(&caller, tool, &sample_args(tool)).is_ok(),
                 "{tool}"
@@ -792,9 +809,17 @@ mod tests {
         let client = default_client("a-single-token");
         assert_eq!(client.scopes, Scope::LEGACY.into_iter().collect());
         assert_eq!(Caller::from_client(&client).scopes(), caller.scopes());
-        // ALL is the three added to the seven, in no way narrower.
-        assert_eq!(Scope::ALL.len(), Scope::LEGACY.len() + 3);
-        for scope in Scope::LEGACY.into_iter().chain(SHARED_PANE_SCOPES) {
+        // The routine scope (issue #98) is in ALL and not in the legacy set.
+        assert!(!caller.has(Scope::Routine));
+        assert!(!Scope::LEGACY.contains(&Scope::Routine));
+        // ALL is the three shared-pane scopes and `routine` added to the
+        // seven, in no way narrower.
+        assert_eq!(Scope::ALL.len(), Scope::LEGACY.len() + 4);
+        for scope in Scope::LEGACY
+            .into_iter()
+            .chain(SHARED_PANE_SCOPES)
+            .chain([Scope::Routine])
+        {
             assert!(Scope::ALL.contains(&scope), "{scope}");
         }
     }
@@ -805,6 +830,7 @@ mod tests {
             ("attach", Scope::Attach),
             ("attach:write", Scope::AttachWrite),
             ("lease:preempt", Scope::LeasePreempt),
+            ("routine", Scope::Routine),
         ] {
             let clients = Clients::parse(&file_text(json!([client_json(
                 "person",
