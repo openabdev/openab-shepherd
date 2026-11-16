@@ -4,6 +4,15 @@ A routine is a proactive client that runs inside Shepherd. Shepherd otherwise ac
 only when an MCP client calls a tool; a routine acts on a timer, with no client
 attached.
 
+There are two kinds, and they do different jobs:
+
+- The **idle routine** is set by the operator in a launch profile (the `routine`
+  key). It nudges a pane that ended a turn and then sat idle. It is described in
+  the rest of this page up to [Identity and audit](#identity-and-audit).
+- An **agent-created routine** is a line that Shepherd types into a pane every N
+  seconds. An agent or an MCP client creates it with the `routine_*` tools, on a
+  pane whose profile allows it. See [Agent-created routines](#agent-created-routines).
+
 ## Scenario
 
 An agent is left unattended and ends a turn with work left. It is
@@ -148,15 +157,210 @@ refusal inside the write stays the authority; the check is only an early exit. A
 
 ## Identity and audit
 
-A routine has no client identity: it is not a client from the clients file. What it
+The idle routine has no client identity: it is not a client from the clients file. What it
 decided is on Shepherd's stderr (`routine nudge`, `routine gave up`). With an audit log
 configured, each nudge it attempts is two lines by the fixed system actor
 `system:routine`: a `send_input` `call` line before the send (a nudge whose `call`
 line cannot be written is not sent) and an `outcome` line after it, `ok` or
 `error:<code>` (for example `error:status_mismatch` when the pane moved first). Both
-carry `routine` (`profile`) and `created_by` (`profile`), and the length of the text
-but never the text. A tick that skips (a person at the pane, a replayed pane) writes no
+carry `routine` (`profile`, or the id such as `r3` of an agent-created routine) and
+`created_by` (`profile`, or the client that created the routine), and the length of
+the text but never the text. A tick that skips (a person at the pane, a replayed pane) writes no
 audit line.
+
+## Agent-created routines
+
+An agent can ask Shepherd to type a line into its own pane on a clock: "check
+whether any todo work is left, every hour". A routine is a trigger and an action.
+In this version the trigger is `every` (a fixed interval in seconds) and the action
+is `text` (one line typed into the pane). The idle trigger stays a profile setting
+and is not available to the tools. Dynamic routines are off unless the operator opts
+in per launch profile, so a profiles file without the `dynamic_routines` key behaves
+exactly as before.
+
+### What it does and does not do
+
+- At each grid time (`created_at + n * every_secs`) Shepherd types `text` through
+  the same path and refusal rules as `send_input`, only when the pane's turn has
+  finished. A pane that is working, blocked, held by a person (lease or draft) or
+  still repainting after a restart is skipped. The skip is not queued and not made
+  up later: a routine never interrupts a running turn, and a long task simply
+  misses ticks. `last_result` in `routine_list` says what happened at the last
+  tick (`skipped:working` and so on).
+- Ticks missed while Shepherd was down are skipped too. After a restart the
+  routine resumes on its original grid, with no burst. A laptop that sleeps is the
+  same as a server that was down. There is no calendar syntax, so no time zone and
+  no daylight saving rule.
+- The text is typed unchanged, with no prefix. A text that starts with `/` is still
+  a slash command for the agent.
+- At most one nudge per pane per 5 s pass. If two routines are due together, the
+  first send turns the pane `working` and the second sees that and skips.
+- The consecutive-nudge cap of the idle routine does **not** apply to `every`. An
+  hourly routine is driven by the clock, and the cap would stop it after three
+  hours without progress. It is bounded by the interval floor, the expiry, the
+  per-pane count, `max_runs` and the give-up rule below.
+- Three failed sends in a row end the routine as `gave_up`; a success resets the
+  count. A paste that was typed but whose Enter was refused (`pasted_unsubmitted`)
+  ends it at once, because a retry would paste the line twice. A send that fails
+  only because the pane lock was busy for more than 2 s is retried on the next
+  pass and does not use the tick.
+- A dynamic routine can do nothing that `send_input` cannot: it types one line of at
+  most 1024 bytes, never a bare confirmation, through the same guard.
+
+### Opting in: the `dynamic_routines` profile key
+
+```json
+"dynamic_routines": { "min_every_secs": 600, "max_per_pane": 3, "max_expires_secs": 604800 }
+```
+
+`{}` turns it on with the defaults shown. A profile without the key refuses every
+`routine_create` on its panes with `routines_not_allowed`. The key does not need a
+`routine` section; a pane with only `dynamic_routines` is watched by the scheduler
+alone. Unknown keys are refused when the file is read, so an older Shepherd refuses
+a profiles file that uses it; upgrade the server first.
+
+| Key | Meaning | Default | Allowed |
+|-----|---------|---------|---------|
+| `min_every_secs` | shortest interval a routine may use | 600 | 60 to 604800 |
+| `max_per_pane` | active routines on one pane | 3 | 1 to 10 |
+| `max_expires_secs` | longest life of a routine; also its default | 604800 (7 days) | 3600 to 2592000 |
+
+Worst case at the defaults: 3 routines every 10 minutes for 7 days is about 1000
+typed lines per pane. Set the bounds to what the operator accepts.
+
+### Limits of one routine
+
+| Field | Rule |
+|-------|------|
+| `trigger` | `{"type": "every", "every_secs": N}`. Any other type is refused |
+| `every_secs` | 60 to 604800, and not below the profile's `min_every_secs` |
+| `text` | at most 1024 bytes; trimmed; no control characters except TAB; not a bare confirmation (`yes`, `ok`, a digit, ...); not `/yolo` on a Devin pane |
+| `todo_file` | optional; a relative path inside the pane's working directory; the line is typed only while the file has an unchecked `- [ ]` item (same reading rules as the idle routine's `todo_file`); refused for a pane without a local working directory |
+| `expires_secs` | 60 to 2592000, and not above the profile's `max_expires_secs`; defaults to that maximum, so a routine always expires |
+| `max_runs` | optional, 1 to 10000; the routine is `done` after that many sends |
+
+A value outside a limit is refused, not adjusted, and the refusal names the limit.
+Finished routines (`expired`, `done`, `gave_up`, `stopped`) do not count toward
+`max_per_pane`; the oldest finished ones are dropped once a pane holds more than
+twice that many records.
+
+### The tools
+
+All four need the `routine` scope (see [Scopes](operations.md#scopes)) and take the
+pane name as `terminal`, like every other tool. A pane started by Shepherd has its
+own name in the environment variable `SHEPHERD_PANE`, so an agent knows what to
+pass. Panes started before the variable existed lack it; the agent can use the name
+`start_pane` or `list_panes` showed.
+
+| Tool | Arguments | Result |
+|------|-----------|--------|
+| `routine_create` | `terminal`, `trigger`, `text`; optional `todo_file`, `expires_secs`, `max_runs` | `routine` (the record) and `ceiling` (`min_every_secs`, `max_per_pane`, `max_expires_secs`, `active`, `free`) |
+| `routine_list` | optional `terminal` (left out: every pane that has routines) | `routines`, each with its `terminal` |
+| `routine_update` | `terminal`, `id`, and at least one of `every_secs`, `text`, `todo_file` (null removes it), `expires_secs`, `max_runs` (null removes it) | `routine` |
+| `routine_delete` | `terminal`, `id` | `terminal`, `id`, `deleted` |
+
+A routine record shows `id` (`r1`, `r2`, ...; never reused on a pane), `terminal`,
+`source` (`agent`, or `profile` for the idle routine), `trigger`, `action`,
+`todo_file`, `created_by` (the client id), `created_at`, `expires_at`, `max_runs`,
+`runs`, `status`, `stop_reason`, `last_run_at`, `last_result`, `next_due_at`,
+`next_due_in_secs` and `expires_in_secs`. Times are Unix seconds.
+
+- `status` is `active`, `expired`, `done`, `gave_up` or `stopped`. `stop_reason` is
+  `profile_changed` when a restart found that the profile no longer allows the
+  routine (the key was removed, the floor was raised above its interval, or its
+  expiry is beyond the new maximum). Such a routine is kept, so the agent can see it
+  and delete or recreate it; it never types again.
+- `last_result` is `sent`, `skipped:working`, `skipped:blocked`, `skipped:replayed`,
+  `skipped:person`, `skipped:todo_done` or `failed:<code>`. It is written when it
+  changes.
+- Nothing is pushed to the agent when a routine expires, finishes or gives up. The
+  agent finds out by calling `routine_list`; the tool descriptions say so.
+- `routine_update` with a new `every_secs` or `expires_secs` restarts the grid from
+  now. `expires_secs` on a finished routine makes it active again, if there is room
+  under `max_per_pane` and the result still fits the limits. There is no `enabled`
+  flag: delete and create again to pause.
+- `routine_list` also shows the profile's idle routine as `id: "profile"`,
+  `source: "profile"`. It is read-only: `routine_update` and `routine_delete` on it
+  fail with `routine_read_only`. For it, `runs` is the number of consecutive nudges
+  since the agent last made progress, `last_result` is `sent` or `gave_up`, and
+  `next_due_in_secs` is the idle time still to run on the finished turn being timed
+  (null while none is).
+
+Errors (`structuredContent.error`):
+
+| Code | When | Extra fields |
+|------|------|--------------|
+| `forbidden` | the client has no `routine` scope (the single legacy token never has it) | the missing scope |
+| `routines_not_allowed` | the pane was not started from a profile with `dynamic_routines` | `terminal` |
+| `routine_invalid` | a value is outside a limit, or the trigger type is not `every` | `field`, `limit` |
+| `routine_limit` | the pane already has `max_per_pane` active routines | `field` (`routines`), `limit`, `max` |
+| `routine_not_found` | the pane has no routine with that `id` | `terminal`, `id` |
+| `routine_read_only` | update or delete of the profile's routine | `terminal`, `id` |
+| `routine_not_saved` | the change could not be kept for a restart, so nothing changed | `backend_detail` |
+| `pane_not_live` | the pane's program has ended | `terminal` |
+| `audit_unavailable` | the audit line could not be written; nothing was changed | |
+| `not_found` | no pane has that name | |
+
+### Storage and restart
+
+A routine is stored in the pane's record in the holder, next to the idle routine's
+counters. It lives as long as its pane, and under `openab-shepherd hold` it survives
+a server restart: the new server rebuilds the schedule with the same grid. A bare
+`openab-shepherd` owns its panes, so a restart ends them and the routines with them.
+A routine does not move to another pane and ends when its pane ends.
+
+A write that fails (or one that would make the record too large) is refused with
+`routine_not_saved` and changes nothing, because an acknowledged routine that
+vanishes at the next restart is the worst outcome for this feature. With no registry
+(a bare server) there is nothing to write and the create succeeds in memory.
+
+Rolling back to an older Shepherd after routines exist: an older build ignores the
+stored routines and drops them at its next write, and it refuses a clients file that
+names the `routine` scope. Accept that, or remove the scope first.
+
+At each restart the current profile is read again. A stored routine that breaks the
+current limits becomes `stopped` with `stop_reason: profile_changed` and one line on
+stderr. If a lowered `max_per_pane` leaves too many, the newest are stopped.
+
+### Interaction with the idle routine
+
+A dynamic nudge counts as the idle routine's own nudge for its progress logic: the
+turns it causes never count as progress, so it cannot clear an idle give-up, and the
+idle cooldown also spaces after it. A pane with an idle routine without `todo_file`
+plus a dynamic routine can be nudged by both; prefer a `todo_file` or no idle routine
+on such a pane.
+
+### Who may use it
+
+`routine` is a separate scope. It does not imply `control`: a holder can only make
+Shepherd type a fixed line of at most 1024 bytes, not a bare confirmation, at an
+interval of at least the profile's floor, on panes whose profile opted in. It does
+not allow `send_input`. The single legacy token holds no `routine` scope; a clients
+file can grant it (the `ALL` list includes it). Any client with the scope can create,
+list, update and delete on any pane it can name, as `send_input` and `remove_pane`
+work; per-client ownership is a non-goal ([trust model](adr/trust-model.md)).
+`created_by` is stored and shown, and the audit log has the client id.
+
+For an agent that schedules itself, give it its own client with `routine` and
+`observe` (if it should call `list_panes`), and no `control`. Shepherd never puts a
+token into a pane's environment; the operator puts the agent's token into the agent
+CLI's own MCP configuration. See [credentials.md](credentials.md#an-agent-as-an-mcp-client).
+
+### Audit
+
+`routine_create`, `routine_update` and `routine_delete` write a `call` line before
+the change and an `outcome` line after it, under the client's id, and are refused
+with `audit_unavailable` when the `call` line cannot be written. The fields are the
+pane, the routine `id`, the interval, the length of the text, `expires_secs`,
+`max_runs` and whether a `todo_file` is set; never the text. `routine_list` writes
+nothing. A nudge is a `send_input` pair by `system:routine`, with `routine` and
+`created_by` fields; see [Identity and audit](#identity-and-audit).
+
+### Checking it by hand
+
+[operator-e2e/routine-dynamic.md](operator-e2e/routine-dynamic.md) is the operator
+runbook: ten checks on a real server (create, skip while working, restart, downtime,
+audit, profile change, audit failure, expiry).
 
 ## The deprecated `watchdog` key
 
@@ -167,17 +371,21 @@ warning line to stderr. A profile that sets both keys is refused at startup; rem
 
 ## Positioning
 
-This is the minimal implementation of the routine idea found in agent products such
-as Grok Bot. There, a routine says when to run and a skill says what to do, and
-triggers are schedules or events. Shepherd has one trigger today (a finished turn
-that sits idle past `idle_timeout_secs`) and one action (type `nudge_text` through
-the `send_input` path).
+This is the small end of the routine idea found in agent products such as Grok Bot.
+There, a routine says when to run and a skill says what to do, and triggers are
+schedules or events. Shepherd has two triggers, a finished turn that sits idle past
+`idle_timeout_secs` (set in a profile) and a fixed interval (`every`, created over
+MCP), and one action: type a line into the pane through the `send_input` path.
+Asking an agent in plain words ("every hour, check whether any todo work is left")
+ends in one `routine_create` call, and `every` plus `text` is the smallest version
+of what those products offer. Shepherd adds a ceiling the operator sets per profile.
 
 Possible later extensions, none planned:
 
-- other triggers: a schedule, a pane exit, a webhook;
-- other actions: a notification, a saved prompt.
+- other triggers: a pane exit, a webhook, a calendar schedule;
+- other actions: a notification, a saved prompt;
+- a dynamic `idle` trigger.
 
-Any extension would add trigger and action fields inside the same `routine`
-section. It needs a concrete scenario first, and a design reviewed by the sol and
-opus5 council with a herdr and Orca comparison before any code.
+Any extension would add trigger and action fields inside the same routine record. It
+needs a concrete scenario first, and a design reviewed by the sol and opus5 council
+with a herdr and Orca comparison before any code.

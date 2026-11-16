@@ -49,7 +49,7 @@ later is a contained change.
 | `examples/native_probe.rs` | The real-Kiro probe for the native backend |
 | `examples/native_leak_check.rs` | Real-Kiro leak check: removes a pane and verifies no descendant process survives (issue #10) |
 | `examples/record_tail.rs` | Records a program's raw output and final screen as a replay fixture (user-run; see [Restart survival](#restart-survival)) |
-| `src/tools.rs` | The ten tools, their schemas, the safety rules, and the backend calls each one makes |
+| `src/tools.rs` | The fourteen tools (the ten pane tools and the four `routine_*` tools), their schemas, the safety rules, and the backend calls each one makes |
 | `src/routine.rs` | The per-pane routine state and its nudge decision (the tools run its thread) |
 | `src/dialog.rs` | Text parser for the kiro-cli permission dialog |
 | `src/devin_dialog.rs` | Text parser for the Devin CLI permission dialog |
@@ -208,6 +208,14 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
 - `routine` (optional): a timer-driven nudge for unattended panes that stop with work
   left; off unless set. Scenario, fields and limits are in
   [routine.md](routine.md).
+- `dynamic_routines` (optional): lets an MCP client with the `routine` scope create
+  routines on this profile's panes with `routine_create`. An object with three optional
+  keys, `min_every_secs` (60 to 604800, default 600), `max_per_pane` (1 to 10, default
+  3) and `max_expires_secs` (3600 to 2592000, default 604800); `{}` uses the defaults.
+  Absent means off: `routine_create` is refused with `routines_not_allowed` and nothing
+  else changes. It may be set without `routine`. An older Shepherd refuses a profiles
+  file that uses the key (unknown keys are errors). See
+  [Agent-created routines](routine.md#agent-created-routines).
 - A `devin` profile's directory must already be trusted in Devin. On a fresh directory
   Devin asks "Do you trust the authors of this directory?". Shepherd never answers
   that prompt. `start_pane` reads the screen for about 3 s after the start, closes the
@@ -235,6 +243,10 @@ A routine is a proactive client inside Shepherd: a timer thread that types a pro
 `nudge_text` into an unattended pane whose finished turn sits idle, with limits and a
 stderr log. It is off unless a launch profile sets a `routine` section. The scenario,
 fields, limits and flowchart are in [routine.md](routine.md).
+
+A second kind, the agent-created routine, types a fixed line into a pane every N seconds
+and is made through the `routine_*` tools. It is off unless the pane's profile sets
+`dynamic_routines`. See [Agent-created routines](routine.md#agent-created-routines).
 
 ## Tools
 
@@ -266,6 +278,10 @@ backend. Calls after the lookup use the pane's internal id. `send_input`,
 | `answer_dialog` | `get`, `read`, `keys` | `terminal`, `choice` (`allow_once` or `deny_once`) | `terminal`, `choice`, `selected`, `title`, `command`, `options`, `moves`, `keys_result` (`status`, `turn`) |
 | `remove_pane` | `get` (twice), `remove` | `terminal`, `timeout` (0 to 60 s, default 2: the grace before the kill) | `name`, `was_live` (the program was running), `stopped` (`exited`, `killed`, `other`, or null when it had already finished), `exit_code` (128 + the signal number when a signal ended it; null when unknown). See [remove_pane](#remove_pane) |
 | `draft_clear` | `get`, then the person side's `draft_clear` (no pane lock: it types nothing) | `terminal` | `terminal`, `cleared` (whether a draft was set). Needs the `lease:preempt` scope. See [draft_clear](#draft_clear) |
+| `routine_create` | `get` | `terminal`, `trigger` (`{"type": "every", "every_secs": N}`), `text`; optional `todo_file`, `expires_secs`, `max_runs` | `routine` and `ceiling`. Needs the `routine` scope and a profile with `dynamic_routines`. See [routine.md](routine.md#agent-created-routines) |
+| `routine_list` | `get` when `terminal` is given | `terminal` (optional) | `routines`: the agent routines and the profile's read-only idle routine (`id` `profile`). Needs the `routine` scope |
+| `routine_update` | `get` | `terminal`, `id`, and at least one of `every_secs`, `text`, `todo_file`, `expires_secs`, `max_runs` | `routine`. Needs the `routine` scope |
+| `routine_delete` | `get` | `terminal`, `id` | `terminal`, `id`, `deleted`. Needs the `routine` scope |
 
 Tool results carry `structuredContent` and a text copy. Unknown tool names are
 JSON-RPC errors.
@@ -312,6 +328,14 @@ for debugging; do not parse it.
 | `pane_replayed` | The pane was picked up by a new server after a restart and its screen is not yet trusted, so nothing was typed. Refused for `send_input`, `answer_dialog` and the routine's nudge. It clears when the program repaints; see [Restart survival](#restart-survival) |
 | `pane_human_controlled` | A person holds the pane's input lease, so nothing was typed. Refused for `send_input`, `send_keys`, `answer_dialog`, `interrupt_pane`, `remove_pane` and the routine's nudge, and never queued: look again later. `idle_secs` and `expires_in_secs` say how long the person has been quiet and when the lease ends if they stay so (300 s without input). No client can take a lease yet, so a server started as before never answers this. `draft_clear` does not end a lease |
 | `pane_draft_pending` | A person typed into the pane and has not pressed Enter, so nothing was typed. Refused for the same operations as `pane_human_controlled`, and never queued. Only a person's Enter clears it, not a turn advance and not time. A server restart under `hold` keeps it. A client with `lease:preempt` can clear it with [`draft_clear`](#draft_clear) when the person is gone. No client can create a draft yet |
+| `routines_not_allowed` | `routine_create` on a pane that was not started from a profile with `dynamic_routines`; nothing was created. `terminal` names the pane |
+| `routine_invalid` | A routine argument is outside a limit (interval, text, `todo_file`, expiry, `max_runs`) or the trigger type is not `every`; nothing was changed. `field` names the argument and `limit` the allowed range |
+| `routine_limit` | The pane already has `max_per_pane` active routines. Carries `field` (`routines`), `limit` and `max` |
+| `routine_not_found` | The pane has no routine with that `id` |
+| `routine_read_only` | `routine_update` or `routine_delete` on `id` `profile`, the idle routine that the profile sets |
+| `routine_not_saved` | A routine change could not be kept for a restart; nothing was changed. Try again |
+| `pane_not_live` | A routine tool named a pane whose program has ended; routines end with their pane |
+| `audit_unavailable` | The `call` line of a mutating tool could not be written; nothing was done. See [Audit log](#audit-log) |
 | `terminal_changed` | The name pointed at a different pane while waiting for the pane lock; nothing was sent |
 | `refused` | `answer_dialog` refused; see [answer_dialog](#answer_dialog) |
 | `unavailable` | The backend cannot be reached |
@@ -734,6 +758,16 @@ counters are written before the nudge bytes, so a crash between the two over-cou
 one nudge and never under-counts it. `gave_up` stays given up across a restart, and the
 cap holds across a crash-looping front.
 
+Agent-created routines (`routine_create`) are kept in the same record, with their grid
+(`created_at`, the next due time), their counters and their status. After a restart the
+new front rebuilds each schedule on its original grid: ticks missed while no front ran
+are skipped, never made up, and a pane that has not repainted (`pane_replayed`) is not
+typed into. A routine that the current profile no longer allows (the `dynamic_routines`
+key is gone, the floor is above its interval, its expiry is beyond the maximum)
+becomes `stopped` with `stop_reason` `profile_changed`, is kept so that it can be seen
+and deleted, and never types again. See
+[Agent-created routines](routine.md#agent-created-routines).
+
 The routine's configuration is read from the **current** profile, so editing the
 profile and sending `SIGUSR2` takes effect. A pane whose profile is gone, or has no
 `routine` now, is not watched, and the front logs one line. The idle clock starts again
@@ -927,6 +961,7 @@ Everything not allowed is denied, and a tool with no scope mapping is denied.
 | `attach` | Watching a pane's stream as a viewer (reserved: the attach surface is not in this release) |
 | `attach:write` | Typing into a pane as a person, under the input lease (reserved, as `attach`) |
 | `lease:preempt` | `draft_clear`; taking the input lease from a person who holds it (the second part is reserved, as `attach`) |
+| `routine` | `routine_create`, `routine_list`, `routine_update`, `routine_delete` |
 
 - A `start_pane` call that names a `profile` needs `start` and the profile on the
   list. A call with `argv` or `line` (the key present counts, even as `null`) needs
@@ -937,6 +972,16 @@ Everything not allowed is denied, and a tool with no scope mapping is denied.
 - A denied call is an MCP tool result with the error code `forbidden` (not an HTTP
   403), and names the missing scope. `tools/list` shows a client only the tools it
   has a scope for; this is a convenience, the check runs on every call.
+- `routine` does not imply `control`. A holder can make Shepherd type a fixed line of at
+  most 1024 bytes (never a bare confirmation) into panes whose profile set
+  `dynamic_routines`, at an interval of at least that profile's floor, until the routine
+  expires; it cannot type anything else. Any client with the scope can manage the
+  routines on every pane it can name, as with `send_input`. The single legacy token
+  holds no `routine` scope, so these tools answer it with `forbidden`; a clients file
+  grants it. An older Shepherd refuses a clients file that names `routine`. A
+  self-scheduling agent's client should hold `routine` (and `observe` if it calls
+  `list_panes`) and not `control`; see
+  [credentials.md](credentials.md#an-agent-as-an-mcp-client).
 - `dialog` is kept apart on purpose: approving a permission dialog lets the agent
   run what it asked for.
 - `attach`, `attach:write` and `lease:preempt` are for a person at a shared pane
@@ -961,19 +1006,28 @@ is recorded (only allowed when no clients file is set).
   `phase`.
 - `phase` is one of:
   - `call`: written before a mutating tool runs (`start_pane`, `send_input`,
-    `answer_dialog`, `remove_pane`, `interrupt_pane`, `draft_clear`).
+    `answer_dialog`, `remove_pane`, `interrupt_pane`, `draft_clear`, `routine_create`,
+    `routine_update`, `routine_delete`).
   - `outcome`: written after the call, best effort, for the mutating tools and for
     `read_output`. It carries `outcome`, which is `ok` or `error:<code>` using the
     tool's error code.
   - `denied`: the scope check refused the call. `outcome` is `denied` and `reason`
     says why.
-- `list_panes`, `get_status` and `wait_status` write no line.
+- `list_panes`, `get_status`, `wait_status` and `routine_list` write no line.
 - Per-tool fields come from an allowlist; anything else is dropped:
   - `start_pane`: `profile` and `pane` (the requested name; the outcome line also
     carries the name the pane got).
   - `send_input`: `pane` and `text_len` (the length of the text in bytes).
   - `answer_dialog`: `pane` and `choice`.
   - `read_output`, `interrupt_pane`, `remove_pane`, `draft_clear`: `pane`.
+  - `routine_create`: `pane`, `trigger`, `every_secs`, `text_len`, `expires_secs`,
+    `max_runs`, `todo` (whether a `todo_file` was set); the outcome line adds the new
+    `routine` id. `routine_update`: `pane`, `routine`, the names of the fields it
+    changes, `text_len`. `routine_delete`: `pane`, `routine`. `routine_list` writes
+    no line.
+  - A routine's nudge is a `send_input` pair by `system:routine`; both lines add
+    `routine` (`profile`, or an id such as `r3`) and `created_by` (`profile`, or the
+    client that created the routine). A tick that is skipped writes nothing.
 - Never recorded: tokens, token hashes, the `Authorization` header, environment
   values, argv, request bodies, typed text, screen text, file contents.
 - Failed authentications are not written to the audit file. Shepherd prints each one
@@ -984,8 +1038,9 @@ is recorded (only allowed when no clients file is set).
 error; a file that was unlinked or renamed while Shepherd runs is not detected,
 because writes keep going to the old file), these tools are refused with the error
 code `audit_unavailable` and nothing is done: `start_pane`, `send_input`,
-`answer_dialog`, `remove_pane` and `draft_clear`. The routine's nudges follow the same
-rule. `interrupt_pane` and the reads go ahead. `interrupt_pane` stays open because it is
+`answer_dialog`, `remove_pane`, `draft_clear`, `routine_create`, `routine_update` and
+`routine_delete`. The routine's nudges follow the same rule. `routine_list` stays open,
+like `list_panes`. `interrupt_pane` and the reads go ahead. `interrupt_pane` stays open because it is
 how a person stops a runaway agent; it is still recorded when the write works.
 Failed writes are counted and reported on stderr at most once a minute. A full disk
 therefore stops state changes but not reading, interrupting, or answering a dialog in
@@ -1004,7 +1059,7 @@ Typed text is not recorded, only its length, but a screen read by a client with
 
 - No clients file: nothing changes. The token from `OPENAB_SHEPHERD_TOKEN_FILE` (or
   `OPENAB_SHEPHERD_TOKEN`) becomes the client `default`, with the seven scopes above `attach` and every
-  profile (none of `attach`, `attach:write` or `lease:preempt`). It is audited only if `OPENAB_SHEPHERD_AUDIT_FILE` is set.
+  profile (none of `attach`, `attach:write`, `lease:preempt` or `routine`). It is audited only if `OPENAB_SHEPHERD_AUDIT_FILE` is set.
 - With a clients file, a token file or a token in the environment is a startup error,
   because a token with every scope would cancel the limits of the others. The message
   names the fix: unset the variable and give that client its own entry
@@ -1078,7 +1133,7 @@ build host needs `sh`, `cat`, `printf`, `env` and `ls`.
 
 The tool contract is pinned by `tests/tool_schema_snapshot.rs`. It compares the tool names and input schemas that `tools/list` reports with `tests/snapshots/tool_schemas.json`. A change to a tool name, argument, type, bound or argument description fails the test until the snapshot is regenerated with `UPDATE_SNAPSHOTS=1 cargo test --test tool_schema_snapshot` and committed in the same PR, so the contract change shows in review. The variable is ignored when `CI` is set. Result fields are not snapshotted: they are documented only as prose in [Tools](#tools), not in a machine-readable form.
 
-The operator end-to-end runbook, which drives real Devin and OpenCode panes through the MCP tools, is in [`docs/operator-e2e/`](operator-e2e/README.md). The restart-survival scripts (kill the server mid-dialog, SIGUSR2, service restart, the version loop, the routine after a restart) are in [`docs/operator-e2e/restart-survival.md`](operator-e2e/restart-survival.md). Agents never run either set: both start the real server.
+The operator end-to-end runbook, which drives real Devin and OpenCode panes through the MCP tools, is in [`docs/operator-e2e/`](operator-e2e/README.md). The restart-survival scripts (kill the server mid-dialog, SIGUSR2, service restart, the version loop, the routine after a restart) are in [`docs/operator-e2e/restart-survival.md`](operator-e2e/restart-survival.md). The dynamic-routine checks (create, skip while working, restart, downtime, audit, profile change, audit failure, expiry) are in [`docs/operator-e2e/routine-dynamic.md`](operator-e2e/routine-dynamic.md). Agents never run any of these sets: they start the real server.
 
 ## CI
 

@@ -6,6 +6,8 @@ Run the scripts from this directory (`docs/operator-e2e` in a clone of the repos
 
 The scripts for restart survival (`hold`, SIGUSR2, service restarts, the routine after a restart) are a separate set, described in [restart-survival.md](restart-survival.md).
 
+The script for agent-created routines (`routine_create` and the other three tools, with a restart, a downtime and the audit file) is `routine-dynamic.sh`, described in [routine-dynamic.md](routine-dynamic.md).
+
 Validated against `origin/main` commit `afd73c9`; see [Known results](#known-results) and [Verified against](#verified-against).
 
 ## Safety rules

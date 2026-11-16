@@ -15,9 +15,11 @@ which answers a permission dialog may receive.
   or IPv6 loopback address, and IPv4 loopback is the default. Every request needs `Authorization: Bearer <token>`, compared in constant
   time. The Host header is checked first, against loopback names and an optional
   allowlist (`OPENAB_SHEPHERD_ALLOWED_HOSTS`) for use behind `tailscale serve`.
-- **Pane lifecycle tools.** Nine MCP tools: `start_pane`, `send_input`,
+- **Pane lifecycle tools.** Ten MCP tools: `start_pane`, `send_input`,
   `read_output`, `get_status`, `wait_status`, `list_panes`, `interrupt_pane`,
-  `answer_dialog` and `remove_pane`. Panes are addressed by name.
+  `answer_dialog`, `remove_pane` and `draft_clear`. Panes are addressed by name.
+  Four more, `routine_create`, `routine_list`, `routine_update` and `routine_delete`,
+  need the `routine` scope (see the routine feature below).
 - **Blocked-dialog handling.** `send_input` refuses to type while a pane is blocked
   on a dialog and returns `pane_blocked`. `answer_dialog` accepts only `allow_once`
   or `deny_once`; the rule-creating options cannot be chosen. It reads the dialog
@@ -37,6 +39,13 @@ which answers a permission dialog may receive.
   pane whose finished turn sits idle past `idle_timeout_secs`, with limits and a
   stderr log. Off unless a profile sets it; see
   [docs/routine.md](docs/routine.md).
+- **Agent-created routines (optional, per profile).** An agent, or any client with the
+  `routine` scope, can ask Shepherd to type a line into a pane every N seconds with
+  `routine_create`: "every hour, check whether any todo work is left". A profile opts
+  in with `dynamic_routines`, which sets the shortest interval, the number per pane and
+  the longest life; without the key nothing changes. Missed or busy ticks are skipped,
+  never queued. See [docs/routine.md](docs/routine.md#agent-created-routines) and the
+  `routine` scope in [docs/operations.md](docs/operations.md#scopes).
 - **Native terminal core.** The default backend runs each pane on its own PTY with a
   `vt100` emulator, a cleared child environment and at most 8 live panes. Programs
   report their state (`idle`, `working`, `done`, `blocked`, ...) with OSC 7501

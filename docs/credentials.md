@@ -72,6 +72,26 @@ audit trail, and `dialog` and `read` are separate scopes, as are the three for a
 person at a shared pane (`attach`, `attach:write`, `lease:preempt`; see
 [operations.md](operations.md#clients-scopes-and-the-audit-log)).
 
+## An agent as an MCP client
+
+Shepherd gives a pane's agent no credential for Shepherd itself, and never puts the MCP
+token into a pane's environment (`OPENAB_SHEPHERD_*` names are refused in a profile
+`env`). What it does set is `SHEPHERD_PANE`, the pane's own name, which is not a secret.
+
+An operator may still give an agent its own client: a token from the clients file, put
+into that agent CLI's own MCP configuration. That client is like any other and its
+scopes are its ceiling. For an agent that schedules itself with the `routine_*` tools
+([routine.md](routine.md#agent-created-routines)), grant `routine`, plus `observe` if it
+should call `list_panes`, and no `control`. The `routine` scope does not imply `control`;
+it lets the agent make Shepherd type a fixed line of at most 1024 bytes into panes whose
+profile set `dynamic_routines`, within that profile's limits. The single legacy token
+holds no `routine` scope, and the list of every scope (the one a clients file may name)
+includes it.
+
+A pane's agent runs as the same OS account as Shepherd and can read any token file that
+account can read (see the [trust model](adr/trust-model.md)). So give it a separate
+narrow token rather than letting it borrow the operator's.
+
 ## What Shepherd does and does not do
 
 Shepherd does:
