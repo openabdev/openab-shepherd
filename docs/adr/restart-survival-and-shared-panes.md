@@ -1,10 +1,10 @@
 # ADR: Restart survival and shared panes
 
-- **Status:** Proposed. Do not merge before the maintainer approves (§8).
+- **Status:** Accepted for restart survival (implemented in #83 to #91, #94, #100; issue #76 closed). Shared panes: the lease, draft, refusals, scopes, `draft_clear` and lease-holder resize are implemented (#95, #96, #97); attach is not implemented (issue #77).
 - **Date:** 2026-11-14 (rescoped)
 - **Author:** chaodu-agent
 - **Related:** #66 (restart survival), #4 (client identity, scopes, audit; first PR #68 merged), `docs/adr/native-core.md`, openabdev/openab-pty#97 (what OpenAB Connect speaks).
-- **Sources:** herdr-core c84d6e7 and Orca, as profiled in `.agents/tasks/arch-comparison/` (`profile-herdr.md`, `profile-orca.md`). Nothing was built or run for this ADR.
+- **Sources:** herdr-core c84d6e7 and Orca, as profiled in task notes that are not in this repository. Nothing was built or run for this ADR.
 
 The maintainer answered #66: restart survival is a requirement (YES), humans and bots will share a pane, for example through OpenAB Connect (YES), and Claude Code and Codex will be supported (YES).
 
@@ -25,10 +25,10 @@ Copy herdr's holder (it owns every PTY, "spawn, pump, resize, signal, reap, no p
 ```mermaid
 flowchart TD
   T[tini PID 1] --> H[holder]
-  H -- socketpair --> F[front]
+  H -- two socketpairs --> F[front]
   H --> P[PTY panes]
   B[bot, MCP bearer] --> F
-  C[Connect human, attach] --> F
+  C[Connect human, attach] -.->|planned, #77| F
 ```
 
 - **Holder** (`openab-shepherd hold`, child of `tini`). Per pane: spawn, write, resize, signal, kill, reap, a ~1 MiB output tail with a per-pane `seq`, and an opaque `meta` blob (set/get). It streams every output byte to the front and parses nothing. It spawns the front over an anonymous socketpair and respawns it with backoff; it never exits because the front failed. Protocol: length-prefixed frames, one integer `HOLDER_VERSION`, exact match. Ops: `spawn write resize signal kill list meta_set meta_get` (`list` returns each pane's cols/rows and tail range); events: `output(pane, seq, bytes)`, `exited(pane, status)`. An exited pane stays in `list` with its status until a front reads it, so no exit is lost while no front runs.
@@ -38,7 +38,7 @@ flowchart TD
 
 ### 3.1 Restart survival
 
-- **Survives:** front crash, front restart, reload (SIGUSR2 to the holder), config, client and profile change. In-place front binary replacement (p1, macmini): replace the file, then send SIGUSR2 to the holder; panes survive while `HOLDER_VERSION` is unchanged. If it changed, the new front exits with a version-mismatch error, the holder logs it and keeps backing off (the bad-config case), and panes live until the holder is restarted.
+- **Survives:** front crash, front restart, reload (SIGUSR2 to the holder), config, client and profile change. In-place front binary replacement (on each of the test hosts): replace the file, then send SIGUSR2 to the holder; panes survive while `HOLDER_VERSION` is unchanged. If it changed, the new front exits with a version-mismatch error, the holder logs it and keeps backing off (the bad-config case), and panes live until the holder is restarted.
 - **Layout and service managers:** the holder is the unit's main process (under `tini` in pods). Stopping or restarting the service (`systemctl restart`, `launchctl kickstart`) stops the holder and ends the panes. No `KillMode` or `AbandonProcessGroup` tricks, and no separate holder unit. The supported front restart is SIGUSR2 to the holder, and `docs/operations.md` says so.
 - **Ends panes:** service restart or stop, holder crash, holder upgrade, host reboot, pod rollout (a new image replaces the holder). Stated plainly, as herdr does. In a pod a front upgrade is a new image, so it ends panes too.
 - **Adoption:** the new front reads `list` and `meta`, and replays each tail into a fresh emulator with the emulator's reply output discarded (DA, DSR, XTVERSION and mode queries in the tail must not be answered into the live PTY). The replay starts at the first line start in the tail; a cut escape sequence at the very start can leave one wrong cell, which the next repaint fixes. Replay is silent: it emits no OSC 7501 events and triggers no waits or routine. `turn` is restored from `meta`, and only output past `turn_seq` advances it, so a crash never double-counts a turn. Status is set from the last OSC 7501 state found in the tail (state only, no event); with a wrapped tail and none found, status is `unknown` until the first fresh event, so output produced while no front ran is never shown as stale `working`. Replay uses the pane's cols/rows, which the holder keeps per pane and returns in `list`.
@@ -103,16 +103,16 @@ Not designed against, by decision. Each is a same-account attack and Shepherd ha
 
 ## 8. Open decisions for the maintainer
 
-Where the two council reviewers still differed, this ADR picked the smaller option. Approve or override:
+Where the two reviews still differed, this ADR picked the smaller option. Approve or override:
 
 - **Q1. Attach transport.** WebSocket or chunked HTTP plus POST: follow whatever openab-pty#97 Connect already speaks. One choice, to be made in the shared-panes issue.
-- **Q2. Resize authority.** One reviewer: last active viewer sets size (herdr). Other: only the lease holder resizes. Chosen: lease holder only, since a resize changes layout under a bot's dialog parser.
-- **Q3. Link.** Chosen: anonymous socketpair, holder is always the parent of the front. Alternative: a named socket in a 0700 directory with a single writer, which is herdr's literal shape but brings stale-socket handling back.
-- **Q4. Persisted pane state.** Chosen: `meta` inside the holder. Alternative: a front-written `registry.json`, which needs reconcile logic after a crash.
+- **Q2. Resize authority.** One review: last active viewer sets size (herdr). Other: only the lease holder resizes. Chosen: lease holder only, since a resize changes layout under a bot's dialog parser. Decided in code (#97).
+- **Q3. Link.** Chosen: anonymous socketpair, holder is always the parent of the front. Alternative: a named socket in a 0700 directory with a single writer, which is herdr's literal shape but brings stale-socket handling back. Decided in code: two socketpairs (#87; see note 5 below).
+- **Q4. Persisted pane state.** Chosen: `meta` inside the holder. Alternative: a front-written `registry.json`, which needs reconcile logic after a crash. Decided in code: `meta` in the holder (#83 to #91).
 - **Q5. Placeholder hook issue.** Chosen: file it now, no work scheduled. Alternative: file nothing until someone asks.
-- **Q6. Bad config.** Chosen: log loop with MCP down. Alternative: a fast container fail on first deploy, which needs `--check-config` back.
+- **Q6. Bad config.** Chosen: log loop with MCP down. Alternative: a fast container fail on first deploy, which needs `--check-config` back. Decided in code: the log loop.
 
-Issue drafts: `.agents/tasks/adr-restart/issues-draft.md` (three issues).
+Q1 (attach transport) and Q5 (the placeholder hook issue) are still open.
 
 ## 9. Consequences
 
@@ -122,7 +122,6 @@ Panes survive the process that changes most. Attach, lease and draft need no new
 
 - #66: https://github.com/openabdev/openab-shepherd/issues/66
 - #4: https://github.com/openabdev/openab-shepherd/issues/4
-- Architecture comparison inputs: `.agents/tasks/arch-comparison/`
 
 ## 11. Implementation notes
 
@@ -136,7 +135,7 @@ Written as the code lands (#76); the list grows with each PR.
 
 ### Where the code departs from, or adds to, the sections above
 
-Recorded when #76 closed its code PRs (PR1 to PR7). The decisions stand; these are the places where the text above is incomplete or says something the code does differently. The status line at the top is the maintainer's to change.
+Recorded when #76 closed its code PRs (PR1 to PR7). The decisions stand; these are the places where the text above is incomplete or says something the code does differently. The status line at the top records what shipped.
 
 1. **The op list is longer (PR5).** `interrupt` needs the terminal's foreground process group (`fg_pgrp`), replay needs the tail bytes with their offsets (`attach`; `list` returns only a range), and the ADR names no consumer for "kept until a front reads them". The added ops are `fg_pgrp`, `attach`, `end_all`, `wait_writable` and the `hello` frame. A finished pane stays until `kill`, which forgets it.
 2. **"Exited panes stay until a front reads them" became "until `remove_pane`".** A first-read rule loses a finished pane on the second front restart, while today finished panes live (up to 32 in the front) for `list_panes` with `all` and `read_output`. The holder's own cap of 64 finished panes is a backstop for when no front lives; the front's 32 is the policy.
@@ -159,4 +158,4 @@ Recorded when #76 closed its code PRs (PR1 to PR7). The decisions stand; these a
 19. **The image runs the holder (PR7).** The `CMD` is `openab-shepherd hold -- <server flags>`. This is the one deployment-visible change; an override with the bare invocation restores the earlier behaviour. The bare binary does not become the holder by default (a later decision, after the operator results).
 20. **Known limit: one events thread.** A front's events share one thread, so an unthrottled writer on one pane (tens of thousands of `keys` a second, each holding that pane's `state` across a round trip) delays every other pane's events. Real callers make tens of calls a second, and a per-pane ingest queue is the local fix if it ever matters.
 
-Still open for the user: the operator runs in `docs/operator-e2e/restart-survival.md` on macmini and p1, and the four agent fixtures from `examples/record_tail.rs`. Those gate closing #76, not merging code.
+Operator results: the runs in `docs/operator-e2e/restart-survival.md` on a macOS host and a Linux host, and the replay fixtures from `examples/record_tail.rs` (two of the four agents, kiro and opencode, are recorded). Issue #76 is closed; report results on #77.

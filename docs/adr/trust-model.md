@@ -15,7 +15,7 @@ herdr and Orca also trust the agent in the pane and the account it runs under. S
 
 - Per-client scopes and an audit log. A status-only CI bot cannot approve a dialog, run an arbitrary command or read the screen, and each mutating call is recorded against its client.
 - A guarded `answer_dialog`. It holds the pane lock from the first read to the Enter key and re-checks status, dialog kind and turn, so a person typing in the same pane and a parser misread do not produce a wrong approval.
-- Restart survival, so a Shepherd restart does not end every pane. This is planned (#66) and does not exist yet.
+- Restart survival under `hold`, so a Shepherd restart does not end every pane (#76). Panes still end when the holder stops.
 
 A pane's agent holds no Shepherd credential unless the operator gives it a client of its
 own. The `routine` scope lets such a client make Shepherd type a fixed, bounded line into

@@ -30,7 +30,7 @@ whether the remaining work is worth doing, which a fixed nudge cannot.
 ## How it is triggered
 
 A timer thread checks every 5 s. It runs only when at least one launch profile sets
-a `routine` section, and it watches only panes that this Shepherd process started from
+a `routine` or a `dynamic_routines` section, and it watches only panes that this Shepherd process started from
 such a profile. Registrations survive a server restart when Shepherd runs under
 `openab-shepherd hold`: the profile name and the counters are kept with the pane, and
 the new server watches the pane again (see [Restart
@@ -39,7 +39,7 @@ its panes, so a restart ends them and there is nothing to watch.
 
 ## Conditions
 
-The routine checks these in order on every pass, for each watched pane:
+The routine checks these on every pass, for each watched pane; all must hold:
 
 1. The pane's turn has finished and the turn number has sat untouched for
    `idle_timeout_secs`.
@@ -58,13 +58,15 @@ flowchart TD
     B -- no --> A
     B -- yes --> C{Todo has open item?}
     C -- no --> A
-    C -- yes --> D{Under nudge limit?}
+    C -- yes --> K{Cooldown passed?}
+    K -- no --> A
+    K -- yes --> D{Under nudge limit?}
     D -- yes --> E[Nudge via send path]
     E --> A
     D -- no --> F[Give up, log it]
 ```
 
-Without a `todo_file`, the "open item" step always passes.
+Without a `todo_file`, the "open item" step always passes. A pane that is blocked, replayed or has a person at it is skipped.
 
 ## Profile fields and limits
 
@@ -178,6 +180,21 @@ and is not available to the tools. Dynamic routines are off unless the operator 
 in per launch profile, so a profiles file without the `dynamic_routines` key behaves
 exactly as before.
 
+```mermaid
+flowchart TD
+  A[agent calls routine_create] --> B{routine scope and dynamic_routines?}
+  B -- no --> X[refused]
+  B -- yes --> C[saved in pane meta]
+  C --> D[every tick, 5 s check]
+  D --> E{due on the grid?}
+  E -- no --> D
+  E -- yes --> F{turn finished and nobody at the pane?}
+  F -- no --> G[skip, not made up]
+  F -- yes --> H[type text]
+  G --> D
+  H --> D
+```
+
 ### What it does and does not do
 
 - At each grid time (`created_at + n * every_secs`) Shepherd types `text` through
@@ -188,7 +205,7 @@ exactly as before.
   misses ticks. `last_result` in `routine_list` says what happened at the last
   tick (`skipped:working` and so on).
 - Ticks missed while Shepherd was down are skipped too. After a restart the
-  routine resumes on its original grid, with no burst. A laptop that sleeps is the
+  routine resumes on its original grid, with no burst. A machine that sleeps is the
   same as a server that was down. There is no calendar syntax, so no time zone and
   no daylight saving rule.
 - The text is typed unchanged, with no prefix. A text that starts with `/` is still
@@ -290,7 +307,7 @@ Errors (`structuredContent.error`):
 
 | Code | When | Extra fields |
 |------|------|--------------|
-| `forbidden` | the client has no `routine` scope (the single legacy token never has it) | the missing scope |
+| `forbidden` | the client has no `routine` scope (the single token never has it) | the missing scope |
 | `routines_not_allowed` | the pane was not started from a profile with `dynamic_routines` | `terminal` |
 | `routine_invalid` | a value is outside a limit, or the trigger type is not `every` | `field`, `limit` |
 | `routine_limit` | the pane already has `max_per_pane` active routines | `field` (`routines`), `limit`, `max` |
@@ -335,7 +352,7 @@ on such a pane.
 `routine` is a separate scope. It does not imply `control`: a holder can only make
 Shepherd type a fixed line of at most 1024 bytes, not a bare confirmation, at an
 interval of at least the profile's floor, on panes whose profile opted in. It does
-not allow `send_input`. The single legacy token holds no `routine` scope; a clients
+not allow `send_input`. The single token (client `default`) holds no `routine` scope; a clients
 file can grant it (the `ALL` list includes it). Any client with the scope can create,
 list, update and delete on any pane it can name, as `send_input` and `remove_pane`
 work; per-client ownership is a non-goal ([trust model](adr/trust-model.md)).
@@ -387,5 +404,5 @@ Possible later extensions, none planned:
 - a dynamic `idle` trigger.
 
 Any extension would add trigger and action fields inside the same routine record. It
-needs a concrete scenario first, and a design that has had a council review and a
+needs a concrete scenario first, and a written design and review and a
 comparison with herdr and Orca before any code.

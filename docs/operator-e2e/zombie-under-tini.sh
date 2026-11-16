@@ -7,7 +7,7 @@
 #   IMAGE=<image> ./zombie-under-tini.sh            # the real entrypoint (tini): expect PASS
 #   IMAGE=<image> NO_TINI=1 ./zombie-under-tini.sh  # holder as PID 1: expect FAIL (control)
 #
-# DOCKER defaults to `docker`; on a Mac with OrbStack set DOCKER=~/.orbstack/bin/docker.
+# DOCKER defaults to `docker`; on a Mac set DOCKER to the docker binary.
 set -u
 IMAGE="${IMAGE:?set IMAGE to the image to check}"
 DOCKER="${DOCKER:-docker}"

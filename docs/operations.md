@@ -13,13 +13,13 @@ only backend. Status: MVP. Test and probe results are in
 
 ## Language: Rust
 
-- The user chose Rust for the MVP. The project rule is that the laptop never runs
-  `cargo` or `rustc`, so all compilation happens on a remote build host.
+- Shepherd is written in Rust. Build it on any machine with the pinned Rust toolchain
+  (see `rust-toolchain.toml`).
 - The release build is one native binary with no interpreter or virtualenv to
   manage on the machine that runs it.
 - `serde_json` parses and emits JSON-RPC. `tiny_http` provides the HTTP listener.
-  The native core adds `libc` and `vt100` (pinned to `=0.18.1`). Four direct
-  dependencies in total.
+  The native core adds `libc` and `vt100` (pinned to `=0.18.1`), and `sha2` hashes
+  client tokens. Five direct dependencies in total.
 
 ## MCP SDK or hand-written: hand-written
 
@@ -27,7 +27,7 @@ The MCP surface this server needs is small: `initialize`, `notifications/initial
 `ping`, `tools/list`, and `tools/call`, over HTTP POST with JSON replies. `src/mcp.rs`
 and `src/http.rs` implement it, and unit tests exercise both.
 
-An official Rust MCP SDK was not used. I did not verify its current API offline, and
+An official Rust MCP SDK was not used: its current API was not checked offline, and
 its streaming and session features are unused here. Replacing this layer with an SDK
 later is a contained change.
 
@@ -42,7 +42,8 @@ later is a contained change.
 | `src/ansi.rs` | Escape-sequence filter for pane output |
 | `src/backend.rs` | The `TerminalBackend` trait and Shepherd's own types: `TerminalInfo`, `ProgramStatus`, `Capabilities`, `InputGuard`, `BackendError`, ... |
 | `src/native/mod.rs` | `NativeBackend`: pane table, reader and reaper threads, guarded writes, the trait impl |
-| `src/native/pty.rs`, `term.rs`, `status.rs`, `keys.rs`, `procs.rs` | PTY spawn and child env; the `vt100` emulator and query replies; OSC 7501 parsing and turns; key encoding; the process table and descendant tree used by cleanup |
+| `src/native/term.rs`, `status.rs`, `keys.rs` | The `vt100` emulator and query replies; OSC 7501 parsing and turns; key encoding |
+| `src/native/host/pty.rs`, `procs.rs` | PTY spawn and child env; the process table and descendant tree used by cleanup |
 | `src/native/host/` | The process half, behind the `PtyHost` trait: `local.rs` (PTYs and process trees in this process), `tail.rs` (the per-pane tail ring), `wire.rs`, `server.rs` and `client.rs` (the holder link), `supervisor.rs` (`hold`), `front.rs` (what `front` does at start) |
 | `src/native/meta.rs`, `replay.rs` | The per-pane record the front keeps in the holder, and silent replay of the tail on adoption |
 | `src/native/tests.rs` | Test-only: native tests with real programs |
@@ -58,11 +59,16 @@ later is a contained change.
 | `src/panelock.rs` | The per-pane lock that serializes calls typing into one pane |
 | `src/mcp.rs` | MCP message handling |
 | `src/http.rs` | Loopback Host check, bearer auth, POST handling |
+| `src/clients.rs`, `src/audit.rs` | Clients, scopes and token checks; the audit log |
+| `src/registry.rs`, `src/shared_panes.rs`, `src/tool_flows.rs` | The tools layer's per-pane records (rebuilt after a restart), the shared-pane refusals, shared tool flows |
+| `src/routine_model.rs`, `src/schedule.rs` | Agent-created routines: the record and its limits; the `every` schedule |
+| `src/native/human.rs`, `src/native/lease.rs` | The input lease, the draft flag and the lease holder's resize |
+| `src/native/host/contract.rs`, `held.rs`, `mod.rs` | The `PtyHost` contract and the holder's per-pane state |
 | `src/testutil.rs` | Test-only helpers: scratch dirs, git init, an in-memory `FakeBackend` |
 
 ## Run
 
-Build on the remote build host, then copy the release binary back (see Build offload).
+Build the release binary (see Build offload).
 Create the token file outside any git repository:
 
 ```sh
@@ -128,10 +134,10 @@ also be a regular file owned by the user Shepherd runs as and writable by no one
 (`chmod 600` or `644`); Shepherd checks and reads the same open file. Otherwise
 Shepherd refuses to start.
 
-Upgrading: `start_pane` without a profiles file now refuses every start with
-`profile_required`. Create a profiles file with the programs
-you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
-`argv`/`line` (without credentials).
+Without a profiles file, `start_pane` refuses every start with `profile_required`. Create a
+profiles file with the programs you start, or set `"allow_arbitrary_command": true` in it
+to allow caller-chosen `argv`/`line` (without credentials). The file holds at most 64
+profiles and is at most 1 MiB.
 
 ```json
 {
@@ -187,7 +193,7 @@ you start, or set `"allow_arbitrary_command": true` in it to keep caller-chosen
 - `agent` (optional, default `kiro`): `kiro`, `devin` or `opencode`. It decides which permission
   dialog `answer_dialog` reads for panes this profile starts, and, for `devin`, the
   launch flag below. For `opencode`, `answer_dialog` sends Esc for `deny_once` and presses Enter for `allow_once` only after
-  it verifies the highlight from styled cells (see the OpenCode section of the README), and its profiles must use `permission_mode` `normal`. A pane started any other way has no agent, so `answer_dialog`
+  it verifies the highlight from styled cells (see [opencode.md](opencode.md)), and its profiles must use `permission_mode` `normal`. A pane started any other way has no agent, so `answer_dialog`
   refuses it with no keys sent. Panes started before this Shepherd process have no
   record of their agent, so they are refused too.
   A profile whose `argv` or `extra_args` names `opencode` (case-insensitive substring) and contains an auto-approve spelling (`--auto`, `autoaccept`, `auto-accept`) is refused at load. This prevents accidental configuration; it does not defend against a renamed binary, a wrapper script, or `allow_arbitrary_command`.
@@ -326,7 +332,7 @@ for debugging; do not parse it.
 | `status_mismatch` | A backend-side input condition did not hold; nothing was sent |
 | `pane_finished` | The pane's program has ended |
 | `pane_replayed` | The pane was picked up by a new server after a restart and its screen is not yet trusted, so nothing was typed. Refused for `send_input`, `answer_dialog` and the routine's nudge. It clears when the program repaints; see [Restart survival](#restart-survival) |
-| `pane_human_controlled` | A person holds the pane's input lease, so nothing was typed. Refused for `send_input`, `send_keys`, `answer_dialog`, `interrupt_pane`, `remove_pane` and the routine's nudge, and never queued: look again later. `idle_secs` and `expires_in_secs` say how long the person has been quiet and when the lease ends if they stay so (300 s without input). No client can take a lease yet, so a server started as before never answers this. `draft_clear` does not end a lease |
+| `pane_human_controlled` | A person holds the pane's input lease, so nothing was typed. Refused for `send_input`, key presses (`answer_dialog`), `interrupt_pane`, `remove_pane` and the routine's nudge, and never queued: look again later. `idle_secs` and `expires_in_secs` say how long the person has been quiet and when the lease ends if they stay so (300 s without input). No client can take a lease yet, so a server started as before never answers this. `draft_clear` does not end a lease |
 | `pane_draft_pending` | A person typed into the pane and has not pressed Enter, so nothing was typed. Refused for the same operations as `pane_human_controlled`, and never queued. Only a person's Enter clears it, not a turn advance and not time. A server restart under `hold` keeps it. A client with `lease:preempt` can clear it with [`draft_clear`](#draft_clear) when the person is gone. No client can create a draft yet |
 | `routines_not_allowed` | `routine_create` on a pane that was not started from a profile with `dynamic_routines`; nothing was created. `terminal` names the pane |
 | `routine_invalid` | A routine argument is outside a limit (interval, text, `todo_file`, expiry, `max_runs`) or the trigger type is not `every`; nothing was changed. `field` names the argument and `limit` the allowed range |
@@ -383,6 +389,30 @@ must not be `blocked`, then the text is sent, still inside the lock.
 forgery as a security boundary under its [trust model](adr/trust-model.md): pane programs are trusted.
 
 ### answer_dialog
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant S as Shepherd
+  participant B as Backend
+  C->>S: answer_dialog allow_once
+  S->>S: take pane lock
+  S->>B: get status
+  B-->>S: blocked, permission, turn N
+  loop up to 16 reads, 200 ms apart
+    S->>B: read screen
+    B-->>S: screen text
+    S->>S: parse dialog
+  end
+  S->>B: move cursor keys, guarded
+  S->>B: read screen again
+  B-->>S: cursor on target, same dialog
+  S->>B: Enter with guard blocked, permission, turn N
+  B-->>S: pressed, or refused if state changed
+  S-->>C: result, or refused with nothing sent
+```
+
+This is the Kiro and Devin path. OpenCode skips the cursor moves and presses Enter in one guarded step from the styled cells.
 
 1. Take the pane lock, then `get`: refuse unless `status.state` is `blocked` and
    `status.kind` is `permission`. Record the `turn` number.
@@ -575,7 +605,7 @@ profile.
 `NativeBackend` (`src/native/`) is the only backend and is what Shepherd starts;
 `OPENAB_SHEPHERD_BACKEND` accepts only unset, empty or `native`, and any other value
 exits with status 2. The trait stays so that another backend can be added later
-without touching the tools; none is planned. The herdr-core (hc) backend was removed.
+without touching the tools; none is planned. 
 
 ### Native backend
 
@@ -665,6 +695,34 @@ which starts `openab-shepherd front` (a hidden subcommand of the same binary) wi
 flags after `--` and starts it again whenever it exits. The bare command is unchanged:
 one process serves and owns its panes, and `survives_restart` is false. The container
 image runs the holder by default (see [Container image](#container-image)).
+
+```mermaid
+sequenceDiagram
+  participant O as Operator
+  participant H as Holder
+  participant F1 as Old front
+  participant F2 as New front
+  participant P as Panes
+  O->>H: SIGUSR2
+  H->>F1: SIGTERM, SIGKILL after 5 s
+  F1-->>H: exits
+  Note over H,P: panes keep running, tail ring keeps filling
+  H->>F2: start, no backoff
+  F2->>H: hello with HOLDER_VERSION
+  Note over F2: other number: exit 78, holder retries
+  F2->>H: list, then attach per pane
+  H-->>F2: tail bytes and meta
+  F2->>F2: replay silently, no replies, no events
+  alt tail wrapped
+    F2->>P: resize one row, then back
+    Note over F2,P: pane_replayed until it repaints
+  else tail complete
+    Note over F2: pane live at once
+  end
+  F2->>F2: rebuild agent kind, routines, start routine thread
+```
+
+A front kill (`kill -9`) follows the same path, except that the holder waits 1 s, then 2 s, doubling to 30 s, before it starts the next front.
 
 ```
 openab-shepherd hold -- <server flags>                   holder: PTYs, process trees, tail rings
@@ -852,7 +910,7 @@ text removes the rest of the text. Newlines and tabs are kept.
 - Bearer token: compared in constant time. A missing, wrong or expired token gets
   HTTP 401. With a clients file, each client has its own token and scopes (see
   [Clients, scopes and the audit log](#clients-scopes-and-the-audit-log)).
-- Only `POST /mcp` is served. `GET` gets 405. Notifications get 202.
+- Only `POST /mcp` is served. Checks run in this order: Host header (403), bearer token (401), path (404), method (405, so `GET` gets 405); then an unreadable body gets 400 and one over 1 MiB gets 413. Notifications get 202.
 - The listener binds the validated loopback address only. The server does not run
   `tailscale serve`, Funnel, or any other public listener.
 - Request bodies are capped at 1 MiB, read before the token check. Request bodies
@@ -926,8 +984,7 @@ traceable in an audit log.
 - `profiles`: the launch profile names this client may start. Optional; missing or
   empty means none. There is no "all profiles" entry.
 - `expires`: optional, Unix seconds. From that second on, the token is refused.
-- Unknown fields anywhere in the file are an error (this includes the removed
-  `allow_legacy_token`). A key repeated inside one JSON object is not checked: the last
+- Unknown fields anywhere in the file are an error. A key repeated inside one JSON object is not checked: the last
   value wins. The whole file is validated before any of it is used; one bad entry
   stops startup with exit status 2.
 - File rules: the path is canonicalized, must be a regular file, with no group or
@@ -976,7 +1033,7 @@ Everything not allowed is denied, and a tool with no scope mapping is denied.
   most 1024 bytes (never a bare confirmation) into panes whose profile set
   `dynamic_routines`, at an interval of at least that profile's floor, until the routine
   expires; it cannot type anything else. Any client with the scope can manage the
-  routines on every pane it can name, as with `send_input`. The single legacy token
+  routines on every pane it can name, as with `send_input`. The single token (client `default`)
   holds no `routine` scope, so these tools answer it with `forbidden`; a clients file
   grants it. An older Shepherd refuses a clients file that names `routine`. A
   self-scheduling agent's client should hold `routine` (and `observe` if it calls
@@ -985,7 +1042,7 @@ Everything not allowed is denied, and a tool with no scope mapping is denied.
 - `dialog` is kept apart on purpose: approving a permission dialog lets the agent
   run what it asked for.
 - `attach`, `attach:write` and `lease:preempt` are for a person at a shared pane
-  (issue #77), not for a bot. The single legacy token holds none of the three, so
+  (issue #77), not for a bot. The single token (client `default`) holds none of the three, so
   a deployment that wants a person at a pane needs a clients file, and a bot's
   client is simply not given them. A clients file may name them (an older server
   reading a file that does is a startup error on the unknown scope).
@@ -1084,10 +1141,10 @@ Use the same `printf %s`, not `echo`, so no newline is hashed.
 
 ### Limits
 
-- **No pane ownership yet.** Every client with `control` or `remove` can act on
+- **No pane ownership.** Every client with `control` or `remove` can act on
   every pane, including panes another client started. `list_panes` shows every pane
   to every client with `observe`. A client's `profiles` list limits what it can
-  start, not what it can touch.
+  start, not what it can touch. Pane ownership is a non-goal (see the [trust model](adr/trust-model.md)).
 - **`control` is code execution within the pane's rights.** `send_input` types into
   a coding agent, which can run commands as Shepherd's user, with the credentials
   of that pane's profile. Give `control` only to clients you would trust with that.
@@ -1149,7 +1206,7 @@ secrets and only read access to the repository.
   after 15 minutes.
 
 To reproduce the `test` job, run these three commands in the crate directory on the build
-host (see "Build offload"), never on the laptop:
+host (see "Build offload"), not on a light developer machine:
 
 ```sh
 cargo fmt --check
@@ -1185,9 +1242,9 @@ The job fails if any run failed. The logic is in `.github/scripts/stress-native.
 
 ## Build offload
 
-The laptop never runs `cargo` or `rustc`. Sync the crate to the build host with
-`rsync -a --delete --exclude target/`, which keeps the remote build cache. Build and
-test there, then copy `target/release/openab-shepherd` back. The real-Kiro probe is
+Build and test on a machine with the pinned toolchain. Syncing the crate with
+`rsync -a --delete --exclude target/` keeps the remote build cache. Copy
+`target/release/openab-shepherd` back if you built elsewhere. The real-Kiro probe is
 built by `cargo build --release --all-targets` at
 `target/release/examples/native_probe`; copy it back with `scp` and run it on the
 machine that has kiro-cli (it takes only `--keep-dir` and opens no listener).
@@ -1198,7 +1255,7 @@ machine that has kiro-cli (it takes only `--keep-dir` and opens no listener).
 runtime with kiro-cli, git and tini, running as uid 1000. kiro-cli is pinned to
 3.1.0 (`KIRO_CLI_VERSION`) and its download is checked against a SHA-256 for amd64
 and for arm64. The image holds no token and
-no profiles file. Build it on the remote build host, not the laptop:
+no profiles file. Build it on the build host:
 
 ```sh
 docker build --platform linux/amd64 -t <registry>/openab-shepherd:<version> .
@@ -1322,7 +1379,7 @@ to a registry, push or create a release. It runs `verify` for the given version,
 amd64 (loaded locally, runs `openab-shepherd --help`) and arm64 (built, discarded):
 
 ```sh
-gh workflow run release.yml -f dry_run=true -f version=0.3.0
+gh workflow run release.yml -f dry_run=true -f version=X.Y.Z
 ```
 
 Use a version that matches `Cargo.toml` on the ref you run it on. GitHub only accepts a
@@ -1385,11 +1442,11 @@ try to update itself at run time).
 
 ## Known limits (MVP scope)
 
-- **No per-pane ownership.** With the single token, any holder has full control of
+- **No per-pane ownership (a non-goal).** With the single token, any holder has full control of
   every pane. With a clients file, scopes limit what a client may do, but a client
   with `control` or `remove` can still act on every pane (see
   [Clients, scopes and the audit log](#clients-scopes-and-the-audit-log)).
-- **Permission dialogs: text parsing, two layouts.** `answer_dialog` parses the dialog
+- **Permission dialogs: text parsing, three agents.** `answer_dialog` parses the dialog
   from screen text, for the pane's agent. Kiro dialogs were measured on kiro-cli 3.3.0
   (V3 engine); shell dialogs were also measured on 3.1.0. Devin
   is tested against the layouts measured on Devin CLI 3000.12.43 and 3000.12.57 for shell commands.
@@ -1424,7 +1481,8 @@ try to update itself at run time).
   live parent until the next look, is ended (issue #10). macOS offers no
   unprivileged way to close this: kqueue `NOTE_TRACK` answers `ENOTSUP`, only root
   can create a coalition, and there is no subreaper or cgroup (measured on macOS
-  15.7). A Linux subreaper is a follow-up.
+  15.7). On Linux the holder is deliberately not a subreaper; an orphan that
+  escapes the scan is reaped by PID 1 (tini in the image).
 - **A profile's credential goes to that profile's program and what it runs.** A Kiro
   profile with `KIRO_API_KEY` gives the key to kiro-cli, and Kiro's tools inherit it,
   so a caller who can prompt that Kiro can try to make it reveal the key. Profiles
@@ -1445,11 +1503,11 @@ try to update itself at run time).
   working until it exits, so `wait_status` on it returns only on exit or timeout.
 - **Trimmed argv.** Argument text is trimmed by the input rules, so leading and
   trailing spaces inside an `argv` element are lost.
-- **Grok Bot tested by hand only.** Grok Bot has connected to a deployed endpoint and
-  called these tools in manual sessions. No automated test covers that client.
+- **MCP clients tested by hand only.** A deployed MCP client (Grok Bot) has called these
+  tools in manual sessions. No automated test covers that client.
 - **Stateless HTTP.** No SSE stream and no session ids. Clients that expect server
   push or sessions will not get them.
 - **One backend.** The native core is the only backend and was verified against
   kiro-cli 3.1.0. openab-pty is not a backend.
 - **Integration.** The native backend's real-program tests run in `cargo test` and
-  the real-Kiro probe ran on the laptop ([`MVP-REPORT.md`](../MVP-REPORT.md), a dated record).
+  the real-Kiro probe ran on a developer machine ([`MVP-REPORT.md`](../MVP-REPORT.md), a dated record).

@@ -1,8 +1,8 @@
 # Restart survival: operator end-to-end scripts
 
-For a person at a terminal on **macmini (macOS)** and **p1 (Linux)**. These scripts start the real
+For a person at a terminal on a **macOS host** and a **Linux host**. These scripts start the real
 `openab-shepherd hold` and drive it through the MCP tools. **Agents never run them**: an agent must
-not start the Shepherd server. Issue #76 stays open until you have run them on both machines and
+not start the Shepherd server. Issue #76 is closed; run them on both machines and
 pasted the results into the issue (see [Results](#results-for-the-issue)).
 
 None of them calls a model. The panes are `sh -c` scripts that print OSC 7501 status reports and a
@@ -17,15 +17,15 @@ stops its holder, which ends its panes, and removes these files when it ends (`K
 
 ## Before you start
 
-1. A release binary built on the build host, not on the laptop (`cargo build --release`), copied to
+1. A release binary built on the build host (`cargo build --release`), copied to
    `~/.local/bin/openab-shepherd` on the machine you test (or set `SHEPHERD_BIN`). Build one per
    architecture and note the commit: `git rev-parse --short HEAD`.
-2. `bash`, `python3`, `openssl`, `curl` and `pgrep` on the machine. `systemd --user` on p1 for
+2. `bash`, `python3`, `openssl`, `curl` and `pgrep` on the machine. `systemd --user` on the Linux host for
    `service-restart-linux.sh` (over ssh: `loginctl enable-linger $USER` once).
 3. Run from this directory (`docs/operator-e2e` in a clone of the repository).
 
 Check the scripts without starting anything: `bash -n *.sh`, and `shellcheck *.sh` where it is
-installed (macmini has it).
+installed.
 
 ## The scripts
 
@@ -40,7 +40,7 @@ installed (macmini has it).
 | `service-restart-linux.sh` | The holder under a systemd user unit: `systemctl --user reload` keeps the pane, `restart` ends it | 1 min |
 | `version-mismatch.sh` | A front that speaks another protocol number exits 78 repeatedly with growing delays and the log names both numbers, MCP is down and the pane stays alive; then a matching front adopts it with its state | 1 min |
 | `routine-after-restart.sh` | A pane that had used its only nudge stays given up across SIGUSR2; a pane not yet nudged is nudged by the new front at least once and at most `max_consecutive_nudges` times, then gives up and is not nudged again after a second restart; a profile that loses its `routine` block is no longer watched | 2 min |
-| `zombie-under-tini.sh` | The image under real tini on p1 (Docker): no defunct process, SIGUSR2 through tini, `docker stop`. `NO_TINI=1` is the control and must fail | 1 min |
+| `zombie-under-tini.sh` | The image under real tini on the Linux host (Docker): no defunct process, SIGUSR2 through tini, `docker stop`. `NO_TINI=1` is the control and must fail | 1 min |
 | `record-replay-fixture.sh AGENT` | Records replay fixtures for `claude`, `codex`, `kiro` or `opencode` with `examples/record_tail.rs` (2 model prompts) | 5 min |
 | `restart-cleanup.sh` | Stops a leftover holder and removes the throwaway files | 1 s |
 
@@ -51,16 +51,16 @@ with `KEEP=1`).
 
 ## Running them
 
-On macmini, then on p1:
+On the macOS host, then on the Linux host:
 
 ```sh
 cd docs/operator-e2e
 for s in front-kill front-kill-mid-dialog wrapped-tail sigusr2 version-mismatch routine-after-restart; do
   echo "=== $s"; bash "$s.sh" 2>&1 | tee "/tmp/$s.out"
 done
-bash service-restart-macos.sh    # macmini
-bash service-restart-linux.sh    # p1
-IMAGE=<registry>/openab-shepherd:<version> bash zombie-under-tini.sh   # p1; DOCKER=~/.orbstack/bin/docker on a Mac
+bash service-restart-macos.sh    # macOS host
+bash service-restart-linux.sh    # Linux host
+IMAGE=<registry>/openab-shepherd:<version> bash zombie-under-tini.sh   # Linux host; on a Mac set DOCKER to the docker binary
 ```
 
 Run one at a time: they share the port and the throwaway directories. The routine scenario for agent-created routines, `routine-dynamic.sh`, has its own runbook, [routine-dynamic.md](routine-dynamic.md), and its own port and directories.
@@ -84,10 +84,10 @@ Run one at a time: they share the port and the throwaway directories. The routin
 Paste, per machine, the last lines of each script (the `host:`, `binary:`, `summary:` and `RESULT:`
 lines), the commit you built, and for `sigusr2.sh` the five `MCP back after N ms` lines. Then:
 
-- **#76 closes** when `front-kill.sh`, `front-kill-mid-dialog.sh`, `sigusr2.sh`,
+- **#76 (closed)** was gated on `front-kill.sh`, `front-kill-mid-dialog.sh`, `sigusr2.sh`,
   `service-restart-*.sh`, `version-mismatch.sh` and `routine-after-restart.sh` say `RESULT: PASS` on
-  macmini and p1, `zombie-under-tini.sh` passes on p1, and the four agents' fixtures are recorded,
-  read and committed under `tests/fixtures/replay/<agent>/`.
+  a macOS host and a Linux host, `zombie-under-tini.sh` passes on the Linux host, and the agents' fixtures are recorded,
+  read and committed under `tests/fixtures/replay/<agent>/` (kiro and opencode are recorded; claude and codex are not). Report results on #77.
 - **Mode snapshot.** If a recording shows that replay loses alternate screen, scroll region or
   kitty flags for one of the four agents, say so in the issue. A snapshot of those modes in the pane
   record is a follow-up, not part of #76.

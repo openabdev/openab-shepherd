@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Linux (p1): run the holder as a systemd user unit and check both kinds of restart.
+# Linux: run the holder as a systemd user unit and check both kinds of restart.
 #   systemctl --user reload    runs ExecReload (kill -USR2 $MAINPID): the pane survives.
 #   systemctl --user restart   restarts the holder: the pane ends, as documented.
 # It installs a throwaway unit (shepherd-e2e-restart.service) in ~/.config/systemd/user and

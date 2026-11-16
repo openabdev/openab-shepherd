@@ -2,7 +2,7 @@
 
 > **Historical record, last reviewed against `origin/main` 6dba579 (0.2.0 plus the Devin and
 > OpenCode changes).** The sections below were written at the points in time they name and are
-> not rewritten. Counts and statements in them (70, 120, 170 tests; seven tools; "crate not yet
+> not rewritten. Host names and the "laptop" in it are historical. Counts and statements in them (70, 120, 170 tests; seven tools; "crate not yet
 > committed") describe those moments. **Current facts:** 9 tools (`TOOL_NAMES` in
 > `src/tools.rs`); 264 unit tests (lib 261, bin 3, `cargo test` on the build host); the crate is
 > committed and released as 0.2.0; supported agents are kiro-cli 3.1.0 and Devin CLI 3000.12.43
