@@ -16,8 +16,9 @@
 //! follows `serde_json`: the last value wins.
 //!
 //! Without a clients file, the single bearer token is the client `default`
-//! with every scope. With one, a token file or env token is a startup error
-//! (see `config.rs`).
+//! with the seven scopes that existed before shared panes (not `attach`,
+//! `attach:write` or `lease:preempt`). With one, a token file or env token is
+//! a startup error (see `config.rs`).
 //!
 //! Not here yet (later phases of issue #4): pane ownership, reload without a
 //! restart, `dialog:deny`, a token CLI.
@@ -65,10 +66,35 @@ pub enum Scope {
     Dialog,
     /// `remove_pane`.
     Remove,
+    /// Watch a pane's stream as a viewer (issue #77). Reads only.
+    Attach,
+    /// Type into a pane as a person, under the input lease (issue #77).
+    AttachWrite,
+    /// Take the input lease from a person who holds it, and `draft_clear`
+    /// (issue #77). A person's scope: the legacy token and bots do not get it.
+    LeasePreempt,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 7] = [
+    /// Every scope the clients file can name: the parser's universe.
+    pub const ALL: [Scope; 10] = [
+        Scope::Observe,
+        Scope::Read,
+        Scope::Control,
+        Scope::Start,
+        Scope::StartArbitrary,
+        Scope::Dialog,
+        Scope::Remove,
+        Scope::Attach,
+        Scope::AttachWrite,
+        Scope::LeasePreempt,
+    ];
+
+    /// What the single legacy token holds: the scopes that existed before
+    /// shared panes. It gets none of `attach`, `attach:write` and
+    /// `lease:preempt`; a person's access needs a clients file. Granting a
+    /// scope later is not breaking, withdrawing one is.
+    pub const LEGACY: [Scope; 7] = [
         Scope::Observe,
         Scope::Read,
         Scope::Control,
@@ -87,6 +113,9 @@ impl Scope {
             Scope::StartArbitrary => "start:arbitrary",
             Scope::Dialog => "dialog",
             Scope::Remove => "remove",
+            Scope::Attach => "attach",
+            Scope::AttachWrite => "attach:write",
+            Scope::LeasePreempt => "lease:preempt",
         }
     }
 
@@ -151,9 +180,10 @@ impl Caller {
         }
     }
 
-    /// The caller of a deployment with one token: every scope, any profile.
+    /// The caller of a deployment with one token: the legacy scopes, any
+    /// profile.
     pub fn default_client() -> Self {
-        Self::new(DEFAULT_ID, Scope::ALL, ProfileAccess::Any)
+        Self::new(DEFAULT_ID, Scope::LEGACY, ProfileAccess::Any)
     }
 
     fn from_client(client: &Client) -> Self {
@@ -194,6 +224,7 @@ pub fn any_scope(tool: &str) -> Option<&'static [Scope]> {
         "start_pane" => &[Scope::Start, Scope::StartArbitrary],
         "answer_dialog" => &[Scope::Dialog],
         "remove_pane" => &[Scope::Remove],
+        "draft_clear" => &[Scope::LeasePreempt],
         _ => return None,
     })
 }
@@ -414,7 +445,7 @@ fn default_client(token: &str) -> Client {
     Client {
         id: DEFAULT_ID.to_string(),
         token_sha256: sha256(token.as_bytes()),
-        scopes: Scope::ALL.into_iter().collect(),
+        scopes: Scope::LEGACY.into_iter().collect(),
         profiles: ProfileAccess::Any,
         expires: None,
     }
@@ -700,6 +731,7 @@ mod tests {
                     "start_pane" => scope == Scope::Start,
                     "answer_dialog" => scope == Scope::Dialog,
                     "remove_pane" => scope == Scope::Remove,
+                    "draft_clear" => scope == Scope::LeasePreempt,
                     other => panic!("unmapped tool {other}"),
                 };
                 assert_eq!(allowed, expected, "{tool} with only {scope}");
@@ -727,10 +759,12 @@ mod tests {
     }
 
     #[test]
-    fn default_caller_holds_every_scope_and_any_profile() {
+    fn default_caller_holds_the_legacy_scopes_and_any_profile() {
         let caller = Caller::default_client();
         assert_eq!(caller.client(), "default");
-        for tool in TOOL_NAMES {
+        // Every tool that existed before shared panes; `draft_clear` needs
+        // `lease:preempt`, which the legacy caller does not hold.
+        for tool in TOOL_NAMES.into_iter().filter(|tool| *tool != "draft_clear") {
             assert!(
                 authorize(&caller, tool, &sample_args(tool)).is_ok(),
                 "{tool}"
@@ -740,6 +774,75 @@ mod tests {
         assert!(authorize(&caller, "start_pane", &arbitrary).is_ok());
         let other = args(json!({"profile": "anything"}));
         assert!(authorize(&caller, "start_pane", &other).is_ok());
+    }
+
+    const SHARED_PANE_SCOPES: [Scope; 3] = [Scope::Attach, Scope::AttachWrite, Scope::LeasePreempt];
+
+    #[test]
+    fn the_legacy_caller_holds_exactly_the_seven_old_scopes_and_none_of_the_new() {
+        let caller = Caller::default_client();
+        assert_eq!(caller.scopes().len(), 7);
+        for scope in Scope::LEGACY {
+            assert!(caller.has(scope), "{scope}");
+        }
+        for scope in SHARED_PANE_SCOPES {
+            assert!(!caller.has(scope), "{scope}");
+        }
+        // Both constructors agree: the caller and the client record.
+        let client = default_client("a-single-token");
+        assert_eq!(client.scopes, Scope::LEGACY.into_iter().collect());
+        assert_eq!(Caller::from_client(&client).scopes(), caller.scopes());
+        // ALL is the three added to the seven, in no way narrower.
+        assert_eq!(Scope::ALL.len(), Scope::LEGACY.len() + 3);
+        for scope in Scope::LEGACY.into_iter().chain(SHARED_PANE_SCOPES) {
+            assert!(Scope::ALL.contains(&scope), "{scope}");
+        }
+    }
+
+    #[test]
+    fn a_clients_file_may_grant_each_new_scope_and_still_refuses_an_unknown_one() {
+        for (name, scope) in [
+            ("attach", Scope::Attach),
+            ("attach:write", Scope::AttachWrite),
+            ("lease:preempt", Scope::LeasePreempt),
+        ] {
+            let clients = Clients::parse(&file_text(json!([client_json(
+                "person",
+                SECRET_A,
+                &["observe", name]
+            )])))
+            .unwrap();
+            let caller = clients
+                .authenticate(Some(&bearer(&token("person", SECRET_A))), 0)
+                .unwrap();
+            assert!(caller.has(scope) && caller.has(Scope::Observe), "{name}");
+            assert_eq!(caller.scopes().len(), 2, "{name}");
+            assert_eq!(scope.as_str(), name);
+        }
+        for bad in ["attach:read", "lease", "attach:*", "Attach"] {
+            let err = Clients::parse(&file_text(json!([client_json("x", SECRET_A, &[bad])])))
+                .unwrap_err();
+            assert!(err.to_string().contains("unknown scope"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn only_lease_preempt_opens_draft_clear_and_it_opens_nothing_else() {
+        let holder = only(Scope::LeasePreempt, &[]);
+        assert!(authorize(&holder, "draft_clear", &sample_args("draft_clear")).is_ok());
+        assert!(holder.may_list("draft_clear"));
+        for tool in TOOL_NAMES.into_iter().filter(|tool| *tool != "draft_clear") {
+            assert!(
+                authorize(&holder, tool, &sample_args(tool)).is_err(),
+                "{tool}"
+            );
+        }
+        for scope in Scope::ALL.into_iter().filter(|s| *s != Scope::LeasePreempt) {
+            let other = only(scope, &["ci"]);
+            let denied = authorize(&other, "draft_clear", &sample_args("draft_clear")).unwrap_err();
+            assert_eq!(denied.scope, Some(Scope::LeasePreempt), "{scope}");
+            assert!(!other.may_list("draft_clear"), "{scope}");
+        }
     }
 
     #[test]

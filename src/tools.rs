@@ -1,4 +1,4 @@
-//! The nine MCP tools. They talk only to [`TerminalBackend`]; the safety rules
+//! The ten MCP tools. They talk only to [`TerminalBackend`]; the safety rules
 //! (input validation, the pane lock, refusing to type into a blocked pane, and
 //! answer_dialog's checks) are enforced here, whatever the backend.
 //!
@@ -14,6 +14,7 @@
 //!   interrupt_pane  -> get (x2, see lock_pane), interrupt
 //!   answer_dialog   -> get, read, keys
 //!   remove_pane     -> get (x2, see lock_pane), remove
+//!   draft_clear     -> get, then SharedPanes::draft_clear (no pane lock: it types nothing)
 
 use crate::agent::{unmeasured, Agent, ParsedDialog};
 use crate::ansi::strip_terminal_escapes;
@@ -30,6 +31,7 @@ use crate::panelock::{PaneGuard, PaneLocks};
 use crate::profiles::{CwdError, LaunchPolicy, RoutineConfig};
 use crate::registry::{PaneRegistry, RoutineState};
 use crate::routine::{self, PaneWatch, Todo, WatchEvent};
+use crate::shared_panes::SharedPanes;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,7 +39,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const TOOL_NAMES: [&str; 9] = [
+pub const TOOL_NAMES: [&str; 10] = [
     "start_pane",
     "send_input",
     "read_output",
@@ -47,6 +49,7 @@ pub const TOOL_NAMES: [&str; 9] = [
     "interrupt_pane",
     "answer_dialog",
     "remove_pane",
+    "draft_clear",
 ];
 pub const READ_MAX_LINES: u64 = 10_000;
 pub const WAIT_MIN_SECONDS: f64 = 1.0;
@@ -103,6 +106,10 @@ pub struct Shepherd {
     /// a front that starts after its panes gets them back. `None` keeps them
     /// in memory only, as before.
     registry: Option<Arc<dyn PaneRegistry>>,
+    /// Who is at a pane and whether they left a draft (issue #77). `None`
+    /// for a backend with no person side: nothing is refused, `draft_clear`
+    /// is unsupported and the status carries no `human` object.
+    shared: Option<Arc<dyn SharedPanes>>,
 }
 
 /// What this process knows about a pane a profile started, keyed by pane name.
@@ -140,7 +147,17 @@ impl Shepherd {
             routine_lock_wait: routine::LOCK_WAIT,
             audit: None,
             registry: None,
+            shared: None,
         }
+    }
+
+    /// Ask `shared` who is at a pane: for the `human` object of the status,
+    /// for `draft_clear`, and for the routine to skip a pane a person is at
+    /// before it records a call. The refusal of a bot's write itself stays in
+    /// the backend.
+    pub fn with_shared_panes(mut self, shared: Arc<dyn SharedPanes>) -> Self {
+        self.shared = Some(shared);
+        self
     }
 
     /// Keep each pane's agent kind, profile, routine counters and answered
@@ -467,6 +484,18 @@ impl Shepherd {
         self.persist_routine(pane_id, &state);
     }
 
+    /// A nudge was not sent because a person is at the pane. Counts toward
+    /// neither the cooldown nor the cap; logs once per episode.
+    fn note_person_at_pane(&self, name: &str, pane_id: &str) {
+        let mut first = false;
+        self.settle_routine(name, pane_id, |watch| first = watch.note_held());
+        if first {
+            eprintln!(
+                "openab-shepherd: routine: pane {name}: not nudging while a person is at the pane"
+            );
+        }
+    }
+
     fn routine_check(&self, name: &str, clock: &dyn Fn() -> Instant) {
         let now = clock();
         let (config, work_dir, todo_rel, pane_id, finished_state) = {
@@ -548,6 +577,22 @@ impl Shepherd {
                 let turn = info
                     .turn
                     .map_or_else(|| "?".to_string(), |turn| turn.to_string());
+                // A person at the pane (a lease or a draft): skip before the
+                // pending count is kept and before the send writes an audit
+                // `call` line, or every tick would record a call and an
+                // error while they type. Only an early exit: the backend's
+                // refusal inside the write is what keeps the bytes out, and
+                // the arm below still handles a person who arrives between
+                // this check and the send.
+                if let Some(shared) = &self.shared {
+                    if shared
+                        .human_state(&info.reference())
+                        .is_ok_and(|state| state.is_held())
+                    {
+                        self.note_person_at_pane(name, &pane_id);
+                        return;
+                    }
+                }
                 // Condition the send on the state this check observed: if
                 // the pane changed (working, blocked, a new turn) between
                 // the observation and the send, the send is refused as a
@@ -627,14 +672,7 @@ impl Shepherd {
                         // is not queued: a skip like a replayed pane, counted
                         // toward neither the cooldown nor the cap, so a
                         // person at the pane cannot make the routine give up.
-                        let mut first = false;
-                        self.settle_routine(name, &pane_id, |watch| first = watch.note_held());
-                        if first {
-                            eprintln!(
-                                "openab-shepherd: routine: pane {name}: not nudging while a \
-                                 person is at the pane"
-                            );
-                        }
+                        self.note_person_at_pane(name, &pane_id);
                     }
                     Err(err) => {
                         // Any other refusal or failure (a `terminal_changed`
@@ -835,6 +873,17 @@ pub fn definitions() -> Value {
                 },
                 "required": ["terminal"]
             }
+        },
+        {
+            "name": "draft_clear",
+            "description": "Clear the draft flag of a pane: the mark a person's typing leaves until they press Enter. While it is set, every bot write to the pane is refused (pane_draft_pending). Use it only when the person is gone and their half-typed line no longer matters; the line itself stays on the pane's input, so read_output first if unsure. It clears the flag whoever holds the pane's input lease and does not touch the lease: while a lease is held a bot is still refused (pane_human_controlled). Needs the lease:preempt scope, which a bot normally does not hold. Returns terminal and cleared (whether a draft was set). A backend with no person side returns unsupported.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "terminal": {"type": "string", "description": "Pane name, as start_pane or list_panes returned it."}
+                },
+                "required": ["terminal"]
+            }
         }
     ])
 }
@@ -851,6 +900,7 @@ pub fn call(sh: &Shepherd, name: &str, args: &Args) -> Result<Value, ToolError> 
         "interrupt_pane" => interrupt_pane(sh, args),
         "answer_dialog" => answer_dialog(sh, args),
         "remove_pane" => remove_pane(sh, args),
+        "draft_clear" => draft_clear(sh, args),
         other => Err(format!("unknown tool: {other}").into()),
     }
 }
@@ -1427,9 +1477,36 @@ fn read_output(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
 fn get_status(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     let terminal = terminal_arg(args)?;
     let info = resolve(sh, &terminal)?;
-    let mut out = info.to_json();
+    let mut out = pane_json(sh, &info);
     out["terminal"] = json!(terminal);
     Ok(out)
+}
+
+/// [`TerminalInfo::to_json`] plus, when a person is at the pane, `human`:
+/// `lease` (null, or holder, idle_secs and expires_in_secs) and `draft`. The
+/// object is left out when there is neither, and when the backend has no
+/// person side, so the common output does not change.
+fn pane_json(sh: &Shepherd, info: &TerminalInfo) -> Value {
+    let mut out = info.to_json();
+    let Some(shared) = &sh.shared else {
+        return out;
+    };
+    // A pane that went away between the read and this one has nothing to show.
+    let Ok(state) = shared.human_state(&info.reference()) else {
+        return out;
+    };
+    if !state.is_held() {
+        return out;
+    }
+    out["human"] = json!({
+        "lease": state.lease.as_ref().map(|lease| json!({
+            "holder": lease.holder,
+            "idle_secs": lease.idle.as_secs(),
+            "expires_in_secs": lease.expires_in.as_secs() + u64::from(lease.expires_in.subsec_nanos() > 0),
+        })),
+        "draft": state.draft,
+    });
+    out
 }
 
 fn wait_status(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
@@ -1553,7 +1630,11 @@ fn list_panes(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
         .backend
         .list(all)
         .map_err(|err| backend_failure(None, err))?;
-    let panes: Vec<Value> = list.terminals.iter().map(TerminalInfo::to_json).collect();
+    let panes: Vec<Value> = list
+        .terminals
+        .iter()
+        .map(|pane| pane_json(sh, pane))
+        .collect();
     // Running panes are listed whether or not `all` is set.
     let live_panes = list.terminals.iter().filter(|pane| pane.live).count();
     let launch = sh.policy.to_json();
@@ -1610,6 +1691,22 @@ fn remove_pane(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
     }))
 }
 
+/// Clear a pane's draft flag (issue #77). Does not take the pane lock: it types
+/// nothing, and a draft left behind must be clearable while a call is stuck on
+/// that lock. The backend waits (bounded) for a write in flight, so it never
+/// lands inside a bot's paste and its Enter.
+fn draft_clear(sh: &Shepherd, args: &Args) -> Result<Value, ToolError> {
+    let terminal = terminal_arg(args)?;
+    let Some(shared) = &sh.shared else {
+        return Err(unsupported("clearing a draft"));
+    };
+    let pane = resolve(sh, &terminal)?.reference();
+    let cleared = shared
+        .draft_clear(&pane)
+        .map_err(|err| backend_failure(Some(&terminal), err))?;
+    Ok(json!({"terminal": terminal, "cleared": cleared}))
+}
+
 /// A backend failure in Shepherd's words. The backend's own text is kept only
 /// under `backend_detail`.
 fn backend_failure(terminal: Option<&str>, err: BackendError) -> ToolError {
@@ -1641,7 +1738,8 @@ fn backend_failure(terminal: Option<&str>, err: BackendError) -> ToolError {
         ),
         ErrorKind::DraftPending => format!(
             "a person has typed into {pane} and not pressed Enter; nothing was sent. \
-             Look again later"
+             Look again later, or clear the mark with draft_clear (it needs the \
+             lease:preempt scope) when the person is gone"
         ),
         ErrorKind::Unsupported(op) => format!("the terminal backend does not support {op}"),
         ErrorKind::InvalidInput => "the terminal backend refused the request".to_string(),
@@ -4861,6 +4959,194 @@ mod tests {
         assert_eq!(draft.data["error"], "pane_draft_pending");
         assert!(draft.data.get("idle_secs").is_none());
         assert!(draft.text.contains("nothing was sent"), "{}", draft.text);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #77: the `human` object, `draft_clear` and the routine pre-check.
+    // -----------------------------------------------------------------
+
+    use crate::testutil::FakeShared;
+
+    fn shared_over(fake: &FakeBackend) -> (Shepherd, Arc<FakeShared>) {
+        let shared = Arc::new(FakeShared::default());
+        let sh = Shepherd::new(fake.clone()).with_shared_panes(shared.clone());
+        (sh, shared)
+    }
+
+    fn status_of(sh: &Shepherd) -> Value {
+        call(sh, "get_status", &args(json!({"terminal": "work"}))).unwrap()
+    }
+
+    fn listed(sh: &Shepherd) -> Value {
+        call(sh, "list_panes", &args(json!({}))).unwrap()["panes"][0].clone()
+    }
+
+    #[test]
+    fn the_human_object_is_left_out_when_nobody_is_at_the_pane() {
+        let fake = FakeBackend::new(true);
+        fake.add_pane("work", State::Idle, None);
+        fake.state.lock().unwrap().listable = true;
+        let plain = Shepherd::new(fake.clone());
+        let (shared_sh, shared) = shared_over(&fake);
+        // Neither a lease nor a draft: the same bytes as without the handle.
+        assert_eq!(status_of(&shared_sh), status_of(&plain));
+        assert_eq!(listed(&shared_sh), listed(&plain));
+        assert!(status_of(&shared_sh).get("human").is_none());
+        assert!(listed(&shared_sh).get("human").is_none());
+        // The backend was asked, so the absence is the answer and not a skip.
+        assert!(shared.asked.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn the_human_object_shows_a_lease_a_draft_or_both() {
+        let fake = FakeBackend::new(true);
+        fake.add_pane("work", State::Idle, None);
+        fake.state.lock().unwrap().listable = true;
+        let (sh, shared) = shared_over(&fake);
+        shared.person_at_the_pane(true, false);
+        for pane in [status_of(&sh), listed(&sh)] {
+            assert_eq!(
+                pane["human"],
+                json!({
+                    "lease": {"holder": "person", "idle_secs": 3, "expires_in_secs": 297},
+                    "draft": false
+                })
+            );
+        }
+        shared.person_at_the_pane(true, true);
+        assert_eq!(status_of(&sh)["human"]["draft"], true);
+        assert_eq!(status_of(&sh)["human"]["lease"]["holder"], "person");
+        // A draft the person left behind: no lease, the flag alone.
+        shared.person_at_the_pane(false, true);
+        for pane in [status_of(&sh), listed(&sh)] {
+            assert_eq!(pane["human"], json!({"lease": null, "draft": true}));
+        }
+        // The rest of the pane object is the one it always was.
+        let mut without = status_of(&sh);
+        without.as_object_mut().unwrap().remove("human");
+        shared.person_at_the_pane(false, false);
+        assert_eq!(without, status_of(&sh));
+    }
+
+    #[test]
+    fn draft_clear_is_unsupported_on_a_backend_with_no_person_side() {
+        let fake = FakeBackend::new(true);
+        fake.add_pane("work", State::Idle, None);
+        let sh = Shepherd::new(fake.clone());
+        let err = call(&sh, "draft_clear", &args(json!({"terminal": "work"}))).unwrap_err();
+        assert_eq!(err.data["error"], "unsupported");
+    }
+
+    #[test]
+    fn draft_clear_clears_the_draft_and_leaves_the_lease() {
+        let fake = FakeBackend::new(true);
+        fake.add_pane("work", State::Idle, None);
+        let (sh, shared) = shared_over(&fake);
+        shared.person_at_the_pane(true, true);
+        let out = call(&sh, "draft_clear", &args(json!({"terminal": "work"}))).unwrap();
+        assert_eq!(out, json!({"terminal": "work", "cleared": true}));
+        assert!(shared.lease.lock().unwrap().is_some());
+        assert!(!*shared.draft.lock().unwrap());
+        let again = call(&sh, "draft_clear", &args(json!({"terminal": "work"}))).unwrap();
+        assert_eq!(again["cleared"], false);
+        // It types nothing and takes no pane lock.
+        assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn draft_clear_checks_its_argument_and_names_only_a_real_pane() {
+        let fake = FakeBackend::new(true);
+        fake.add_pane("work", State::Idle, None);
+        let (sh, shared) = shared_over(&fake);
+        shared.person_at_the_pane(false, true);
+        for bad in [json!({}), json!({"terminal": 5}), json!({"terminal": ""})] {
+            let err = call(&sh, "draft_clear", &args(bad)).unwrap_err();
+            assert_eq!(err.data["error"], "invalid_input");
+        }
+        let err = call(&sh, "draft_clear", &args(json!({"terminal": "nope"}))).unwrap_err();
+        assert_eq!(err.data["error"], "not_found");
+        assert_eq!(shared.clears(), 0);
+        assert!(*shared.draft.lock().unwrap());
+    }
+
+    #[test]
+    fn a_draft_that_cannot_be_cleared_is_reported_and_stays() {
+        let fake = FakeBackend::new(true);
+        fake.add_pane("work", State::Idle, None);
+        let (sh, shared) = shared_over(&fake);
+        shared.person_at_the_pane(false, true);
+        *shared.clear_error.lock().unwrap() = Some(ErrorKind::Timeout);
+        let err = call(&sh, "draft_clear", &args(json!({"terminal": "work"}))).unwrap_err();
+        assert_eq!(err.data["error"], "timeout");
+        assert!(*shared.draft.lock().unwrap());
+    }
+
+    #[test]
+    fn the_draft_refusal_names_draft_clear() {
+        let draft = backend_failure(
+            Some("work"),
+            BackendError::new(ErrorKind::DraftPending, "raw"),
+        );
+        assert!(draft.text.contains("draft_clear"), "{}", draft.text);
+    }
+
+    /// The routine's pre-check: a pane a person is at is skipped before the
+    /// pending count is kept and before a `call` line is written.
+    #[test]
+    fn the_routine_writes_no_audit_line_while_a_lease_or_a_draft_exists() {
+        use crate::audit::testing::memory_audit;
+        for (lease, draft) in [(true, false), (false, true), (true, true)] {
+            let dir = crate::testutil::TempDir::new("tools-routine-precheck");
+            let fake = FakeBackend::new(true);
+            let reg = Arc::new(MemoryRegistry::default());
+            let (audit, sink) = memory_audit();
+            let shared = Arc::new(FakeShared::default());
+            let sh = registered_pane(reg.clone(), &fake, &dir)
+                .with_audit(Arc::new(audit))
+                .with_shared_panes(shared.clone());
+            // The audit and the person side were added after the start.
+            let t0 = Instant::now();
+            sh.routine_tick_at(t0);
+            shared.person_at_the_pane(lease, draft);
+            for tick in 11..31 {
+                sh.routine_tick_at(t0 + Duration::from_secs(tick));
+            }
+            let case = format!("lease {lease}, draft {draft}");
+            assert!(sink.records().is_empty(), "{case}: {:?}", sink.records());
+            assert_eq!(sent_count(&fake), 0, "{case}");
+            assert!(
+                !fake.calls().contains(&"send"),
+                "{case}: the backend was asked to type: {:?}",
+                fake.calls()
+            );
+            assert_eq!(
+                sh.routine_map().get("work").unwrap().state(),
+                RoutineState::default(),
+                "{case}: counted"
+            );
+            assert_eq!(
+                reg.get("id-work").unwrap().routine,
+                Some(RoutineState::default()),
+                "{case}: a pending count was kept for a nudge never sent"
+            );
+            // After `draft_clear` (and the lease ending) the next tick nudges,
+            // and only now does the audit see the routine.
+            shared.person_at_the_pane(lease, draft);
+            *shared.lease.lock().unwrap() = None;
+            if draft {
+                let cleared = call(&sh, "draft_clear", &args(json!({"terminal": "work"}))).unwrap();
+                assert_eq!(cleared["cleared"], true, "{case}");
+            }
+            sh.routine_tick_at(t0 + Duration::from_secs(31));
+            assert_eq!(sent_count(&fake), 1, "{case}");
+            let records = sink.records();
+            assert!(
+                records.iter().any(|r| r["client"] == audit::ROUTINE_ACTOR
+                    && r["tool"] == "send_input"
+                    && r["phase"] == "call"),
+                "{case}: {records:?}"
+            );
+        }
     }
 
     #[test]

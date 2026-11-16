@@ -22,6 +22,7 @@ pub mod panelock;
 pub mod profiles;
 pub mod registry;
 pub mod routine;
+pub mod shared_panes;
 pub mod tools;
 
 #[cfg(test)]

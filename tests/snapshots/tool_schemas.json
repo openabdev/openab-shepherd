@@ -26,6 +26,21 @@
       "inputSchema": {
         "properties": {
           "terminal": {
+            "description": "Pane name, as start_pane or list_panes returned it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal"
+        ],
+        "type": "object"
+      },
+      "name": "draft_clear"
+    },
+    {
+      "inputSchema": {
+        "properties": {
+          "terminal": {
             "type": "string"
           }
         },

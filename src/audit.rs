@@ -9,15 +9,15 @@
 //! clients, not tamper-proofing.
 //!
 //! Shape of a call: each mutating tool (`start_pane`, `send_input`,
-//! `answer_dialog`, `remove_pane`, `interrupt_pane`) writes a `call` line
-//! before it runs and a best-effort `outcome` line after. `read_output` writes
-//! an `outcome` line after. `list_panes`, `get_status` and `wait_status` write
+//! `answer_dialog`, `remove_pane`, `interrupt_pane`, `draft_clear`) writes a
+//! `call` line before it runs and a best-effort `outcome` line after.
+//! `read_output` writes an `outcome` line after. `list_panes`, `get_status` and `wait_status` write
 //! nothing. A call refused by the scope check writes a `denied` line.
 //! Failed authentications go to stderr, not to this file.
 //!
-//! Failure policy: `start_pane`, `send_input`, `answer_dialog` and
-//! `remove_pane` are refused with `audit_unavailable` when the `call` record
-//! cannot be written, so a failing sink means no backend call for them.
+//! Failure policy: `start_pane`, `send_input`, `answer_dialog`, `remove_pane`
+//! and `draft_clear` are refused with `audit_unavailable` when the `call`
+//! record cannot be written, so a failing sink means no backend call for them.
 //! `interrupt_pane` (the human's way to stop a runaway agent) and the reads go
 //! ahead when the write fails; the failure is counted and reported on stderr
 //! at most once a minute.
@@ -114,7 +114,12 @@ pub fn policy(tool: &str) -> Policy {
 fn writes_call(tool: &str) -> bool {
     matches!(
         tool,
-        "start_pane" | "send_input" | "answer_dialog" | "remove_pane" | "interrupt_pane"
+        "start_pane"
+            | "send_input"
+            | "answer_dialog"
+            | "remove_pane"
+            | "interrupt_pane"
+            | "draft_clear"
     )
 }
 
@@ -345,7 +350,7 @@ fn request_fields(tool: &str, args: &Args) -> Map<String, Value> {
             put_capped(&mut out, "pane", args, "terminal", SHORT);
             put_capped(&mut out, "choice", args, "choice", 32);
         }
-        "read_output" | "interrupt_pane" | "remove_pane" => {
+        "read_output" | "interrupt_pane" | "remove_pane" | "draft_clear" => {
             put_capped(&mut out, "pane", args, "terminal", SHORT);
         }
         _ => {}
@@ -495,6 +500,7 @@ mod tests {
             "answer_dialog",
             "remove_pane",
             "interrupt_pane",
+            "draft_clear",
         ] {
             let (audit, sink) = memory_audit();
             let a = sample(tool);
@@ -559,6 +565,22 @@ mod tests {
     #[test]
     fn a_failing_sink_refuses_remove_pane() {
         assert_fail_closed("remove_pane");
+    }
+
+    #[test]
+    fn a_failing_sink_refuses_draft_clear() {
+        assert_fail_closed("draft_clear");
+    }
+
+    #[test]
+    fn draft_clear_records_its_pane_and_nothing_else_of_the_request() {
+        let (audit, sink) = memory_audit();
+        let a = args(json!({"terminal": "w", "extra": "dropped"}));
+        audit.before("alice", "draft_clear", &a).unwrap();
+        let record = &sink.records()[0];
+        assert_eq!(record["tool"], "draft_clear");
+        assert_eq!(record["pane"], "w");
+        assert!(record.get("extra").is_none());
     }
 
     fn assert_fail_closed(tool: &str) {
