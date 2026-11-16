@@ -371,10 +371,18 @@ fn dynamic_setup(base: &Path, dynamic: &str) -> (PathBuf, PathBuf) {
     std::fs::create_dir_all(base).unwrap();
     let out = Command::new("bash")
         .arg("-c")
-        .arg("D_SOURCE_ONLY=1 source \"$SCRIPT\" && d_setup && d_write_profiles \"$DYNAMIC\"")
+        // R_HOME and R_WORK are set as plain shell variables, as they are when the script runs
+        // with its defaults. Exporting them from here would hide a python heredoc that reads
+        // them from the environment without being handed them (the first live run hit that).
+        .arg(
+            "R_HOME=\"$T_HOME\"; R_WORK=\"$T_WORK\"; \
+             D_SOURCE_ONLY=1 source \"$SCRIPT\" && d_setup && d_write_profiles \"$DYNAMIC\"",
+        )
         .env("SCRIPT", e2e_dir().join("routine-dynamic.sh"))
-        .env("R_HOME", &home)
-        .env("R_WORK", &work)
+        .env_remove("R_HOME")
+        .env_remove("R_WORK")
+        .env("T_HOME", &home)
+        .env("T_WORK", &work)
         .env("SHEPHERD_BIN", "/bin/sh")
         .env("DYNAMIC", dynamic)
         .output()
