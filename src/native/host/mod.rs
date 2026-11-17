@@ -23,6 +23,8 @@ pub(super) mod server;
 pub(super) mod supervisor;
 pub(super) mod tail;
 #[cfg(test)]
+mod tests_drain;
+#[cfg(test)]
 pub(super) mod tests_link;
 pub(super) mod wire;
 

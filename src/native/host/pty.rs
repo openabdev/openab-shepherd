@@ -315,15 +315,19 @@ fn poll(fd: RawFd, events: libc::c_short, timeout_ms: libc::c_int) -> io::Result
 }
 
 /// Wait up to `timeout_ms` for output, then read once. `None` when nothing
-/// was ready; `Some(0)` at end of file.
+/// was ready; `Some(0)` at end of file. `on_ready` runs after the wait found
+/// output and before the read takes it, so a caller can mark itself busy
+/// before the bytes leave the terminal's queue (see [`queued`]).
 pub(crate) fn poll_read(
     fd: RawFd,
     buf: &mut [u8],
     timeout_ms: libc::c_int,
+    on_ready: impl FnOnce(),
 ) -> io::Result<Option<usize>> {
     if !poll(fd, libc::POLLIN, timeout_ms)? {
         return Ok(None);
     }
+    on_ready();
     // SAFETY: `buf` is valid for `buf.len()` bytes.
     let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
     if n >= 0 {
@@ -333,6 +337,19 @@ pub(crate) fn poll_read(
     match err.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(None),
         _ => Err(err),
+    }
+}
+
+/// The bytes queued on the master for a reader to take (`FIONREAD`); 0 when
+/// the terminal cannot say.
+pub(crate) fn queued(fd: RawFd) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one c_int through the pointer.
+    let rc = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n as *mut libc::c_int) };
+    if rc == -1 {
+        0
+    } else {
+        usize::try_from(n).unwrap_or(0)
     }
 }
 
