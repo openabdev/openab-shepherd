@@ -1007,7 +1007,10 @@ fn corruption_is_an_error_not_a_guess() {
 }
 
 #[test]
-fn a_forged_done_in_the_log_does_not_replay() {
+fn a_forged_done_that_breaks_the_matching_rule_does_not_replay() {
+    // Only records the rule would reject are refused on replay. A hand-written
+    // record that names the right id, session and open attempt replays: the
+    // log is accountability, not tamper-proofing (docs/ledger.md).
     let mut log = Vec::new();
     let created = |n: &str| Event::Created {
         id: id(n),

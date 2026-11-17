@@ -18,7 +18,7 @@ It is not wired into any running code. Nothing in the server creates a ledger or
 | `depends_on` | Dispatches that must be `done` first. They must already exist, so a cycle cannot be written |
 | `attempt` | The number of the latest delivery request, never reused: it rises by one for every `delivery_started`, even if the runtime refused the request. 0 before the first |
 | `request_id` | The id of the latest delivery request. Every answer from the runtime must name it |
-| `max_retries` | Redeliveries allowed after the first. Requests allowed: `max_retries + 1`. Using them up sets `failed` with reason `retry_cap_reached` |
+| `max_retries` | Redeliveries allowed after the first. Requests allowed: `max_retries + 1`. Using them up sets `failed` with reason `retry_cap_reached`. The call that finds the cap logs that `failed` and then returns an error |
 | `state` | See below |
 | `created_at`, `updated_at`, `delivered_at` | Milliseconds since the Unix epoch, from an injected clock |
 
@@ -164,9 +164,11 @@ It does not guarantee:
 
 `record_rejected` events are not rate limited here, so the log grows with every rejected record. A
 transport must limit the rate of records it passes in before this is exposed to untrusted senders.
+The same holds for `create`. The log has no retention or compaction yet; that is out of scope here.
 
-`FileStore` uses Unix file locking and permissions, so it builds on Unix only. A backend for other
-platforms implements `Store`.
+`FileStore` uses Unix file locking and permissions, so it builds on Unix only. It needs a local
+filesystem and cooperating writers, refuses a symlink at the log path, and sets mode 0600 only when
+it creates the file. A backend for other platforms implements `Store`.
 
 The log sits behind the `Store` trait: load all bytes, append one record durably, truncate. The file
 backend, `FileStore`, is the only implementation. Another backend must keep the same contract: an

@@ -56,7 +56,9 @@ pub fn system_clock() -> Clock {
 /// A ledger operation failed.
 #[derive(Debug)]
 pub enum LedgerError {
-    /// The operation does not fit the current state. Nothing was written.
+    /// The operation does not fit the current state. Nothing was written,
+    /// with one exception: reaching the retry cap in `begin_delivery` or
+    /// `request_retry` logs `failed` first and then returns `RetryCapReached`.
     Transition(TransitionError),
     /// The log could not be written. Nothing changed in memory. The ledger
     /// refuses every further write until it is reopened; reads still work.
@@ -209,7 +211,11 @@ impl<S: Store> Ledger<S> {
             .ok_or_else(|| TransitionError::UnknownDispatch(id.clone()).into())
     }
 
-    /// Create a dispatch: `ready` if every dependency is `done`, else `pending`.
+    /// Create a dispatch. Each call appends a record and syncs, so a caller
+    /// exposed to untrusted senders must limit how often it calls. Retention
+    /// and compaction of the log are out of scope here.
+    ///
+    /// A dispatch is `ready` if every dependency is `done`, else `pending`.
     pub fn create(&mut self, new: NewDispatch) -> Result<(), LedgerError> {
         let at = self.now();
         self.commit(Event::Created {
@@ -224,7 +230,12 @@ impl<S: Store> Ledger<S> {
     }
 
     /// Log the intent to inject, before the floor request. Returns the attempt
-    /// number. The caller asks the runtime only after this returns `Ok`.
+    /// number. If no request is left, the dispatch is set to `failed` and the
+    /// call returns `RetryCapReached`: the state changed.
+    ///
+    /// The attempt number is never reused, which is what lets a worker record
+    /// be matched on (dispatch, attempt, session) alone.
+    /// The caller asks the runtime only after this returns `Ok`.
     pub fn begin_delivery(
         &mut self,
         id: &DispatchId,
@@ -373,6 +384,9 @@ impl<S: Store> Ledger<S> {
     /// event that moves nothing. A record is never dropped without a trace; if
     /// the log cannot be written the call returns the error and the state is
     /// unchanged.
+    ///
+    /// Every call appends a record, including for claims that match nothing,
+    /// so the caller must apply a per-session rate limit or dedup before this.
     pub fn submit_record(&mut self, claim: Claim) -> Result<RecordOutcome, LedgerError> {
         let at = self.now();
         let id = DispatchId::new(claim.dispatch_id.as_str()).ok();
@@ -380,8 +394,9 @@ impl<S: Store> Ledger<S> {
         let verdict = match_record(id.as_ref().and_then(|id| self.state.get(id)), &claim);
         match (verdict, id, session) {
             (Ok(outcome), Some(id), Some(session)) => {
-                // A claim's attempt that matched the open attempt fits 32 bits.
-                let attempt = u32::try_from(claim.attempt).unwrap_or(u32::MAX);
+                // The match succeeded, so the attempt equals the open one,
+                // which is a u32.
+                let attempt = u32::try_from(claim.attempt).expect("a matched attempt is a u32");
                 self.commit(Event::RecordAccepted {
                     id,
                     attempt,

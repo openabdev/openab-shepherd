@@ -25,7 +25,10 @@ pub trait Store {
 }
 
 /// The log in one file: mode 0600, opened for append, held under an exclusive
-/// advisory lock so a second writer cannot interleave records.
+/// advisory lock so a second writer cannot interleave records. A symlink at
+/// the path is refused. The mode applies when the file is created: a file that
+/// already exists keeps its mode. Local filesystem and cooperating writers
+/// only, because `flock` does not exclude writers on some network filesystems.
 pub struct FileStore {
     file: File,
     /// Length of the last durable record boundary.
@@ -43,6 +46,7 @@ impl FileStore {
             .append(true)
             .create(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         Self::from_file(file, !existed, path)
     }

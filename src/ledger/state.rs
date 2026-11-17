@@ -26,7 +26,11 @@ pub struct Claim {
 ///
 /// A record counts only if it names this dispatch and its open attempt, comes
 /// from the session the dispatch was delivered to, finds the dispatch in
-/// `delivered`, and no accepted record closed that attempt before. The checks
+/// `delivered`, and no accepted record closed that attempt before.
+///
+/// The record is bound to (dispatch, attempt, session), not to a request id.
+/// That is sound only because attempt numbers are never reused: a refused or
+/// not-injected request keeps its number. Changing that breaks this rule. The checks
 /// run in a fixed order; the first failure is the reason returned.
 pub fn match_record(dispatch: Option<&Dispatch>, claim: &Claim) -> Result<Outcome, RejectReason> {
     let d = dispatch.ok_or(RejectReason::UnknownDispatch)?;
