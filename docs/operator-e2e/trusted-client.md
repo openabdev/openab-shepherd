@@ -81,18 +81,23 @@ summary counts (`N passed, 0 failed, 1 skipped`) and which never decides `RESULT
 ## By hand, with a real kiro-cli (answers #111)
 
 The script cannot measure what only the real CLI shows. On a macOS host with kiro-cli 3.3.0 (and
-later the image's 3.1.0), in a throwaway directory, with a profile you started the usual way:
+later the image's 3.1.0), in a throwaway directory and a throwaway `HOME`, with a profile you started
+the usual way:
 
-1. **Does the choice persist?** Run `kiro-cli chat -a --trust-workspace`. At the warning choose
-   `Yes, and don't ask again`, quit, run it again, and note whether the warning returns and where
-   the choice is stored. Also note whether the phrase `trust all tools mode` stays on screen after
-   you accepted (a status line would keep the guard refusing until the first turn ends; if it
-   does, the fix is a stricter match, not state).
+1. **The choice persists (measured on 3.3.0).** `Yes, and don't ask again` writes
+   `chat.disableTrustAllConfirmation: true` to `$HOME/.kiro/settings/cli.json`, and the next
+   `kiro-cli chat -a --trust-workspace` with the same HOME shows no warning. `Yes, I accept`
+   persists nothing. After either choice the phrase `trust all tools mode` is gone within a
+   second and the footer reads `Trust All Tools active, confirmations are off`. To re-check on a
+   new Kiro version, repeat this in a throwaway HOME (a new empty directory), never your real one.
 2. **The guard on the real screen.** A profile with `"extra_args": ["--trust-workspace", "-a"]`
-   (or `start_pane` with `extra_args ["-a"]` from a client that holds `start:args`): `start_pane`,
-   then `send_input "hello"` is `pane_needs_trust_acceptance` and `list_panes` still shows Kiro
-   alive. Record the screen with `record-replay-fixture.sh` and replace the synthetic fixture
-   with it. Attach, accept the warning, and `send_input` works.
+   (or `start_pane` with `extra_args ["-a"]` from a client that holds `start:args`) and a pane HOME
+   without the persisted key: `start_pane`, then `send_input "hello"` is
+   `pane_needs_trust_acceptance` and `list_panes` still shows Kiro alive. The committed fixture
+   `tests/fixtures/kiro-3.3.0/trust-all-warning.screen.txt` is that screen as measured; it cannot
+   be re-recorded with `record-replay-fixture.sh`, which does not pass `-a`. Attach, accept the
+   warning, and `send_input` works. With the key persisted in the pane's HOME there is no warning
+   and `send_input` works at once, also after a restart.
 3. **`agent` with a real Kiro.** `start_pane {argv: ["kiro-cli", "chat", "--trust-workspace"],
    agent: "kiro", cwd}` from a client with `start:arbitrary`: one model prompt that asks for a
    shell command, `wait_status` is `blocked` and `answer_dialog allow_once` works. Without
