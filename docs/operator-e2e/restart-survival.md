@@ -63,7 +63,7 @@ bash service-restart-linux.sh    # Linux host
 IMAGE=<registry>/openab-shepherd:<version> bash zombie-under-tini.sh   # Linux host; on a Mac set DOCKER to the docker binary
 ```
 
-Run one at a time: they share the port and the throwaway directories. The routine scenario for agent-created routines, `routine-dynamic.sh`, has its own runbook, [routine-dynamic.md](routine-dynamic.md), and its own port and directories.
+Run one at a time: they share the port and the throwaway directories. The routine scenario for agent-created routines, `routine-dynamic.sh`, has its own runbook, [routine-dynamic.md](routine-dynamic.md), and its own port and directories. The trusted-client script, `trusted-client.sh` (`extra_args`, `agent`, the Kiro trust-all guard, the audit fields), is described in [trusted-client.md](trusted-client.md).
 
 ## What a FAIL usually means
 
