@@ -49,6 +49,8 @@ source "$HERE/restart-lib.sh"
 
 C_AGENT="${1:-}"
 C_CLIENTS="$R_HOME/clients.json"
+C_AUDIT_DIR="$R_HOME/audit"           # the server refuses to start with a clients file and no audit file
+C_AUDIT="$C_AUDIT_DIR/audit.jsonl"
 C_HOME="$R_WORK/home"                 # the throwaway HOME of the holder (kiro only)
 C_PANES="$R_WORK/panes"
 C_CWD="$C_PANES/canary"               # the pane's working directory (devin may use CANARY_DEVIN_CWD)
@@ -263,8 +265,9 @@ c_setup() {
   fi
   (
     umask 077
-    mkdir -p "$R_HOME" "$R_WORK"
-    chmod 700 "$R_HOME" "$R_WORK"
+    mkdir -p "$R_HOME" "$R_WORK" "$C_AUDIT_DIR"
+    chmod 700 "$R_HOME" "$R_WORK" "$C_AUDIT_DIR"
+    rm -f "$C_AUDIT"
     rm -rf "${R_WORK:?}/server" "${C_PANES:?}" "${C_HOME:?}"
     mkdir -p "$R_WORK/server" "$C_PANES" "$C_HOME"
     [ "$C_OWN_CWD" = 1 ] && mkdir -p "$C_CWD"
@@ -310,7 +313,7 @@ c_prompt() {
   esac
 }
 
-# c_start_holder AGENT : `openab-shepherd hold` with the clients file, in the background; waits for MCP.
+# c_start_holder AGENT : `openab-shepherd hold` with the clients file and the audit file, in the background; waits for MCP.
 # Kiro: the holder (and so the pane) gets the throwaway HOME and the key. The others get your real
 # HOME (their login lives there) and no Kiro key.
 c_start_holder() {
@@ -326,6 +329,7 @@ c_start_holder() {
       ${unset_key[@]+"${unset_key[@]}"} \
       HOME="$home" \
       OPENAB_SHEPHERD_CLIENTS="$C_CLIENTS" \
+      OPENAB_SHEPHERD_AUDIT_FILE="$C_AUDIT" \
       OPENAB_SHEPHERD_PROFILES="$R_HOME/profiles.json" \
       OPENAB_SHEPHERD_TEST_HOLDER_VERSION="@$R_VERSION_FILE" \
       "$BIN" hold -- --host 127.0.0.1 --port "$PORT"
