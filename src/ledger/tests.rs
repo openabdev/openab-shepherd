@@ -614,7 +614,7 @@ fn script(l: &mut Ledger<MemStore>) {
 }
 
 #[test]
-fn replay_equals_live_state_after_every_operation() {
+fn replay_equals_live_state_after_the_scripted_operations() {
     let store = MemStore::default();
     let (mut l, _) = open_mem(&store);
     script(&mut l);
@@ -1229,4 +1229,22 @@ fn file_store_cuts_a_torn_tail_on_disk() {
     let r = replay(&fs::read(&path).unwrap()).unwrap();
     assert_eq!(r.records, 2);
     assert_eq!(r.torn_bytes, 0);
+}
+
+#[test]
+fn pure_matcher_checks_the_dispatch_id_itself() {
+    let store = MemStore::default();
+    let (mut l, _) = open_mem(&store);
+    l.create(new_dispatch("a", "s1", 1, &[])).unwrap();
+    l.begin_delivery(&id("a"), code("r1")).unwrap();
+    l.confirm_delivered(&id("a")).unwrap();
+    let d = l.get(&id("a")).unwrap();
+    assert_eq!(
+        match_record(Some(d), &claim("other", 1, "s1", Outcome::Done)),
+        Err(RejectReason::UnknownDispatch)
+    );
+    assert_eq!(
+        match_record(Some(d), &claim("a", 1, "s1", Outcome::Done)),
+        Ok(Outcome::Done)
+    );
 }

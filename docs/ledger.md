@@ -118,9 +118,10 @@ no "latest record wins" and no fallback to any other signal. The rule is the pur
 
 If the log cannot be written or synced, the operation returns an error and the in-memory state does
 not change. The ledger then refuses every further write until it is reopened, because after a failed
-sync the file may or may not hold the record. Reads keep working. A write that fails before any byte
-is written is cut back by the file backend. The file backend also refuses to append after a failed
-sync.
+sync the file may or may not hold the record. Reads keep working. A write that fails part way is cut
+back by the file backend where it can be. A record whose sync failed may still be on disk, so after
+a reopen it can replay as if it had been accepted. The file backend also refuses to append after a
+failed sync.
 
 ## What this guarantees, and what it does not
 
@@ -133,7 +134,8 @@ It does guarantee, given a correct transport:
 - A dispatch interrupted between the intent to inject and its confirmation is never treated as
   delivered, not delivered, or complete without an answer from the runtime.
 - Every rejected record leaves a trace in the log.
-- State survives a crash and restart, up to the last record whose append returned success.
+- State survives a crash and restart, up to the last record whose append returned success. A record
+  whose append returned an error may or may not be in the log after a reopen.
 
 It does not guarantee:
 

@@ -229,7 +229,11 @@ impl<S: Store> Ledger<S> {
         id: &DispatchId,
         request_id: Code,
     ) -> Result<u32, LedgerError> {
-        let attempt = self.find(id)?.attempt.saturating_add(1);
+        let attempt = self
+            .find(id)?
+            .attempt
+            .checked_add(1)
+            .ok_or_else(|| TransitionError::RetryCapReached(id.clone()))?;
         let at = self.now();
         self.commit(Event::DeliveryStarted {
             id: id.clone(),

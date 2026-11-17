@@ -30,6 +30,9 @@ pub struct Claim {
 /// run in a fixed order; the first failure is the reason returned.
 pub fn match_record(dispatch: Option<&Dispatch>, claim: &Claim) -> Result<Outcome, RejectReason> {
     let d = dispatch.ok_or(RejectReason::UnknownDispatch)?;
+    if claim.dispatch_id != d.id.as_str() {
+        return Err(RejectReason::UnknownDispatch);
+    }
     if claim.session != d.owner.as_str() {
         return Err(RejectReason::WrongSession);
     }
@@ -160,7 +163,10 @@ impl LedgerState {
             Event::DeliveryStarted { id, attempt, .. } => {
                 let d = self.find(id)?;
                 expect_state(d, &[State::Ready])?;
-                let next = d.attempt.saturating_add(1);
+                let next = d
+                    .attempt
+                    .checked_add(1)
+                    .ok_or_else(|| TransitionError::RetryCapReached(id.clone()))?;
                 if *attempt != next {
                     return Err(wrong_attempt(d, next, *attempt));
                 }
