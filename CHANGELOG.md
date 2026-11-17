@@ -4,6 +4,9 @@
 
 ### Added
 
+- A task ledger module (`src/ledger/`, `docs/ledger.md`): dispatch states, an append-only fsynced event
+  log with replay and crash recovery to `delivery_unknown`, and a pure matching rule for worker
+  completion records. Self-contained and not wired into the server; no behavior changes.
 - `agent` for `start_pane` with `argv` or `line` (issue #113). A caller that may start its own
   command can declare `kiro`, `devin` or `opencode`, so `answer_dialog` and the agent guards
   apply to the pane. No new scope; the declaration is audited (`launch`, `argv0`, `agent`) and

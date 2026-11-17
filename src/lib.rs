@@ -15,6 +15,7 @@ pub mod devin_dialog;
 pub mod dialog;
 pub mod http;
 pub mod input;
+pub mod ledger;
 pub mod mcp;
 pub mod native;
 pub mod opencode_dialog;
