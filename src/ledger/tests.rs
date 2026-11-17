@@ -93,14 +93,51 @@ fn claim(dispatch: &str, attempt: u64, session: &str, outcome: Outcome) -> Claim
     }
 }
 
+/// Answers about the open request: the ledger methods take the request id,
+/// and these look it up so a test can say "the runtime answered".
+trait Answer {
+    fn open_request(&self, id: &DispatchId) -> Code;
+    fn confirm(&mut self, id: &DispatchId) -> Result<(), LedgerError>;
+    fn refuse(&mut self, id: &DispatchId, reason: Code) -> Result<(), LedgerError>;
+    fn unknown(&mut self, id: &DispatchId, reason: Code) -> Result<(), LedgerError>;
+    fn not_injected(&mut self, id: &DispatchId) -> Result<(), LedgerError>;
+}
+
+impl<S: Store> Answer for Ledger<S> {
+    fn open_request(&self, id: &DispatchId) -> Code {
+        self.get(id)
+            .and_then(|d| d.request_id.clone())
+            .unwrap_or_else(|| code("none"))
+    }
+    fn confirm(&mut self, id: &DispatchId) -> Result<(), LedgerError> {
+        let r = self.open_request(id);
+        self.confirm_delivered(id, &r)
+    }
+    fn refuse(&mut self, id: &DispatchId, reason: Code) -> Result<(), LedgerError> {
+        let r = self.open_request(id);
+        self.refuse_delivery(id, &r, reason)
+    }
+    fn unknown(&mut self, id: &DispatchId, reason: Code) -> Result<(), LedgerError> {
+        let r = self.open_request(id);
+        self.mark_delivery_unknown(id, &r, reason)
+    }
+    fn not_injected(&mut self, id: &DispatchId) -> Result<(), LedgerError> {
+        let r = self.open_request(id);
+        self.resolve_not_injected(id, &r)
+    }
+}
+
 fn state_of(l: &Ledger<MemStore>, name: &str) -> State {
     l.get(&id(name)).unwrap().state
 }
 
 fn deliver(l: &mut Ledger<MemStore>, name: &str) {
-    let n = l.begin_delivery(&id(name), code("req")).unwrap();
-    assert!(n >= 1);
-    l.confirm_delivered(&id(name)).unwrap();
+    let next = l.get(&id(name)).unwrap().attempt + 1;
+    let n = l
+        .begin_delivery(&id(name), code(&format!("req{next}")))
+        .unwrap();
+    assert_eq!(n, next);
+    l.confirm(&id(name)).unwrap();
 }
 
 struct TmpDir(PathBuf);
@@ -198,7 +235,7 @@ fn happy_path_and_dependents() {
 
     assert_eq!(l.begin_delivery(&id("a"), code("r1")).unwrap(), 1);
     assert_eq!(state_of(&l, "a"), State::Delivering);
-    l.confirm_delivered(&id("a")).unwrap();
+    l.confirm(&id("a")).unwrap();
     assert_eq!(state_of(&l, "a"), State::Delivered);
     assert!(l.get(&id("a")).unwrap().delivered_at.is_some());
 
@@ -251,15 +288,22 @@ fn dependency_errors_are_refused_at_creation_and_write_nothing() {
 }
 
 #[test]
-fn refused_delivery_returns_to_ready_and_gives_the_attempt_back() {
+fn refused_delivery_returns_to_ready_and_the_attempt_stays_used() {
     let (mut l, _) = open_mem(&MemStore::default());
-    l.create(new_dispatch("a", "s1", 0, &[])).unwrap();
-    for _ in 0..5 {
-        assert_eq!(l.begin_delivery(&id("a"), code("r")).unwrap(), 1);
-        l.refuse_delivery(&id("a"), code("not_idle")).unwrap();
+    l.create(new_dispatch("a", "s1", 3, &[])).unwrap();
+    for n in 1..=4u32 {
+        assert_eq!(l.begin_delivery(&id("a"), code("r")).unwrap(), n);
+        l.refuse(&id("a"), code("not_idle")).unwrap();
         assert_eq!(state_of(&l, "a"), State::Ready);
-        assert_eq!(l.get(&id("a")).unwrap().attempt, 0);
+        assert_eq!(l.get(&id("a")).unwrap().attempt, n);
     }
+    // The fifth request would exceed max_retries + 1: the dispatch fails,
+    // visibly, and the call says why.
+    assert!(matches!(
+        l.begin_delivery(&id("a"), code("r")),
+        Err(LedgerError::Transition(TransitionError::RetryCapReached(_)))
+    ));
+    assert_eq!(state_of(&l, "a"), State::Failed);
 }
 
 #[test]
@@ -276,16 +320,28 @@ fn retry_cap_is_enforced_and_never_silent() {
         l.request_retry(&id("a")),
         Err(LedgerError::Transition(TransitionError::RetryCapReached(_)))
     ));
-    assert_eq!(state_of(&l, "a"), State::Delivered);
-    l.fail(&id("a"), code("retries_exhausted")).unwrap();
+    // Reaching the cap is not a silent stop: the dispatch is failed.
     assert_eq!(state_of(&l, "a"), State::Failed);
     assert_eq!(
         l.get(&id("a")).unwrap().failure,
-        Some(code("retries_exhausted"))
+        Some(code("retry_cap_reached"))
     );
     // Final: nothing moves a failed dispatch.
     assert!(l.begin_delivery(&id("a"), code("r")).is_err());
     assert!(l.fail(&id("a"), code("again")).is_err());
+}
+
+#[test]
+fn a_dispatch_at_the_cap_fails_when_asked_to_deliver_again() {
+    let (mut l, _) = open_mem(&MemStore::default());
+    l.create(new_dispatch("a", "s1", 0, &[])).unwrap();
+    l.begin_delivery(&id("a"), code("r1")).unwrap();
+    l.refuse(&id("a"), code("not_idle")).unwrap();
+    assert!(matches!(
+        l.begin_delivery(&id("a"), code("r2")),
+        Err(LedgerError::Transition(TransitionError::RetryCapReached(_)))
+    ));
+    assert_eq!(state_of(&l, "a"), State::Failed);
 }
 
 #[test]
@@ -304,7 +360,7 @@ fn delivery_unknown_leaves_only_by_runtime_answer() {
     let (mut l, _) = open_mem(&MemStore::default());
     l.create(new_dispatch("a", "s1", 1, &[])).unwrap();
     l.begin_delivery(&id("a"), code("r")).unwrap();
-    l.mark_delivery_unknown(&id("a"), code("timeout")).unwrap();
+    l.unknown(&id("a"), code("timeout")).unwrap();
     assert_eq!(state_of(&l, "a"), State::DeliveryUnknown);
     // Not by a retry, a second delivery, or a worker record.
     assert!(l.request_retry(&id("a")).is_err());
@@ -314,15 +370,84 @@ fn delivery_unknown_leaves_only_by_runtime_answer() {
         RecordOutcome::Rejected(RejectReason::NotDelivered)
     );
     // The runtime's audit shows no injection: back to ready, attempt returned.
-    l.resolve_not_injected(&id("a")).unwrap();
+    l.not_injected(&id("a")).unwrap();
     assert_eq!(state_of(&l, "a"), State::Ready);
-    assert_eq!(l.get(&id("a")).unwrap().attempt, 0);
+    assert_eq!(l.get(&id("a")).unwrap().attempt, 1);
 
     // Or the audit shows it was injected.
-    l.begin_delivery(&id("a"), code("r3")).unwrap();
-    l.mark_delivery_unknown(&id("a"), code("timeout")).unwrap();
-    l.confirm_delivered(&id("a")).unwrap();
+    assert_eq!(l.begin_delivery(&id("a"), code("r3")).unwrap(), 2);
+    l.unknown(&id("a"), code("timeout")).unwrap();
+    l.confirm(&id("a")).unwrap();
     assert_eq!(state_of(&l, "a"), State::Delivered);
+}
+
+/// The failing order from review: request r1 is lost and found not injected,
+/// request r2 follows, and r1's answer arrives late.
+#[test]
+fn a_late_answer_to_an_earlier_request_cannot_move_a_later_one() {
+    let (mut l, _) = open_mem(&MemStore::default());
+    l.create(new_dispatch("a", "s1", 3, &[])).unwrap();
+    let (r1, r2) = (code("r1"), code("r2"));
+    assert_eq!(l.begin_delivery(&id("a"), r1.clone()).unwrap(), 1);
+    l.mark_delivery_unknown(&id("a"), &r1, code("timeout"))
+        .unwrap();
+    l.resolve_not_injected(&id("a"), &r1).unwrap();
+    // The next request gets a new attempt number, never the same one.
+    assert_eq!(l.begin_delivery(&id("a"), r2.clone()).unwrap(), 2);
+
+    let before = l.state().clone();
+    let log_before = count_type(&l.store.bytes(), "delivered");
+    // Late answers naming r1, in every form.
+    assert!(matches!(
+        l.confirm_delivered(&id("a"), &r1),
+        Err(LedgerError::Transition(
+            TransitionError::WrongRequest { .. }
+        ))
+    ));
+    assert!(l.refuse_delivery(&id("a"), &r1, code("late")).is_err());
+    assert!(l
+        .mark_delivery_unknown(&id("a"), &r1, code("late"))
+        .is_err());
+    assert!(l.resolve_not_injected(&id("a"), &r1).is_err());
+    assert_eq!(l.state(), &before);
+    assert_eq!(count_type(&l.store.bytes(), "delivered"), log_before);
+    assert_eq!(state_of(&l, "a"), State::Delivering);
+
+    // A late worker record for the first generation is stale, and so is one
+    // that cannot yet be matched.
+    assert_eq!(
+        l.submit_record(claim("a", 1, "s1", Outcome::Done)).unwrap(),
+        RecordOutcome::Rejected(RejectReason::StaleAttempt)
+    );
+    assert_eq!(state_of(&l, "a"), State::Delivering);
+
+    // r2 itself still works, after which the r1 record stays stale and the
+    // r2 record closes it.
+    l.confirm_delivered(&id("a"), &r2).unwrap();
+    assert_eq!(
+        l.submit_record(claim("a", 1, "s1", Outcome::Done)).unwrap(),
+        RecordOutcome::Rejected(RejectReason::StaleAttempt)
+    );
+    assert_eq!(state_of(&l, "a"), State::Delivered);
+    assert_eq!(
+        l.submit_record(claim("a", 2, "s1", Outcome::Done)).unwrap(),
+        RecordOutcome::Accepted(Outcome::Done)
+    );
+    assert_eq!(state_of(&l, "a"), State::Done);
+}
+
+#[test]
+fn a_late_answer_after_a_refusal_cannot_move_the_dispatch() {
+    let (mut l, _) = open_mem(&MemStore::default());
+    l.create(new_dispatch("a", "s1", 3, &[])).unwrap();
+    let r1 = code("r1");
+    l.begin_delivery(&id("a"), r1.clone()).unwrap();
+    l.refuse_delivery(&id("a"), &r1, code("not_idle")).unwrap();
+    assert!(l.confirm_delivered(&id("a"), &r1).is_err());
+    assert_eq!(state_of(&l, "a"), State::Ready);
+    l.begin_delivery(&id("a"), code("r2")).unwrap();
+    assert!(l.confirm_delivered(&id("a"), &r1).is_err());
+    assert_eq!(state_of(&l, "a"), State::Delivering);
 }
 
 #[test]
@@ -384,7 +509,7 @@ fn build_a(l: &mut Ledger<MemStore>, scenario: &str) -> Option<u64> {
         "delivery_unknown" => {
             l.create(new_dispatch("a", "s1", 2, &[])).unwrap();
             l.begin_delivery(&a, code("r")).unwrap();
-            l.mark_delivery_unknown(&a, code("timeout")).unwrap();
+            l.unknown(&a, code("timeout")).unwrap();
             None
         }
         "delivered2" => {
@@ -591,22 +716,22 @@ fn a_rejected_record_stores_only_capped_claims() {
 fn script(l: &mut Ledger<MemStore>) {
     l.create(new_dispatch("a", "s1", 1, &[])).unwrap();
     l.create(new_dispatch("b", "s1", 1, &["a"])).unwrap();
-    l.create(new_dispatch("c", "s2", 0, &[])).unwrap();
+    l.create(new_dispatch("c", "s2", 1, &[])).unwrap();
     deliver(l, "a");
     l.request_retry(&id("a")).unwrap();
     l.begin_delivery(&id("a"), code("r2")).unwrap();
-    l.confirm_delivered(&id("a")).unwrap();
+    l.confirm(&id("a")).unwrap();
     l.submit_record(claim("a", 2, "s3", Outcome::Done)).unwrap(); // rejected
     l.submit_record(claim("a", 2, "s1", Outcome::Done)).unwrap(); // accepted, releases b
     l.begin_delivery(&id("b"), code("r3")).unwrap();
-    l.mark_delivery_unknown(&id("b"), code("timeout")).unwrap();
-    l.resolve_not_injected(&id("b")).unwrap();
+    l.unknown(&id("b"), code("timeout")).unwrap();
+    l.not_injected(&id("b")).unwrap();
     l.begin_delivery(&id("b"), code("r4")).unwrap();
-    l.confirm_delivered(&id("b")).unwrap();
+    l.confirm(&id("b")).unwrap();
     l.begin_delivery(&id("c"), code("r5")).unwrap();
-    l.refuse_delivery(&id("c"), code("not_idle")).unwrap();
+    l.refuse(&id("c"), code("not_idle")).unwrap();
     deliver(l, "c");
-    l.submit_record(claim("c", 1, "s2", Outcome::Blocked))
+    l.submit_record(claim("c", 2, "s2", Outcome::Blocked))
         .unwrap();
     l.unblock(&id("c")).unwrap();
     l.fail(&id("c"), code("operator_gave_up")).unwrap();
@@ -677,7 +802,7 @@ fn random_walks_keep_replay_equal_and_done_honest() {
     let sessions = ["s1", "s2", "s3"];
     let mut accepted_total = 0;
     let mut rejected_total = 0;
-    for seed in 0..60u64 {
+    for seed in 0..90u64 {
         let mut rng = Lcg(seed + 1);
         let store = MemStore::default();
         let (mut l, _) = open_mem(&store);
@@ -690,22 +815,22 @@ fn random_walks_keep_replay_equal_and_done_honest() {
                     let owner = sessions[rng.next(3) as usize];
                     let dep = names[rng.next(5) as usize];
                     let deps: &[&str] = if rng.next(2) == 0 { &[] } else { &[dep] };
-                    let _ = l.create(new_dispatch(name, owner, rng.next(3) as u32, deps));
+                    let _ = l.create(new_dispatch(name, owner, 1 + rng.next(3) as u32, deps));
                 }
                 1 => {
                     let _ = l.begin_delivery(&d, code("r"));
                 }
                 2 => {
-                    let _ = l.confirm_delivered(&d);
+                    let _ = l.confirm(&d);
                 }
                 3 => {
-                    let _ = l.refuse_delivery(&d, code("refused"));
+                    let _ = l.refuse(&d, code("refused"));
                 }
                 4 => {
-                    let _ = l.mark_delivery_unknown(&d, code("timeout"));
+                    let _ = l.unknown(&d, code("timeout"));
                 }
                 5 => {
-                    let _ = l.resolve_not_injected(&d);
+                    let _ = l.not_injected(&d);
                 }
                 6 => {
                     let _ = l.request_retry(&d);
@@ -925,6 +1050,7 @@ fn a_forged_done_in_the_log_does_not_replay() {
             &Event::Delivered {
                 id: id("a"),
                 attempt: 1,
+                request_id: code("r"),
                 at: 3,
             },
         ));
@@ -959,10 +1085,10 @@ fn check_restart(prefix: &[u8], store: impl Store, read_back: impl Fn() -> Vec<u
         rec.moved_to_delivery_unknown,
         was_delivering
             .iter()
-            .map(|(i, _)| i.clone())
+            .map(|(i, _, _)| i.clone())
             .collect::<Vec<_>>()
     );
-    for (i, attempt) in &was_delivering {
+    for (i, attempt, _) in &was_delivering {
         let d = l.get(i).unwrap();
         assert_eq!(d.state, State::DeliveryUnknown);
         assert_eq!(d.attempt, *attempt);
@@ -1143,7 +1269,7 @@ fn a_refused_transition_writes_nothing() {
     let (mut l, _) = open_mem(&store);
     l.create(new_dispatch("a", "s1", 0, &[])).unwrap();
     let before = store.bytes();
-    assert!(l.confirm_delivered(&id("a")).is_err());
+    assert!(l.confirm(&id("a")).is_err());
     assert!(l.unblock(&id("a")).is_err());
     assert!(l.begin_delivery(&id("nope"), code("r")).is_err());
     assert_eq!(store.bytes(), before);
@@ -1206,8 +1332,10 @@ fn file_store_round_trip_mode_and_single_writer() {
 }
 
 fn deliver_file(l: &mut Ledger<FileStore>, name: &str) {
-    l.begin_delivery(&id(name), code("req")).unwrap();
-    l.confirm_delivered(&id(name)).unwrap();
+    let next = l.get(&id(name)).unwrap().attempt + 1;
+    l.begin_delivery(&id(name), code(&format!("req{next}")))
+        .unwrap();
+    l.confirm(&id(name)).unwrap();
 }
 
 #[test]
@@ -1237,7 +1365,7 @@ fn pure_matcher_checks_the_dispatch_id_itself() {
     let (mut l, _) = open_mem(&store);
     l.create(new_dispatch("a", "s1", 1, &[])).unwrap();
     l.begin_delivery(&id("a"), code("r1")).unwrap();
-    l.confirm_delivered(&id("a")).unwrap();
+    l.confirm(&id("a")).unwrap();
     let d = l.get(&id("a")).unwrap();
     assert_eq!(
         match_record(Some(d), &claim("other", 1, "s1", Outcome::Done)),

@@ -149,11 +149,12 @@ impl<S: Store> Ledger<S> {
             failed: false,
         };
         let mut moved = Vec::new();
-        for (id, attempt) in ledger.state.delivering() {
+        for (id, attempt, request_id) in ledger.state.delivering() {
             let at = (ledger.clock)();
             ledger.commit(Event::DeliveryUnknown {
                 id: id.clone(),
                 attempt,
+                request_id,
                 reason: state::recovered_code(),
                 at,
             })?;
@@ -229,12 +230,15 @@ impl<S: Store> Ledger<S> {
         id: &DispatchId,
         request_id: Code,
     ) -> Result<u32, LedgerError> {
-        let attempt = self
-            .find(id)?
+        let d = self.find(id)?;
+        let attempt = d
             .attempt
             .checked_add(1)
             .ok_or_else(|| TransitionError::RetryCapReached(id.clone()))?;
         let at = self.now();
+        if d.state == State::Ready && u64::from(attempt) > u64::from(d.max_retries) + 1 {
+            return self.fail_at_cap(id, at);
+        }
         self.commit(Event::DeliveryStarted {
             id: id.clone(),
             attempt,
@@ -244,35 +248,51 @@ impl<S: Store> Ledger<S> {
         Ok(attempt)
     }
 
-    /// The runtime confirmed the injection. Also resolves `delivery_unknown`
-    /// when the runtime's audit shows the request id was injected.
-    pub fn confirm_delivered(&mut self, id: &DispatchId) -> Result<(), LedgerError> {
+    /// The runtime confirmed the injection of `request_id`. Also resolves
+    /// `delivery_unknown` when the runtime's audit shows that request was
+    /// injected. An answer naming any other request is refused, so a late
+    /// answer to an earlier request cannot move a later one.
+    pub fn confirm_delivered(
+        &mut self,
+        id: &DispatchId,
+        request_id: &Code,
+    ) -> Result<(), LedgerError> {
         let attempt = self.find(id)?.attempt;
         let at = self.now();
         self.commit(Event::Delivered {
             id: id.clone(),
             attempt,
+            request_id: request_id.clone(),
             at,
         })
     }
 
-    /// The runtime refused. Nothing was injected: back to `ready`, and the
-    /// attempt number is given back.
-    pub fn refuse_delivery(&mut self, id: &DispatchId, reason: Code) -> Result<(), LedgerError> {
+    /// The runtime refused `request_id`. Nothing was injected: back to
+    /// `ready`. The attempt number stays used, so the next request gets a new
+    /// one and counts against the retry cap.
+    pub fn refuse_delivery(
+        &mut self,
+        id: &DispatchId,
+        request_id: &Code,
+        reason: Code,
+    ) -> Result<(), LedgerError> {
         let attempt = self.find(id)?.attempt;
         let at = self.now();
         self.commit(Event::DeliveryRefused {
             id: id.clone(),
             attempt,
+            request_id: request_id.clone(),
             reason,
             at,
         })
     }
 
-    /// The answer is lost (a timeout): `delivering` to `delivery_unknown`.
+    /// The answer to `request_id` is lost (a timeout): `delivering` to
+    /// `delivery_unknown`.
     pub fn mark_delivery_unknown(
         &mut self,
         id: &DispatchId,
+        request_id: &Code,
         reason: Code,
     ) -> Result<(), LedgerError> {
         let attempt = self.find(id)?.attempt;
@@ -280,34 +300,56 @@ impl<S: Store> Ledger<S> {
         self.commit(Event::DeliveryUnknown {
             id: id.clone(),
             attempt,
+            request_id: request_id.clone(),
             reason,
             at,
         })
     }
 
-    /// The runtime's audit shows the request id was not injected:
-    /// `delivery_unknown` to `ready`. Only this call can do it.
-    pub fn resolve_not_injected(&mut self, id: &DispatchId) -> Result<(), LedgerError> {
+    /// The runtime's audit shows `request_id` was not injected:
+    /// `delivery_unknown` to `ready`. Only this call can do it. The attempt
+    /// number stays used.
+    pub fn resolve_not_injected(
+        &mut self,
+        id: &DispatchId,
+        request_id: &Code,
+    ) -> Result<(), LedgerError> {
         let attempt = self.find(id)?.attempt;
         let at = self.now();
         self.commit(Event::DeliveryNotInjected {
+            id: id.clone(),
+            attempt,
+            request_id: request_id.clone(),
+            at,
+        })
+    }
+
+    /// The turn ended without a record: `delivered` to `ready`, if a retry is
+    /// left. At the cap the dispatch is moved to `failed` (reason
+    /// `retry_cap_reached`) and the call returns `RetryCapReached`.
+    pub fn request_retry(&mut self, id: &DispatchId) -> Result<(), LedgerError> {
+        let d = self.find(id)?;
+        let attempt = d.attempt;
+        let at_cap = d.state == State::Delivered && d.attempt > d.max_retries;
+        let at = self.now();
+        if at_cap {
+            return self.fail_at_cap(id, at);
+        }
+        self.commit(Event::RetryRequested {
             id: id.clone(),
             attempt,
             at,
         })
     }
 
-    /// The turn ended without a record: `delivered` to `ready`, if a retry is
-    /// left. At the cap this fails with `RetryCapReached`; the caller then
-    /// calls [`Ledger::fail`].
-    pub fn request_retry(&mut self, id: &DispatchId) -> Result<(), LedgerError> {
-        let attempt = self.find(id)?.attempt;
-        let at = self.now();
-        self.commit(Event::RetryRequested {
+    /// Log `failed` for a dispatch that used its attempts, then report it.
+    fn fail_at_cap<T>(&mut self, id: &DispatchId, at: u64) -> Result<T, LedgerError> {
+        self.commit(Event::Failed {
             id: id.clone(),
-            attempt,
+            reason: Code::new("retry_cap_reached").expect("a fixed valid code"),
             at,
-        })
+        })?;
+        Err(TransitionError::RetryCapReached(id.clone()).into())
     }
 
     /// An operator returns a `blocked` dispatch to `ready`.

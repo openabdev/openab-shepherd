@@ -280,7 +280,7 @@ pub struct Dispatch {
     pub attempt: u32,
     /// Redeliveries allowed after the first delivery.
     pub max_retries: u32,
-    /// The request id of the open attempt, if any.
+    /// The request id of the latest attempt, if any.
     pub request_id: Option<Code>,
     /// Attempts closed by an accepted record. Each closes once.
     pub closed_attempts: BTreeSet<u32>,

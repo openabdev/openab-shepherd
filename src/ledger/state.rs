@@ -70,6 +70,13 @@ pub enum TransitionError {
         expected: u32,
         got: u32,
     },
+    /// The answer names a request other than the one logged for the open
+    /// attempt: a late or misrouted runtime answer.
+    WrongRequest {
+        id: DispatchId,
+        expected: Option<Code>,
+        got: Code,
+    },
     /// The retry cap is reached. The caller must fail the dispatch.
     RetryCapReached(DispatchId),
     /// A `record_accepted` event that the matching rule would reject.
@@ -89,6 +96,9 @@ impl fmt::Display for TransitionError {
             }
             TransitionError::WrongAttempt { id, expected, got } => {
                 write!(f, "dispatch {id}: attempt {got}, expected {expected}")
+            }
+            TransitionError::WrongRequest { id, got, .. } => {
+                write!(f, "dispatch {id}: request {got} is not the open request")
             }
             TransitionError::RetryCapReached(id) => {
                 write!(f, "dispatch {id} has used its retries")
@@ -175,21 +185,44 @@ impl LedgerState {
                 }
                 Ok(())
             }
-            Event::Delivered { id, attempt, .. } => {
+            Event::Delivered {
+                id,
+                attempt,
+                request_id,
+                ..
+            } => {
                 let d = self.find(id)?;
                 expect_state(d, &[State::Delivering, State::DeliveryUnknown])?;
-                expect_attempt(d, *attempt)
+                expect_attempt(d, *attempt)?;
+                expect_request(d, request_id)
             }
-            Event::DeliveryRefused { id, attempt, .. }
-            | Event::DeliveryUnknown { id, attempt, .. } => {
+            Event::DeliveryRefused {
+                id,
+                attempt,
+                request_id,
+                ..
+            }
+            | Event::DeliveryUnknown {
+                id,
+                attempt,
+                request_id,
+                ..
+            } => {
                 let d = self.find(id)?;
                 expect_state(d, &[State::Delivering])?;
-                expect_attempt(d, *attempt)
+                expect_attempt(d, *attempt)?;
+                expect_request(d, request_id)
             }
-            Event::DeliveryNotInjected { id, attempt, .. } => {
+            Event::DeliveryNotInjected {
+                id,
+                attempt,
+                request_id,
+                ..
+            } => {
                 let d = self.find(id)?;
                 expect_state(d, &[State::DeliveryUnknown])?;
-                expect_attempt(d, *attempt)
+                expect_attempt(d, *attempt)?;
+                expect_request(d, request_id)
             }
             Event::RetryRequested { id, attempt, .. } => {
                 let d = self.find(id)?;
@@ -296,11 +329,10 @@ impl LedgerState {
                 d.delivered_at = Some(*at);
             }
             Event::DeliveryRefused { id, at, .. } | Event::DeliveryNotInjected { id, at, .. } => {
-                // Nothing reached the worker: the attempt is given back.
-                let d = self.get_mut(id, *at);
-                d.state = State::Ready;
-                d.attempt = d.attempt.saturating_sub(1);
-                d.request_id = None;
+                // Nothing reached the worker. The attempt number stays used: a
+                // later request never shares it, so a late answer to this one
+                // cannot be taken for the next.
+                self.get_mut(id, *at).state = State::Ready;
             }
             Event::DeliveryUnknown { id, at, .. } => {
                 self.get_mut(id, *at).state = State::DeliveryUnknown;
@@ -365,11 +397,11 @@ impl LedgerState {
     }
 
     /// Ids in `delivering`, ordered.
-    pub(crate) fn delivering(&self) -> Vec<(DispatchId, u32)> {
+    pub(crate) fn delivering(&self) -> Vec<(DispatchId, u32, Code)> {
         self.dispatches
             .values()
             .filter(|d| d.state == State::Delivering)
-            .map(|d| (d.id.clone(), d.attempt))
+            .filter_map(|d| Some((d.id.clone(), d.attempt, d.request_id.clone()?)))
             .collect()
     }
 }
@@ -390,6 +422,18 @@ fn expect_attempt(d: &Dispatch, got: u32) -> Result<(), TransitionError> {
         Ok(())
     } else {
         Err(wrong_attempt(d, d.attempt, got))
+    }
+}
+
+fn expect_request(d: &Dispatch, got: &Code) -> Result<(), TransitionError> {
+    if d.request_id.as_ref() == Some(got) {
+        Ok(())
+    } else {
+        Err(TransitionError::WrongRequest {
+            id: d.id.clone(),
+            expected: d.request_id.clone(),
+            got: got.clone(),
+        })
     }
 }
 

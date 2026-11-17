@@ -16,8 +16,9 @@ It is not wired into any running code. Nothing in the server creates a ledger or
 | `owner` | The one worker session the dispatch is delivered to and completed by |
 | `created_by` | A short code naming who created it |
 | `depends_on` | Dispatches that must be `done` first. They must already exist, so a cycle cannot be written |
-| `attempt` | The open attempt: deliveries that may have reached the worker. 0 before the first |
-| `max_retries` | Redeliveries allowed after the first. Attempts allowed: `max_retries + 1` |
+| `attempt` | The number of the latest delivery request, never reused: it rises by one for every `delivery_started`, even if the runtime refused the request. 0 before the first |
+| `request_id` | The id of the latest delivery request. Every answer from the runtime must name it |
+| `max_retries` | Redeliveries allowed after the first. Requests allowed: `max_retries + 1`. Using them up sets `failed` with reason `retry_cap_reached` |
 | `state` | See below |
 | `created_at`, `updated_at`, `delivered_at` | Milliseconds since the Unix epoch, from an injected clock |
 
@@ -30,7 +31,7 @@ flowchart TD
     pending -->|last dependency done| ready
     ready -->|delivery_started logged| delivering
     delivering -->|runtime confirmed the injection| delivered
-    delivering -->|runtime refused, attempt given back| ready
+    delivering -->|runtime refused, attempt number stays used| ready
     delivering -->|timeout, or crash found at open| delivery_unknown
     delivery_unknown -->|runtime audit shows it was injected| delivered
     delivery_unknown -->|runtime audit shows it was not injected| ready
@@ -39,8 +40,8 @@ flowchart TD
     delivered -->|turn ended without a record, retry left| ready
     blocked -->|operator unblocks| ready
     pending -->|given up| failed
-    ready -->|given up| failed
-    delivered -->|given up, for example retries used| failed
+    ready -->|given up, or no request left| failed
+    delivered -->|given up, or no retry left| failed
     delivery_unknown -->|given up| failed
     blocked -->|given up| failed
 ```
@@ -67,15 +68,20 @@ writer cannot interleave records. One record per line:
 |---|---|---|
 | `created` | `id`, `content_sha256`, `content_len`, `owner`, `created_by`, `depends_on`, `max_retries` | `pending` or `ready` |
 | `delivery_started` | `id`, `attempt`, `request_id` | `ready` to `delivering`, attempt rises by one |
-| `delivered` | `id`, `attempt` | `delivering` or `delivery_unknown` to `delivered` |
-| `delivery_refused` | `id`, `attempt`, `reason` | `delivering` to `ready`, attempt given back |
-| `delivery_unknown` | `id`, `attempt`, `reason` | `delivering` to `delivery_unknown` |
-| `delivery_not_injected` | `id`, `attempt` | `delivery_unknown` to `ready`, attempt given back |
+| `delivered` | `id`, `attempt`, `request_id` | `delivering` or `delivery_unknown` to `delivered` |
+| `delivery_refused` | `id`, `attempt`, `request_id`, `reason` | `delivering` to `ready`. The attempt number stays used |
+| `delivery_unknown` | `id`, `attempt`, `request_id`, `reason` | `delivering` to `delivery_unknown` |
+| `delivery_not_injected` | `id`, `attempt`, `request_id` | `delivery_unknown` to `ready`. The attempt number stays used |
 | `retry_requested` | `id`, `attempt` | `delivered` to `ready`, only while a retry is left |
 | `record_accepted` | `id`, `attempt`, `session`, `outcome`, optional `summary_sha256` and `summary_len` | `done`, or `blocked` for outcomes `blocked` and `cannot`. Closes the attempt |
 | `record_rejected` | `claimed_id`, `claimed_attempt`, `claimed_session`, `reason` | None. Evidence only. Claimed strings are cut to 128 characters |
 | `unblocked` | `id` | `blocked` to `ready` |
 | `failed` | `id`, `reason` | `failed`. Final |
+
+Every runtime answer (`delivered`, `delivery_refused`, `delivery_unknown`, `delivery_not_injected`)
+names the `request_id` of the open attempt and is refused if it names another. Together with attempt
+numbers that are never reused, a late answer or worker record that belongs to an earlier request
+cannot move or close a later one.
 
 Write order: every event is validated against the current state, appended and synced, and only then
 applied in memory. A caller performs the effect an event describes after the call that logs it
@@ -93,6 +99,10 @@ Replaying the same bytes always gives the same state.
   unknown event, or does not fit the state, is an error. The ledger refuses to open and does not
   guess. This includes a `record_accepted` event that the matching rule would not accept: a forged
   `done` in the file does not replay.
+- **Complete but unreadable final line.** A final line that ends in a newline but is not valid
+  (for example a zero-filled block after a power loss) is corruption, not a torn tail: open fails
+  and a person must cut the line. This fails closed; a `delivering` dispatch stays unrecovered
+  until then.
 - **Crash between `delivering` and `delivered`.** At open, each dispatch left in `delivering` gets a
   `delivery_unknown` event with reason `recovered_after_restart`. It is never moved to `ready` or
   `done` by recovery. A second open finds nothing to repair.
@@ -109,6 +119,9 @@ A record is accepted only if all of these hold. The first check that fails is th
    (`future_attempt`).
 5. The dispatch is in `delivered` (`not_delivered`). Because `delivered` is entered only through a
    logged event, a record cannot satisfy a dispatch before its delivery was logged.
+
+A record that arrives while the dispatch is in `delivery_unknown` is rejected as `not_delivered`.
+The sender must resend it after the runtime's audit shows the injection happened.
 
 A rejected record is appended as `record_rejected` with the reason. It changes no dispatch. There is
 no "latest record wins" and no fallback to any other signal. The rule is the pure function
@@ -148,6 +161,12 @@ It does not guarantee:
 - Anything about the text of a dispatch. Only its hash and length are stored.
 
 ## Storage
+
+`record_rejected` events are not rate limited here, so the log grows with every rejected record. A
+transport must limit the rate of records it passes in before this is exposed to untrusted senders.
+
+`FileStore` uses Unix file locking and permissions, so it builds on Unix only. A backend for other
+platforms implements `Store`.
 
 The log sits behind the `Store` trait: load all bytes, append one record durably, truncate. The file
 backend, `FileStore`, is the only implementation. Another backend must keep the same contract: an

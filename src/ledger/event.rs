@@ -28,12 +28,14 @@ pub enum Event {
     Delivered {
         id: DispatchId,
         attempt: u32,
+        request_id: Code,
         at: u64,
     },
     /// The runtime refused. Nothing was injected.
     DeliveryRefused {
         id: DispatchId,
         attempt: u32,
+        request_id: Code,
         reason: Code,
         at: u64,
     },
@@ -41,6 +43,7 @@ pub enum Event {
     DeliveryUnknown {
         id: DispatchId,
         attempt: u32,
+        request_id: Code,
         reason: Code,
         at: u64,
     },
@@ -48,6 +51,7 @@ pub enum Event {
     DeliveryNotInjected {
         id: DispatchId,
         attempt: u32,
+        request_id: Code,
         at: u64,
     },
     /// The turn ended without a record and a retry is allowed.
@@ -137,27 +141,45 @@ impl Event {
                 o.insert("request_id".into(), json!(request_id.as_str()));
                 o.insert("at".into(), json!(at));
             }
-            Event::Delivered { id, attempt, at }
-            | Event::DeliveryNotInjected { id, attempt, at }
-            | Event::RetryRequested { id, attempt, at } => {
+            Event::RetryRequested { id, attempt, at } => {
                 o.insert("id".into(), json!(id.as_str()));
                 o.insert("attempt".into(), json!(attempt));
+                o.insert("at".into(), json!(at));
+            }
+            Event::Delivered {
+                id,
+                attempt,
+                request_id,
+                at,
+            }
+            | Event::DeliveryNotInjected {
+                id,
+                attempt,
+                request_id,
+                at,
+            } => {
+                o.insert("id".into(), json!(id.as_str()));
+                o.insert("attempt".into(), json!(attempt));
+                o.insert("request_id".into(), json!(request_id.as_str()));
                 o.insert("at".into(), json!(at));
             }
             Event::DeliveryRefused {
                 id,
                 attempt,
+                request_id,
                 reason,
                 at,
             }
             | Event::DeliveryUnknown {
                 id,
                 attempt,
+                request_id,
                 reason,
                 at,
             } => {
                 o.insert("id".into(), json!(id.as_str()));
                 o.insert("attempt".into(), json!(attempt));
+                o.insert("request_id".into(), json!(request_id.as_str()));
                 o.insert("reason".into(), json!(reason.as_str()));
                 o.insert("at".into(), json!(at));
             }
@@ -242,23 +264,27 @@ impl Event {
             "delivered" => Event::Delivered {
                 id: id_field(o, "id")?,
                 attempt: u32_field(o, "attempt")?,
+                request_id: code_field(o, "request_id")?,
                 at,
             },
             "delivery_refused" => Event::DeliveryRefused {
                 id: id_field(o, "id")?,
                 attempt: u32_field(o, "attempt")?,
+                request_id: code_field(o, "request_id")?,
                 reason: code_field(o, "reason")?,
                 at,
             },
             "delivery_unknown" => Event::DeliveryUnknown {
                 id: id_field(o, "id")?,
                 attempt: u32_field(o, "attempt")?,
+                request_id: code_field(o, "request_id")?,
                 reason: code_field(o, "reason")?,
                 at,
             },
             "delivery_not_injected" => Event::DeliveryNotInjected {
                 id: id_field(o, "id")?,
                 attempt: u32_field(o, "attempt")?,
+                request_id: code_field(o, "request_id")?,
                 at,
             },
             "retry_requested" => Event::RetryRequested {
