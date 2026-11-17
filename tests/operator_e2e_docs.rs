@@ -726,6 +726,15 @@ fn the_trusted_client_script_is_bounded_portable_and_keeps_secrets_out() {
     // Reads of what a pane or the server writes later wait, and the waits are bounded.
     assert!(text.contains("t_until") && text.contains("t_stays"));
     assert!(text.contains("t_audit_wait"));
+    // A refused start must not be able to create a pane some other step uses: the refused
+    // starts share one name, and no start of a client that holds both scopes is a refusal.
+    assert!(text.contains("T_REFUSED=") && !text.contains(" rej "));
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("t_start trusted ") && l.contains("CANARYARB")),
+        "start:arbitrary is checked with a client that has no start:args"
+    );
     // The summary comes from restart-lib's r_finish: passed, failed and skipped.
     let lib = read(&e2e_dir().join("restart-lib.sh"));
     assert!(lib.contains("summary: $R_PASSES passed, $R_FAILS failed, $R_SKIPS skipped"));
@@ -816,11 +825,12 @@ fn the_files_the_trusted_script_writes_are_accepted_by_the_real_loaders() {
             .authenticate(Some(&format!("Bearer {}", token.trim())), 1)
             .unwrap_or_else(|e| panic!("{id} does not authenticate: {e:?}"))
     };
-    let (ops, orch, trusted) = (who("ops"), who("orch"), who("trusted"));
+    let (ops, orch, trusted, arb) = (who("ops"), who("orch"), who("trusted"), who("arb"));
     assert!(!ops.has(Scope::StartArgs) && !ops.has(Scope::StartArbitrary));
     assert!(orch.has(Scope::StartArgs) && !orch.has(Scope::StartArbitrary));
     assert!(trusted.has(Scope::StartArgs) && trusted.has(Scope::StartArbitrary));
     assert!(trusted.has(Scope::Dialog) && !orch.has(Scope::Dialog));
+    assert!(arb.has(Scope::StartArbitrary) && !arb.has(Scope::StartArgs));
 
     // What the steps expect from the scope check, with the real `authorize`.
     let flags = |profile: &str| args(serde_json::json!({"profile": profile, "extra_args": ["-a"]}));
@@ -838,6 +848,12 @@ fn the_files_the_trusted_script_writes_are_accepted_by_the_real_loaders() {
     assert!(
         authorize(&trusted, "start_pane", &flags("guard")).is_err(),
         "off trusted's list"
+    );
+    // start:arbitrary does not stand in for start:args, and the error names start:args.
+    assert!(authorize(&trusted, "start_pane", &flags("sandbox")).is_ok());
+    assert_eq!(
+        denied(&arb, flags("sandbox")).to_tool_error().data["scope"],
+        "start:args"
     );
     for empty in [serde_json::json!(null), serde_json::json!([])] {
         let call = args(serde_json::json!({"profile": "sandbox", "extra_args": empty}));
@@ -867,6 +883,7 @@ fn the_files_the_trusted_script_writes_are_accepted_by_the_real_loaders() {
             "ops.token",
             "orch.token",
             "trusted.token",
+            "arb.token",
             "clients.json",
             "profiles.json",
         ] {

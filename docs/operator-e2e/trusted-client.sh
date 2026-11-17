@@ -45,6 +45,7 @@ T_AUDIT="$T_AUDIT_DIR/audit.jsonl"
 T_CLIENTS="$R_HOME/clients.json"
 T_PANES="$R_WORK/panes"
 T_WARNING="trust all tools mode"
+T_REFUSED=refused-start               # the pane name of every start that must be refused; nothing else uses it
 T_WAIT=20                              # seconds a pane or the server gets to write something
 T_WINDOW=3                             # seconds a "nothing happened" check watches
 export SHEPHERD_TOKEN_FILE="$R_HOME/ops.token"   # `ops` starts panes; r_mcp_up uses it
@@ -97,12 +98,12 @@ os.chmod(path, 0o600)
 PY
 }
 
-# t_write_clients OUT OPS_HASH ORCH_HASH TRUSTED_HASH : the clients file; the hashes are arguments.
+# t_write_clients OUT OPS_HASH ORCH_HASH TRUSTED_HASH ARB_HASH : the clients file; the hashes are arguments.
 t_write_clients() {
-  python3 - "$1" "$2" "$3" "$4" <<'PY'
+  python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
 import json, os, sys
 
-out, ops, orch, trusted = sys.argv[1:]
+out, ops, orch, trusted, arb = sys.argv[1:]
 doc = {"version": 1, "clients": [
     # Starts profile panes and looks after them. No start:args, no start:arbitrary.
     {"id": "ops", "token_sha256": ops,
@@ -116,6 +117,10 @@ doc = {"version": 1, "clients": [
     {"id": "trusted", "token_sha256": trusted,
      "scopes": ["observe", "read", "control", "start", "start:arbitrary", "start:args",
                 "dialog", "remove"],
+     "profiles": ["sandbox"]},
+    # Runs its own program but has no start:args: start:arbitrary must not stand in for it.
+    {"id": "arb", "token_sha256": arb,
+     "scopes": ["observe", "read", "control", "start", "start:arbitrary", "remove"],
      "profiles": ["sandbox"]},
 ]}
 with open(out, "w") as f:
@@ -168,13 +173,13 @@ t_setup() {
     rm -f "$T_AUDIT"
     rm -rf "${R_WORK:?}/server" "${T_PANES:?}"
     mkdir -p "$R_WORK/server" "$T_PANES"
-    for id in ops orch trusted; do
+    for id in ops orch trusted arb; do
       file="$R_HOME/$id.token"
       [ -s "$file" ] || printf 'osh_%s_%s' "$id" "$(openssl rand -hex 32)" > "$file"
       chmod 600 "$file"
     done
     hash_of() { openssl dgst -sha256 < "$R_HOME/$1.token" | awk '{print $NF}'; }
-    t_write_clients "$T_CLIENTS" "$(hash_of ops)" "$(hash_of orch)" "$(hash_of trusted)"
+    t_write_clients "$T_CLIENTS" "$(hash_of ops)" "$(hash_of orch)" "$(hash_of trusted)" "$(hash_of arb)"
   ) || r_die "setup failed"
   t_write_profiles "$R_HOME" "$T_PANES" || r_die "writing the profiles failed"
   : > "$R_VERSION_FILE"
@@ -366,15 +371,15 @@ t_main() {
     t_until "$T_WAIT" t_file_is "$T_PANES/x1/args.txt" "$(printf -- '-a\n--model\nclaude-sonnet-4')"
 
   r_check "ops (no start:args): extra_args are forbidden" \
-    test "$(t_error t_start ops rej sandbox 'extra_args:=["-a", "CANARYDENIED"]')" = forbidden
+    test "$(t_error t_start ops "$T_REFUSED" sandbox 'extra_args:=["-a", "CANARYDENIED"]')" = forbidden
   r_check "...and the error names the scope start:args" \
-    test "$(t_start ops rej sandbox 'extra_args:=["-a", "CANARYDENIED"]' 2>/dev/null | t_py 'd["scope"]')" = start:args
+    test "$(t_start ops "$T_REFUSED" sandbox 'extra_args:=["-a", "CANARYDENIED"]' 2>/dev/null | t_py 'd["scope"]')" = start:args
   r_check "orch: a profile that is not on its list is forbidden even with start:args" \
-    test "$(t_error t_start orch rej other 'extra_args:=["-a", "CANARYLIST"]')" = forbidden
+    test "$(t_error t_start orch "$T_REFUSED" other 'extra_args:=["-a", "CANARYLIST"]')" = forbidden
   r_check "start:arbitrary does not stand in for start:args" \
-    test "$(t_error t_start trusted rej sandbox 'extra_args:=["-a", "CANARYARB"]')" = forbidden
+    test "$(t_error t_start arb "$T_REFUSED" sandbox 'extra_args:=["-a", "CANARYARB"]')" = forbidden
   r_check "...and the error names the scope start:args, not the profile list" \
-    test "$(t_start trusted rej sandbox 'extra_args:=["-a", "CANARYARB"]' 2>/dev/null | t_py 'd["scope"]')" = start:args
+    test "$(t_start arb "$T_REFUSED" sandbox 'extra_args:=["-a", "CANARYARB"]' 2>/dev/null | t_py 'd["scope"]')" = start:args
   r_check "extra_args null is the same as none: ops may start" \
     r_quiet t_start ops x2 sandbox 'extra_args:=null'
   r_check "extra_args [] is the same as none: ops may start" \
@@ -386,33 +391,33 @@ t_main() {
 
   # --- Step 3: refusals ---------------------------------------------------------------------
   r_check "a control character in an element is invalid_input" \
-    test "$(t_error t_start orch rej sandbox 'extra_args:=["bad\u0001CANARYCTL"]')" = invalid_input
+    test "$(t_error t_start orch "$T_REFUSED" sandbox 'extra_args:=["bad\u0001CANARYCTL"]')" = invalid_input
   r_check "...and the error names the field extra_args" \
-    test "$(t_start orch rej sandbox 'extra_args:=["bad\u0001CANARYCTL"]' 2>/dev/null | t_py 'd["field"]')" = extra_args
+    test "$(t_start orch "$T_REFUSED" sandbox 'extra_args:=["bad\u0001CANARYCTL"]' 2>/dev/null | t_py 'd["field"]')" = extra_args
   r_check "an empty element is invalid_input" \
-    test "$(t_error t_start orch rej sandbox 'extra_args:=[""]')" = invalid_input
+    test "$(t_error t_start orch "$T_REFUSED" sandbox 'extra_args:=[""]')" = invalid_input
   r_check "an element over 4096 bytes is invalid_input" \
-    test "$(t_error t_start orch rej sandbox "extra_args:=$(t_list_json 1 5000)")" = invalid_input
+    test "$(t_error t_start orch "$T_REFUSED" sandbox "extra_args:=$(t_list_json 1 5000)")" = invalid_input
   r_check "more than 256 arguments with the profile's are invalid_input" \
-    test "$(t_error t_start orch rej sandbox "extra_args:=$(t_list_json 256 1)")" = invalid_input
+    test "$(t_error t_start orch "$T_REFUSED" sandbox "extra_args:=$(t_list_json 256 1)")" = invalid_input
   r_check "extra_args without a profile are invalid_input" \
-    test "$(t_error as trusted mcp_tool start_pane 'extra_args:=["-a"]' name=rej)" = invalid_input
+    test "$(t_error as trusted mcp_tool start_pane 'extra_args:=["-a"]' name="$T_REFUSED")" = invalid_input
   r_check "extra_args with argv are invalid_input" \
-    test "$(t_error t_start_argv trusted rej '["/bin/sh", "-c", "true"]' 'extra_args:=["-a"]')" = invalid_input
+    test "$(t_error t_start_argv trusted "$T_REFUSED" '["/bin/sh", "-c", "true"]' 'extra_args:=["-a"]')" = invalid_input
   r_check "the OpenCode auto-approve flag in extra_args is invalid_input" \
-    test "$(t_error t_start orch rej oc 'extra_args:=["--model", "CANARYOC", "--auto"]')" = invalid_input
+    test "$(t_error t_start orch "$T_REFUSED" oc 'extra_args:=["--model", "CANARYOC", "--auto"]')" = invalid_input
   r_check "...and the error names the field extra_args" \
-    test "$(t_start orch rej oc 'extra_args:=["--model", "CANARYOC", "--auto"]' 2>/dev/null | t_py 'd["field"]')" = extra_args
-  r_check "none of the refused starts left a pane" t_no_pane rej
+    test "$(t_start orch "$T_REFUSED" oc 'extra_args:=["--model", "CANARYOC", "--auto"]' 2>/dev/null | t_py 'd["field"]')" = extra_args
+  r_check "none of the refused starts left a pane" t_no_pane "$T_REFUSED"
   # The error text of a refused call must not repeat an argument value (the audit file and the
   # log are checked in step 6; the reply is the third place a value could leak to).
   r_check "the reply to a refused call does not echo an argument value" \
     t_replies_lack CANARY \
-    "$(t_start ops rej sandbox 'extra_args:=["-a", "CANARYDENIED"]' 2>&1)" \
-    "$(t_start orch rej other 'extra_args:=["-a", "CANARYLIST"]' 2>&1)" \
-    "$(t_start orch rej sandbox 'extra_args:=["bad\u0001CANARYCTL"]' 2>&1)" \
-    "$(t_start orch rej oc 'extra_args:=["--model", "CANARYOC", "--auto"]' 2>&1)" \
-    "$(t_start trusted rej sandbox 'extra_args:=["-a", "CANARYARB"]' 2>&1)"
+    "$(t_start ops "$T_REFUSED" sandbox 'extra_args:=["-a", "CANARYDENIED"]' 2>&1)" \
+    "$(t_start orch "$T_REFUSED" other 'extra_args:=["-a", "CANARYLIST"]' 2>&1)" \
+    "$(t_start orch "$T_REFUSED" sandbox 'extra_args:=["bad\u0001CANARYCTL"]' 2>&1)" \
+    "$(t_start orch "$T_REFUSED" oc 'extra_args:=["--model", "CANARYOC", "--auto"]' 2>&1)" \
+    "$(t_start arb "$T_REFUSED" sandbox 'extra_args:=["-a", "CANARYARB"]' 2>&1)"
 
   # --- Step 4: the Kiro trust-all guard -----------------------------------------------------
   r_check "orch starts the guard pane (a Kiro pane showing the trust-all warning)" \
@@ -441,7 +446,7 @@ t_main() {
   local argv
   argv="$(python3 -c 'import json, sys; print(json.dumps(["/bin/sh", "-c", sys.argv[1]]))' "$dialog_script")"
   r_check "ops (no start:arbitrary): an argv start is forbidden" \
-    test "$(t_error t_start_argv ops rej "$argv")" = forbidden
+    test "$(t_error t_start_argv ops "$T_REFUSED" "$argv")" = forbidden
   r_check "trusted: an argv start with agent kiro is accepted" r_quiet t_start_argv trusted a-yes "$argv" agent=kiro
   r_check "trusted: the same argv without agent is accepted" r_quiet t_start_argv trusted a-no "$argv"
   r_check "a-yes is blocked on the dialog" r_wait_field a-yes status.state blocked "$T_WAIT"
@@ -452,10 +457,10 @@ t_main() {
     test "$(t_error as trusted answer_dialog a-no allow_once)" = refused
   r_check "a-no: no key was sent" t_stays "$T_WINDOW" t_absent "$T_PANES/a-no/received.txt"
   r_check "agent with a profile is invalid_input" \
-    test "$(t_error t_start trusted rej sandbox agent=kiro)" = invalid_input
+    test "$(t_error t_start trusted "$T_REFUSED" sandbox agent=kiro)" = invalid_input
   r_check "an unknown agent is invalid_input" \
-    test "$(t_error t_start_argv trusted rej "$argv" agent=emacs)" = invalid_input
-  r_check "no refused start left a pane" t_no_pane rej
+    test "$(t_error t_start_argv trusted "$T_REFUSED" "$argv" agent=emacs)" = invalid_input
+  r_check "no refused start left a pane" t_no_pane "$T_REFUSED"
   r_check "...and the check can see a pane that exists (control: x1 is listed)" \
     t_has_pane x1
 

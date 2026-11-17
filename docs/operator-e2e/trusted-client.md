@@ -50,9 +50,10 @@ It takes about two minutes.
   `guard` (Kiro; shows the trust-all warning with `No, exit` as the default and reads nothing until
   a file `accept` exists), `other` (Kiro; never on the orchestrator's list) and `oc` (OpenCode).
   The profiles file has `allow_arbitrary_command: true`.
-- Three clients: `ops` (`observe`, `read`, `control`, `start`, `remove`; no `start:args`),
-  `orch` (the same plus `start:args`; profiles `sandbox`, `guard`, `oc`) and `trusted` (adds
-  `start:arbitrary` and `dialog`; profile `sandbox`).
+- Four clients: `ops` (`observe`, `read`, `control`, `start`, `remove`; no `start:args`),
+  `orch` (the same plus `start:args`; profiles `sandbox`, `guard`, `oc`), `trusted` (adds
+  `start:arbitrary` and `dialog`; profile `sandbox`) and `arb` (`start:arbitrary` but no
+  `start:args`; profile `sandbox`; it shows that one scope does not stand in for the other).
 - An audit file in a directory of mode 700.
 
 ## The checks
@@ -60,8 +61,8 @@ It takes about two minutes.
 | # | What happens | What proves it |
 |---|--------------|----------------|
 | 1 | Holder, clients file, audit file and profiles start | MCP answers under the `ops` token |
-| 2 | `orch` starts `sandbox` with `extra_args ["-a", "--model", "claude-sonnet-4"]`: the returned `argv` ends with them, after the profile's own arguments, and the pane received them. `ops` (no `start:args`) is `forbidden` and the error names the scope; a profile off the list is `forbidden`; `start:arbitrary` does not stand in for `start:args`; `null` and `[]` are accepted without the scope and add nothing | `argv` in the reply; `args.txt` in the pane directory; `error` and `scope` |
-| 3 | Refusals, each `invalid_input` and none leaves a pane: a control character, an empty element, an element over 4096 bytes, more than 256 arguments, `extra_args` without a profile, `extra_args` with `argv`, and `--auto` on an OpenCode profile (with the `field` `extra_args`) | error code; no pane named `rej` in `list_panes` |
+| 2 | `orch` starts `sandbox` with `extra_args ["-a", "--model", "claude-sonnet-4"]`: the returned `argv` ends with them, after the profile's own arguments, and the pane received them. `ops` (no `start:args`) is `forbidden` and the error names the scope; a profile off the list is `forbidden`; `arb` (`start:arbitrary`, no `start:args`) is `forbidden` with the scope `start:args`, so `start:arbitrary` does not stand in for it; `null` and `[]` are accepted without the scope and add nothing | `argv` in the reply; `args.txt` in the pane directory; `error` and `scope` |
+| 3 | Refusals, each `invalid_input` and none leaves a pane: a control character, an empty element, an element over 4096 bytes, more than 256 arguments, `extra_args` without a profile, `extra_args` with `argv`, and `--auto` on an OpenCode profile (with the `field` `extra_args`) | error code; no pane named `refused-start` in `list_panes` |
 | 4 | The Kiro trust-all guard. The `guard` pane shows the warning; `send_input` is `pane_needs_trust_acceptance` with the pane named, nothing is typed, the pane is still live and `answer_dialog` is refused. After the warning is gone (the script creates `accept`, which stands for a person accepting it) a `send_input` works and the pane gets exactly that line | `typed.txt` absent for a window, then equal to the text; `get_status` `live` |
 | 5 | `agent` on an argv start. `ops` is `forbidden` for `argv`. `trusted` starts the same dialog program twice, with and without `agent: "kiro"`: with it `answer_dialog allow_once` reaches the pane, without it the call is `refused` and no key arrives. `agent` with a profile and an unknown agent are `invalid_input` | `received.txt`; error codes |
 | 6 | The audit file. The `orch` start records `launch` `profile+args`, `extra_args_n` and `flags` (flag names only); the argv start records `launch` `argv`, `argv0` and `agent`; the start without `agent` records none; the denied start is a `denied` line; a plain profile start has no `launch`. No argument value is in the file or in the holder log: a canary in a flag value, in an attached short flag value and after `=` never appears, nor the model name, the program text or the typed text. Canaries also sit in the refused calls (denied, profile not listed, control character, auto-approve flag), and the replies to those calls must not repeat them | Python over the JSON lines, with a bounded wait for the lines |

@@ -1328,6 +1328,49 @@ mod issue4_pr1_mcp {
         assert_eq!(refused["outcome"], "error:invalid_input");
     }
 
+    /// Every `invalid_input` from `extra_args` carries `field: extra_args` and never an
+    /// argument value (issue #113), through the same seam a client uses.
+    #[test]
+    fn every_extra_args_refusal_names_the_field_and_echoes_no_value() {
+        let dir = TempDir::new("i4-xa-field");
+        let fake = idle_fake();
+        let sh = shepherd(&fake, dir.path(), true);
+        let trusted = caller_with(&[Scope::Start, Scope::StartArgs], &["ci"]);
+        let many: Vec<String> = (0..256).map(|_| FLAG_CANARY.to_string()).collect();
+        let cases = [
+            ("a string, not a list", json!(FLAG_CANARY)),
+            (
+                "an element that is not a string",
+                json!(["-a", {"k": FLAG_CANARY}]),
+            ),
+            (
+                "a control character",
+                json!([format!("bad\u{1}{FLAG_CANARY}")]),
+            ),
+            ("too long", json!(["x".repeat(5000) + FLAG_CANARY])),
+            ("too many", json!(many)),
+        ];
+        for (what, extra) in cases {
+            let out = run(
+                &sh,
+                &trusted,
+                "start_pane",
+                json!({"profile": "ci", "cwd": dir.path(), "name": "n", "extra_args": extra}),
+            );
+            assert_eq!(out["isError"], true, "{what}: {out}");
+            assert_eq!(code(&out), "invalid_input", "{what}: {out}");
+            assert_eq!(
+                out["structuredContent"]["field"], "extra_args",
+                "{what}: {out}"
+            );
+            assert!(
+                !text_canary(&out, FLAG_CANARY),
+                "{what} echoed a value: {out}"
+            );
+        }
+        assert!(fake.state.lock().unwrap().runs.is_empty());
+    }
+
     #[test]
     fn start_args_is_what_lets_a_client_pass_flags_and_nothing_else_does() {
         let dir = TempDir::new("i4-xa-scope");
