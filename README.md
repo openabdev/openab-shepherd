@@ -200,7 +200,7 @@ The OpenCode notes (launch, the permission dialog, the highlight check) are in
 
 ## Status and known limits
 
-Shepherd is an MVP. The latest release is 0.4.0; main carries unreleased changes (see
+Shepherd is an MVP. The latest release is 0.5.0 (see
 [CHANGELOG.md](CHANGELOG.md)). The native backend was verified against
 kiro-cli 3.1.0 with a real-Kiro probe; the results are in
 [MVP-REPORT.md](MVP-REPORT.md) (a dated record, not a current status), and the native core's design is in
