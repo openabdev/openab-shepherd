@@ -10,6 +10,8 @@ The script for agent-created routines (`routine_create` and the other three tool
 
 The script for trusted clients (`extra_args` behind `start:args`, the `agent` field, the Kiro trust-all guard and the audit fields) is `trusted-client.sh`, described in [trusted-client.md](trusted-client.md).
 
+The script for the dialog drift canary (does the installed agent CLI's permission dialog still parse with the shipped rule? one prompt per agent, Kiro, Devin or OpenCode, never logs in) is `dialog-canary.sh`, described in [dialog-canary.md](dialog-canary.md).
+
 Validated against `origin/main` commit `afd73c9`; see [Known results](#known-results) and [Verified against](#verified-against).
 
 ## Safety rules
