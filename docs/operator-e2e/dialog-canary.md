@@ -87,6 +87,7 @@ RESULT: PASS
 | Line | Meaning |
 |------|---------|
 | `SKIP ...` | A prerequisite is missing (key, login, trust). Nothing was checked and no prompt was sent. It is not a failure and not a pass: the summary counts it. |
+| `RESULT: INCOMPLETE` (exit 3) | Something was skipped, or nothing passed. It is not a pass. Only a run with `passed` above 0, no `SKIP` and `RESULT: PASS` is evidence for #65. |
 | `NOTICE the installed ... differs from the pin` | The CLI is not the pinned version. The result is about the new version. |
 | `FAIL the dialog has the recorded structure` | The title, tool line or options differ from the recorded dialog. The drift report shows the screen. Update the parser and the fixture together. |
 | `FAIL answer_dialog deny_once succeeds` | The shipped parser refused the live dialog: the drift this script exists to find. The drift report shows `seen`. |
@@ -104,5 +105,5 @@ operator_e2e_docs` checks that the script parses and that this runbook and the R
 
 ## Results for the issue
 
-Paste the output of the Kiro run (the `summary` and `RESULT` lines and the version line) into #65.
+Paste the output of the Kiro run, which must show `RESULT: PASS` with no `SKIP` line (the `summary` and `RESULT` lines and the version line) into #65.
 Issue #65 closes after that real run.

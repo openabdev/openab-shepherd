@@ -61,6 +61,7 @@ C_CLI=""
 C_REASON=""
 C_START_WAIT=90                       # seconds the first screen gets to settle
 C_PROMPT_WAIT=150                     # seconds the agent gets to ask for permission
+C_STRUCT_WAIT=10                      # seconds a partly drawn dialog gets to finish
 C_SETTLE_WAIT=60                      # seconds the agent gets to settle after the answer
 C_WINDOW=3                            # seconds a "nothing happened" check watches
 C_ROWS=30                             # screen lines printed in a drift report
@@ -408,6 +409,19 @@ c_stays() {
   done
 }
 
+# c_finish : the summary. Like r_finish, but a run that checked nothing, or skipped anything, is not a
+# PASS: it prints RESULT: INCOMPLETE and exits 3. Only a run with passed > 0, no skip and no failure
+# is evidence for issue #65.
+c_finish() {
+  if [ "$R_FAILS" -ne 0 ]; then r_finish; return $?; fi
+  if [ "$R_PASSES" -gt 0 ] && [ "$R_SKIPS" -eq 0 ]; then r_finish; return $?; fi
+  echo
+  echo "host:    $(uname -srm)"
+  echo "summary: $R_PASSES passed, $R_FAILS failed, $R_SKIPS skipped"
+  echo "RESULT: INCOMPLETE (a check was skipped or nothing was checked; this is not a pass and not evidence for #65)"
+  return 3
+}
+
 c_usage() { echo "usage: bash dialog-canary.sh kiro|devin|opencode" >&2; exit 2; }
 
 c_main() {
@@ -420,7 +434,7 @@ c_main() {
   if ! c_prereq "$C_AGENT"; then
     r_skip "$C_AGENT: $C_REASON"
     echo "canary: nothing was checked and no model prompt was sent"
-    r_finish
+    c_finish
     exit $?
   fi
   c_version_notice "$C_AGENT" "$C_CLI"
@@ -436,12 +450,12 @@ c_main() {
   if [ "$rc" -ne 0 ]; then
     if [ "$(printf '%s' "$out" | c_py 'd.get("error")')" = trust_prompt ]; then
       r_skip "$C_AGENT: asks to trust the directory (do the one-time trust of README D0 and set CANARY_DEVIN_CWD to that directory)"
-      r_finish
+      c_finish
       exit $?
     fi
     r_check "start_pane starts the $C_AGENT pane" false
     echo "$out" | head -20
-    r_finish
+    c_finish
     exit $?
   fi
   C_STARTED=1
@@ -451,11 +465,11 @@ c_main() {
      || [ "$(r_field "$C_PANE" status.kind)" = auth ]; then
     remove_pane "$C_PANE" >/dev/null 2>&1; C_STARTED=0
     r_skip "$C_AGENT: the first screen asks for a login; the pane was removed and nothing was typed (log in yourself, this script never does)"
-    r_finish
+    c_finish
     exit $?
   fi
   r_check "the $C_AGENT pane reaches idle (state: ${state:-none})" test "$state" = idle
-  if [ "$state" != idle ]; then c_report "$C_SCREEN"; r_finish; exit $?; fi
+  if [ "$state" != idle ]; then c_report "$C_SCREEN"; c_finish; exit $?; fi
 
   # --- Step 3: the one prompt -------------------------------------------------------------
   out="$(send_input "$C_PANE" "$(c_prompt "$C_AGENT")" 2>&1)"
@@ -465,15 +479,22 @@ c_main() {
     echo "canary: the last outcome was '${C_OUTCOME:-none}'; the agent did not ask (it may have run the command, or refused)"
     c_screen || : > "$C_SCREEN"
     c_report "$C_SCREEN"
-    r_finish
+    c_finish
     exit $?
   fi
 
   # --- Step 4: the structure of the dialog ------------------------------------------------
-  r_check "the screen can be read" c_screen
-  local fixture_args=()
+  local fixture_args=() sdeadline=$((SECONDS + C_STRUCT_WAIT))
   [ -n "$fixture" ] && fixture_args=(--fixture "$fixture")
-  out="$(python3 "$HERE/dialog-canary-check.py" structure "$C_AGENT" "$C_SCREEN" --marker "$C_MARKER_NAME" ${fixture_args[@]+"${fixture_args[@]}"} 2>&1)"; rc=$?
+  # The dialog may still be drawing when `blocked` is reported: read and compare again, bounded.
+  while :; do
+    c_screen || : > "$C_SCREEN"
+    out="$(python3 "$HERE/dialog-canary-check.py" structure "$C_AGENT" "$C_SCREEN" --marker "$C_MARKER_NAME" ${fixture_args[@]+"${fixture_args[@]}"} 2>&1)"; rc=$?
+    [ "$rc" -eq 0 ] && break
+    [ "$SECONDS" -ge "$sdeadline" ] && break
+    sleep 1
+  done
+  r_check "the screen can be read" test -s "$C_SCREEN"
   echo "canary: $out"
   r_check "the dialog has the recorded structure (title, tool line, options in order)" test "$rc" -eq 0
   [ "$rc" -eq 0 ] || c_report "$C_SCREEN"
@@ -500,13 +521,12 @@ except Exception:
     c_wait_state "$C_SETTLE_WAIT" >/dev/null
     r_check "the marker file does not exist after deny_once" c_stays "$C_WINDOW" c_marker_absent
   fi
-  [ "$rc" -eq 0 ] || r_skip "marker check: deny_once was not accepted, so the dialog is still open and an absent marker would prove nothing"
 
   # --- Step 6: remove the pane ------------------------------------------------------------
   out="$(remove_pane "$C_PANE" 2>&1)"; rc=$?
   r_check "remove_pane removes the pane" test "$rc" -eq 0
   [ "$rc" -eq 0 ] && C_STARTED=0
-  r_finish
+  c_finish
 }
 
 if [ "${C_SOURCE_ONLY:-}" != 1 ]; then c_main; fi

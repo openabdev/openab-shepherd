@@ -1205,3 +1205,31 @@ fn the_dialog_canary_reads_the_pins_from_the_dockerfile() {
     );
     assert_eq!(run("c_version_matches '' 'anything' || echo no"), "no");
 }
+
+/// A run that skipped something, or checked nothing, is not a PASS and does not exit 0.
+#[test]
+fn the_dialog_canary_does_not_report_pass_for_a_skipped_or_empty_run() {
+    let run = |counts: &str| {
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "C_SOURCE_ONLY=1 source \"$SCRIPT\" && {counts}; c_finish; echo \"exit=$?\""
+            ))
+            .env("SCRIPT", e2e_dir().join("dialog-canary.sh"))
+            .env("SHEPHERD_BIN", "/bin/echo")
+            .output()
+            .expect("run bash");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let skipped_only = run("R_PASSES=0 R_FAILS=0 R_SKIPS=1");
+    assert!(skipped_only.contains("RESULT: INCOMPLETE") && skipped_only.contains("exit=3"));
+    assert!(!skipped_only.contains("RESULT: PASS"), "{skipped_only}");
+    let nothing = run("R_PASSES=0 R_FAILS=0 R_SKIPS=0");
+    assert!(nothing.contains("RESULT: INCOMPLETE") && nothing.contains("exit=3"));
+    let partial = run("R_PASSES=5 R_FAILS=0 R_SKIPS=1");
+    assert!(partial.contains("RESULT: INCOMPLETE") && !partial.contains("RESULT: PASS"));
+    let failed = run("R_PASSES=5 R_FAILS=1 R_SKIPS=1");
+    assert!(failed.contains("RESULT: FAIL") && failed.contains("exit=1"), "{failed}");
+    let good = run("R_PASSES=8 R_FAILS=0 R_SKIPS=0");
+    assert!(good.contains("RESULT: PASS") && good.contains("exit=0"), "{good}");
+}
