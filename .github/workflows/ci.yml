@@ -16,7 +16,8 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # Above the sum of the step timeouts, so a step timeout fires first.
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -34,8 +35,34 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      # Build and run are separate steps with their own timeouts (issue #108): a
+      # step timeout fails only that step, so the later steps still run and the
+      # log survives. No retries, and the test thread count is left alone.
+      - name: Build tests
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          mkdir -p ci-logs
+          cargo test --locked --no-run --message-format=json-render-diagnostics > ci-logs/build.json
+          jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' \
+            ci-logs/build.json | awk '!seen[$0]++' > ci-logs/executables.txt
+          echo "test executables:"
+          cat ci-logs/executables.txt
+          test -s ci-logs/executables.txt
       - name: Test
-        run: cargo test --locked --no-fail-fast
+        timeout-minutes: 12
+        run: ci/run-tests.sh ci-logs/executables.txt --doc
+      - name: Upload test log and diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-logs-${{ matrix.os }}
+          path: |
+            ci-logs/*.log
+            ci-logs/diagnostics.txt
+            ci-logs/executables.txt
+          if-no-files-found: ignore
+          retention-days: 14
 
   docker-build:
     name: docker build
