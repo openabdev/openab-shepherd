@@ -18,7 +18,7 @@ It is not wired into any running code. Nothing in the server creates a ledger or
 | `depends_on` | Dispatches that must be `done` first. They must already exist, so a cycle cannot be written |
 | `attempt` | The number of the latest delivery request, never reused: it rises by one for every `delivery_started`, even if the runtime refused the request. 0 before the first |
 | `request_id` | The id of the latest delivery request. Every answer from the runtime must name it |
-| `max_retries` | Redeliveries allowed after the first. Requests allowed: `max_retries + 1`. Using them up sets `failed` with reason `retry_cap_reached`. The call that finds the cap logs that `failed` and then returns an error |
+| `max_retries` | Redeliveries allowed after the first. Requests allowed: `max_retries + 1`. Using them up sets `failed` with reason `retry_cap_reached`. The call that finds the cap logs that `failed` and then returns an error. At most 4294967293 (`u32::MAX - 2`), so the attempt counter always reaches the cap; a larger value is refused when the dispatch is created |
 | `state` | See below |
 | `created_at`, `updated_at`, `delivered_at` | Milliseconds since the Unix epoch, from an injected clock |
 
@@ -81,7 +81,8 @@ writer cannot interleave records. One record per line:
 Every runtime answer (`delivered`, `delivery_refused`, `delivery_unknown`, `delivery_not_injected`)
 names the `request_id` of the open attempt and is refused if it names another. Together with attempt
 numbers that are never reused, a late answer or worker record that belongs to an earlier request
-cannot move or close a later one.
+cannot move or close a later one. A dispatch also never reuses a request id: a `delivery_started`
+that repeats one the dispatch already used is refused, and replay refuses a log that contains one.
 
 Write order: every event is validated against the current state, appended and synced, and only then
 applied in memory. A caller performs the effect an event describes after the call that logs it

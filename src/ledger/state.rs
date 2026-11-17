@@ -57,6 +57,11 @@ pub fn match_record(dispatch: Option<&Dispatch>, claim: &Claim) -> Result<Outcom
     Ok(claim.outcome)
 }
 
+/// The largest accepted `max_retries`. It keeps `max_retries + 1` attempts
+/// below `u32::MAX`, so the attempt counter can always reach the cap and the
+/// dispatch can always be moved to `failed` there.
+pub const MAX_RETRIES_LIMIT: u32 = u32::MAX - 2;
+
 /// An event does not fit the current state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransitionError {
@@ -83,6 +88,13 @@ pub enum TransitionError {
     },
     /// The retry cap is reached. The caller must fail the dispatch.
     RetryCapReached(DispatchId),
+    /// The dispatch already used this request id for an earlier attempt.
+    RequestReused {
+        id: DispatchId,
+        request_id: Code,
+    },
+    /// `max_retries` is above `MAX_RETRIES_LIMIT`.
+    MaxRetriesTooLarge(u32),
     /// A `record_accepted` event that the matching rule would reject.
     RecordNotMatching(RejectReason),
 }
@@ -106,6 +118,12 @@ impl fmt::Display for TransitionError {
             }
             TransitionError::RetryCapReached(id) => {
                 write!(f, "dispatch {id} has used its retries")
+            }
+            TransitionError::RequestReused { id, request_id } => {
+                write!(f, "dispatch {id} already used request {request_id}")
+            }
+            TransitionError::MaxRetriesTooLarge(n) => {
+                write!(f, "max_retries {n} is above {MAX_RETRIES_LIMIT}")
             }
             TransitionError::RecordNotMatching(r) => write!(f, "record does not match: {r}"),
         }
@@ -155,7 +173,15 @@ impl LedgerState {
     /// Whether `event` may follow the current state. Changes nothing.
     pub fn validate(&self, event: &Event) -> Result<(), TransitionError> {
         match event {
-            Event::Created { id, depends_on, .. } => {
+            Event::Created {
+                id,
+                depends_on,
+                max_retries,
+                ..
+            } => {
+                if *max_retries > MAX_RETRIES_LIMIT {
+                    return Err(TransitionError::MaxRetriesTooLarge(*max_retries));
+                }
                 if self.dispatches.contains_key(id) {
                     return Err(TransitionError::DuplicateId(id.clone()));
                 }
@@ -174,7 +200,12 @@ impl LedgerState {
                 }
                 Ok(())
             }
-            Event::DeliveryStarted { id, attempt, .. } => {
+            Event::DeliveryStarted {
+                id,
+                attempt,
+                request_id,
+                ..
+            } => {
                 let d = self.find(id)?;
                 expect_state(d, &[State::Ready])?;
                 let next = d
@@ -186,6 +217,12 @@ impl LedgerState {
                 }
                 if u64::from(*attempt) > u64::from(d.max_retries) + 1 {
                     return Err(TransitionError::RetryCapReached(id.clone()));
+                }
+                if d.used_requests.contains(request_id) {
+                    return Err(TransitionError::RequestReused {
+                        id: id.clone(),
+                        request_id: request_id.clone(),
+                    });
                 }
                 Ok(())
             }
@@ -307,6 +344,7 @@ impl LedgerState {
                         attempt: 0,
                         max_retries: *max_retries,
                         request_id: None,
+                        used_requests: Default::default(),
                         closed_attempts: Default::default(),
                         outcome: None,
                         failure: None,
@@ -326,6 +364,7 @@ impl LedgerState {
                 d.state = State::Delivering;
                 d.attempt = *attempt;
                 d.request_id = Some(request_id.clone());
+                d.used_requests.insert(request_id.clone());
             }
             Event::Delivered { id, at, .. } => {
                 let d = self.get_mut(id, *at);

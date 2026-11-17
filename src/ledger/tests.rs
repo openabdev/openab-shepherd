@@ -292,7 +292,10 @@ fn refused_delivery_returns_to_ready_and_the_attempt_stays_used() {
     let (mut l, _) = open_mem(&MemStore::default());
     l.create(new_dispatch("a", "s1", 3, &[])).unwrap();
     for n in 1..=4u32 {
-        assert_eq!(l.begin_delivery(&id("a"), code("r")).unwrap(), n);
+        assert_eq!(
+            l.begin_delivery(&id("a"), code(&format!("r{n}"))).unwrap(),
+            n
+        );
         l.refuse(&id("a"), code("not_idle")).unwrap();
         assert_eq!(state_of(&l, "a"), State::Ready);
         assert_eq!(l.get(&id("a")).unwrap().attempt, n);
@@ -818,7 +821,7 @@ fn random_walks_keep_replay_equal_and_done_honest() {
                     let _ = l.create(new_dispatch(name, owner, 1 + rng.next(3) as u32, deps));
                 }
                 1 => {
-                    let _ = l.begin_delivery(&d, code("r"));
+                    let _ = l.begin_delivery(&d, code(&format!("r{seed}x{step}")));
                 }
                 2 => {
                     let _ = l.confirm(&d);
@@ -1378,4 +1381,76 @@ fn pure_matcher_checks_the_dispatch_id_itself() {
         match_record(Some(d), &claim("a", 1, "s1", Outcome::Done)),
         Ok(Outcome::Done)
     );
+}
+
+/// Review finding: a request id reused by the same dispatch let a late answer
+/// for attempt 1 confirm attempt 2, which was never injected.
+#[test]
+fn a_dispatch_cannot_reuse_a_request_id() {
+    let (mut l, _) = open_mem(&MemStore::default());
+    l.create(new_dispatch("a", "s1", 3, &[])).unwrap();
+    let r = code("r");
+    assert_eq!(l.begin_delivery(&id("a"), r.clone()).unwrap(), 1);
+    l.refuse_delivery(&id("a"), &r, code("not_idle")).unwrap();
+    let before = l.state().clone();
+    let log_before = l.store.bytes();
+    assert!(matches!(
+        l.begin_delivery(&id("a"), r.clone()),
+        Err(LedgerError::Transition(
+            TransitionError::RequestReused { .. }
+        ))
+    ));
+    // Nothing was written, and the dispatch is still ready for a fresh id.
+    assert_eq!(l.state(), &before);
+    assert_eq!(l.store.bytes(), log_before);
+    assert_eq!(l.begin_delivery(&id("a"), code("r2")).unwrap(), 2);
+    // The late answer for attempt 1 cannot confirm attempt 2.
+    assert!(l.confirm_delivered(&id("a"), &r).is_err());
+    assert_eq!(state_of(&l, "a"), State::Delivering);
+    // Another dispatch may use the same id.
+    l.create(new_dispatch("b", "s1", 0, &[])).unwrap();
+    assert_eq!(l.begin_delivery(&id("b"), r).unwrap(), 1);
+}
+
+#[test]
+fn a_log_that_reuses_a_request_id_does_not_replay() {
+    let (mut l, _) = open_mem(&MemStore::default());
+    l.create(new_dispatch("a", "s1", 3, &[])).unwrap();
+    l.begin_delivery(&id("a"), code("r")).unwrap();
+    l.refuse(&id("a"), code("not_idle")).unwrap();
+    let mut state = l.state().clone();
+    let reuse = Event::DeliveryStarted {
+        id: id("a"),
+        attempt: 2,
+        request_id: code("r"),
+        at: 99,
+    };
+    assert!(matches!(
+        state.apply(&reuse),
+        Err(TransitionError::RequestReused { .. })
+    ));
+    assert_eq!(&state, l.state());
+}
+
+/// Review finding: with `max_retries` at `u32::MAX` the attempt counter could
+/// overflow before the cap, leaving the dispatch `ready`. The limit keeps
+/// `max_retries + 1` attempts representable, so the cap is always reachable.
+#[test]
+fn max_retries_is_bounded_so_the_cap_stays_reachable() {
+    let (mut l, _) = open_mem(&MemStore::default());
+    l.create(new_dispatch("ok", "s1", MAX_RETRIES_LIMIT, &[]))
+        .unwrap();
+    let d = l.get(&id("ok")).unwrap();
+    assert!(u64::from(d.max_retries) + 1 < u64::from(u32::MAX));
+    let log_before = l.store.bytes();
+    for n in [MAX_RETRIES_LIMIT + 1, u32::MAX - 1, u32::MAX] {
+        assert!(matches!(
+            l.create(new_dispatch("big", "s1", n, &[])),
+            Err(LedgerError::Transition(
+                TransitionError::MaxRetriesTooLarge(_)
+            ))
+        ));
+    }
+    assert_eq!(l.store.bytes(), log_before);
+    assert!(l.get(&id("big")).is_none());
 }

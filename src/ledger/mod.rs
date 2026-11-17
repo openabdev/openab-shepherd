@@ -30,7 +30,7 @@ mod tests;
 
 pub use event::Event;
 pub use log::{encode_record, replay, Replay, ReplayError, FORMAT_VERSION};
-pub use state::{match_record, Claim, LedgerState, TransitionError};
+pub use state::{match_record, Claim, LedgerState, TransitionError, MAX_RETRIES_LIMIT};
 pub use store::{FileStore, Store};
 pub use types::{
     BadContentRef, Code, ContentRef, Dispatch, DispatchId, NameError, Outcome, RejectReason,
@@ -112,6 +112,8 @@ pub struct NewDispatch {
     pub owner: SessionId,
     pub created_by: Code,
     pub depends_on: Vec<DispatchId>,
+    /// Redeliveries allowed after the first. At most `MAX_RETRIES_LIMIT`;
+    /// a larger value is refused with `MaxRetriesTooLarge`.
     pub max_retries: u32,
 }
 
@@ -234,7 +236,10 @@ impl<S: Store> Ledger<S> {
     /// call returns `RetryCapReached`: the state changed.
     ///
     /// The attempt number is never reused, which is what lets a worker record
-    /// be matched on (dispatch, attempt, session) alone.
+    /// be matched on (dispatch, attempt, session) alone. A dispatch also never
+    /// reuses a request id: a repeat is refused with `RequestReused` and
+    /// nothing is written, so a late answer to an earlier request cannot be
+    /// taken for the answer to this one.
     /// The caller asks the runtime only after this returns `Ok`.
     pub fn begin_delivery(
         &mut self,
@@ -242,6 +247,8 @@ impl<S: Store> Ledger<S> {
         request_id: Code,
     ) -> Result<u32, LedgerError> {
         let d = self.find(id)?;
+        // `max_retries` is bounded at creation, so the cap is always reached
+        // before the counter can overflow.
         let attempt = d
             .attempt
             .checked_add(1)

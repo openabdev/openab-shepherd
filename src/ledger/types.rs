@@ -282,6 +282,10 @@ pub struct Dispatch {
     pub max_retries: u32,
     /// The request id of the latest attempt, if any.
     pub request_id: Option<Code>,
+    /// Every request id this dispatch has used. A request id is never reused
+    /// by the same dispatch, so an answer to an earlier request cannot be
+    /// taken for the answer to a later one.
+    pub used_requests: BTreeSet<Code>,
     /// Attempts closed by an accepted record. Each closes once.
     pub closed_attempts: BTreeSet<u32>,
     /// The outcome of the accepted record that moved it to `done` or `blocked`.
