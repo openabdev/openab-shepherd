@@ -280,6 +280,10 @@ pub struct Dispatch {
     pub attempt: u32,
     /// Redeliveries allowed after the first delivery.
     pub max_retries: u32,
+    /// Requests known not to have reached the worker (refused by the runtime,
+    /// or shown by its audit as not injected). They keep their attempt number
+    /// but do not use the retry budget.
+    pub unsent: u32,
     /// The request id of the latest attempt, if any.
     pub request_id: Option<Code>,
     /// Every request id this dispatch has used. A request id is never reused
@@ -298,6 +302,12 @@ pub struct Dispatch {
 }
 
 impl Dispatch {
+    /// Attempts that count against `max_retries + 1`: those that reached, or
+    /// may have reached, the worker.
+    pub fn spent(&self) -> u64 {
+        u64::from(self.attempt) - u64::from(self.unsent)
+    }
+
     /// Redeliveries used so far.
     pub fn retries(&self) -> u32 {
         self.attempt.saturating_sub(1)

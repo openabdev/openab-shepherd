@@ -215,7 +215,7 @@ impl LedgerState {
                 if *attempt != next {
                     return Err(wrong_attempt(d, next, *attempt));
                 }
-                if u64::from(*attempt) > u64::from(d.max_retries) + 1 {
+                if d.spent() + 1 > u64::from(d.max_retries) + 1 {
                     return Err(TransitionError::RetryCapReached(id.clone()));
                 }
                 if d.used_requests.contains(request_id) {
@@ -269,7 +269,7 @@ impl LedgerState {
                 let d = self.find(id)?;
                 expect_state(d, &[State::Delivered])?;
                 expect_attempt(d, *attempt)?;
-                if d.attempt > d.max_retries {
+                if d.spent() > u64::from(d.max_retries) {
                     return Err(TransitionError::RetryCapReached(id.clone()));
                 }
                 Ok(())
@@ -343,6 +343,7 @@ impl LedgerState {
                         state,
                         attempt: 0,
                         max_retries: *max_retries,
+                        unsent: 0,
                         request_id: None,
                         used_requests: Default::default(),
                         closed_attempts: Default::default(),
@@ -374,8 +375,11 @@ impl LedgerState {
             Event::DeliveryRefused { id, at, .. } | Event::DeliveryNotInjected { id, at, .. } => {
                 // Nothing reached the worker. The attempt number stays used: a
                 // later request never shares it, so a late answer to this one
-                // cannot be taken for the next.
-                self.get_mut(id, *at).state = State::Ready;
+                // cannot be taken for the next. It does not use the retry
+                // budget, which counts only deliveries that may have landed.
+                let d = self.get_mut(id, *at);
+                d.state = State::Ready;
+                d.unsent += 1;
             }
             Event::DeliveryUnknown { id, at, .. } => {
                 self.get_mut(id, *at).state = State::DeliveryUnknown;

@@ -247,14 +247,14 @@ impl<S: Store> Ledger<S> {
         request_id: Code,
     ) -> Result<u32, LedgerError> {
         let d = self.find(id)?;
-        // `max_retries` is bounded at creation, so the cap is always reached
-        // before the counter can overflow.
+        // Refused requests do not use the retry budget, so the counter itself
+        // is the only bound on them: at u32::MAX the call is refused.
         let attempt = d
             .attempt
             .checked_add(1)
             .ok_or_else(|| TransitionError::RetryCapReached(id.clone()))?;
         let at = self.now();
-        if d.state == State::Ready && u64::from(attempt) > u64::from(d.max_retries) + 1 {
+        if d.state == State::Ready && d.spent() + 1 > u64::from(d.max_retries) + 1 {
             return self.fail_at_cap(id, at);
         }
         self.commit(Event::DeliveryStarted {
@@ -287,7 +287,7 @@ impl<S: Store> Ledger<S> {
 
     /// The runtime refused `request_id`. Nothing was injected: back to
     /// `ready`. The attempt number stays used, so the next request gets a new
-    /// one and counts against the retry cap.
+    /// one, but the refusal does not count against the retry cap.
     pub fn refuse_delivery(
         &mut self,
         id: &DispatchId,
@@ -326,7 +326,7 @@ impl<S: Store> Ledger<S> {
 
     /// The runtime's audit shows `request_id` was not injected:
     /// `delivery_unknown` to `ready`. Only this call can do it. The attempt
-    /// number stays used.
+    /// number stays used and the retry cap is not charged.
     pub fn resolve_not_injected(
         &mut self,
         id: &DispatchId,
@@ -348,7 +348,7 @@ impl<S: Store> Ledger<S> {
     pub fn request_retry(&mut self, id: &DispatchId) -> Result<(), LedgerError> {
         let d = self.find(id)?;
         let attempt = d.attempt;
-        let at_cap = d.state == State::Delivered && d.attempt > d.max_retries;
+        let at_cap = d.state == State::Delivered && d.spent() > u64::from(d.max_retries);
         let at = self.now();
         if at_cap {
             return self.fail_at_cap(id, at);

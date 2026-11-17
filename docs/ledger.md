@@ -16,9 +16,9 @@ It is not wired into any running code. Nothing in the server creates a ledger or
 | `owner` | The one worker session the dispatch is delivered to and completed by |
 | `created_by` | A short code naming who created it |
 | `depends_on` | Dispatches that must be `done` first. They must already exist, so a cycle cannot be written |
-| `attempt` | The number of the latest delivery request, never reused: it rises by one for every `delivery_started`, even if the runtime refused the request. 0 before the first |
+| `attempt` | The number of the latest delivery request, never reused: it rises by one for every `delivery_started`, even if the runtime refused the request. 0 before the first. Requests that did not reach the worker keep their number but do not use the retry budget |
 | `request_id` | The id of the latest delivery request. Every answer from the runtime must name it |
-| `max_retries` | Redeliveries allowed after the first. Requests allowed: `max_retries + 1`. Using them up sets `failed` with reason `retry_cap_reached`. The call that finds the cap logs that `failed` and then returns an error. At most 4294967293 (`u32::MAX - 2`), so the attempt counter always reaches the cap; a larger value is refused when the dispatch is created |
+| `max_retries` | Redeliveries allowed after the first. Deliveries that may have reached the worker: `max_retries + 1` (a refused request, or one shown as not injected, is not counted). Using them up sets `failed` with reason `retry_cap_reached`. The call that finds the cap logs that `failed` and then returns an error. At most 4294967293 (`u32::MAX - 2`); a larger value is refused when the dispatch is created. The counter is a `u32`: at its end `begin_delivery` is refused |
 | `state` | See below |
 | `created_at`, `updated_at`, `delivered_at` | Milliseconds since the Unix epoch, from an injected clock |
 
@@ -31,7 +31,7 @@ flowchart TD
     pending -->|last dependency done| ready
     ready -->|delivery_started logged| delivering
     delivering -->|runtime confirmed the injection| delivered
-    delivering -->|runtime refused, attempt number stays used| ready
+    delivering -->|runtime refused, attempt number stays used but no retry is charged| ready
     delivering -->|timeout, or crash found at open| delivery_unknown
     delivery_unknown -->|runtime audit shows it was injected| delivered
     delivery_unknown -->|runtime audit shows it was not injected| ready
@@ -49,6 +49,8 @@ flowchart TD
 `delivering` exists only between two log writes. The only ways out of `delivery_unknown` are the two
 runtime answers above, or `failed`. The ledger never re-injects from it on its own, because a second
 injection would run the same text twice.
+
+A dispatch that depends on one that became `failed` stays `pending`: the ledger does not fail dependents on its own, so the caller decides, for example by logging `failed` for them.
 
 ## The log
 
@@ -69,12 +71,12 @@ writer cannot interleave records. One record per line:
 | `created` | `id`, `content_sha256`, `content_len`, `owner`, `created_by`, `depends_on`, `max_retries` | `pending` or `ready` |
 | `delivery_started` | `id`, `attempt`, `request_id` | `ready` to `delivering`, attempt rises by one |
 | `delivered` | `id`, `attempt`, `request_id` | `delivering` or `delivery_unknown` to `delivered` |
-| `delivery_refused` | `id`, `attempt`, `request_id`, `reason` | `delivering` to `ready`. The attempt number stays used |
+| `delivery_refused` | `id`, `attempt`, `request_id`, `reason` | `delivering` to `ready`. The attempt number stays used, no retry is charged |
 | `delivery_unknown` | `id`, `attempt`, `request_id`, `reason` | `delivering` to `delivery_unknown` |
-| `delivery_not_injected` | `id`, `attempt`, `request_id` | `delivery_unknown` to `ready`. The attempt number stays used |
+| `delivery_not_injected` | `id`, `attempt`, `request_id` | `delivery_unknown` to `ready`. The attempt number stays used, no retry is charged |
 | `retry_requested` | `id`, `attempt` | `delivered` to `ready`, only while a retry is left |
 | `record_accepted` | `id`, `attempt`, `session`, `outcome`, optional `summary_sha256` and `summary_len` | `done`, or `blocked` for outcomes `blocked` and `cannot`. Closes the attempt |
-| `record_rejected` | `claimed_id`, `claimed_attempt`, `claimed_session`, `reason` | None. Evidence only. Claimed strings are cut to 128 characters |
+| `record_rejected` | `claimed_id`, `claimed_attempt`, `claimed_session`, `reason` | None. Evidence only. Claimed strings are cut to 128 characters but are otherwise the sender's text, so treat the log as holding untrusted strings |
 | `unblocked` | `id` | `blocked` to `ready` |
 | `failed` | `id`, `reason` | `failed`. Final |
 

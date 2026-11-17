@@ -288,10 +288,12 @@ fn dependency_errors_are_refused_at_creation_and_write_nothing() {
 }
 
 #[test]
-fn refused_delivery_returns_to_ready_and_the_attempt_stays_used() {
+fn refused_delivery_returns_to_ready_and_the_attempt_number_stays_used() {
     let (mut l, _) = open_mem(&MemStore::default());
-    l.create(new_dispatch("a", "s1", 3, &[])).unwrap();
-    for n in 1..=4u32 {
+    l.create(new_dispatch("a", "s1", 0, &[])).unwrap();
+    // With no retry allowed, any number of refused requests still leaves the
+    // first real delivery available.
+    for n in 1..=6u32 {
         assert_eq!(
             l.begin_delivery(&id("a"), code(&format!("r{n}"))).unwrap(),
             n
@@ -300,13 +302,27 @@ fn refused_delivery_returns_to_ready_and_the_attempt_stays_used() {
         assert_eq!(state_of(&l, "a"), State::Ready);
         assert_eq!(l.get(&id("a")).unwrap().attempt, n);
     }
-    // The fifth request would exceed max_retries + 1: the dispatch fails,
-    // visibly, and the call says why.
+    assert_eq!(l.begin_delivery(&id("a"), code("r7")).unwrap(), 7);
+    l.confirm_delivered(&id("a"), &code("r7")).unwrap();
+    assert_eq!(state_of(&l, "a"), State::Delivered);
+    // That delivery was the one allowed: a turn without a record now fails it.
     assert!(matches!(
-        l.begin_delivery(&id("a"), code("r")),
+        l.request_retry(&id("a")),
         Err(LedgerError::Transition(TransitionError::RetryCapReached(_)))
     ));
     assert_eq!(state_of(&l, "a"), State::Failed);
+}
+
+#[test]
+fn a_not_injected_resolution_does_not_use_the_retry_budget() {
+    let (mut l, _) = open_mem(&MemStore::default());
+    l.create(new_dispatch("a", "s1", 0, &[])).unwrap();
+    l.begin_delivery(&id("a"), code("r1")).unwrap();
+    l.mark_delivery_unknown(&id("a"), &code("r1"), code("timeout"))
+        .unwrap();
+    l.resolve_not_injected(&id("a"), &code("r1")).unwrap();
+    assert_eq!(l.begin_delivery(&id("a"), code("r2")).unwrap(), 2);
+    assert_eq!(state_of(&l, "a"), State::Delivering);
 }
 
 #[test]
@@ -332,19 +348,6 @@ fn retry_cap_is_enforced_and_never_silent() {
     // Final: nothing moves a failed dispatch.
     assert!(l.begin_delivery(&id("a"), code("r")).is_err());
     assert!(l.fail(&id("a"), code("again")).is_err());
-}
-
-#[test]
-fn a_dispatch_at_the_cap_fails_when_asked_to_deliver_again() {
-    let (mut l, _) = open_mem(&MemStore::default());
-    l.create(new_dispatch("a", "s1", 0, &[])).unwrap();
-    l.begin_delivery(&id("a"), code("r1")).unwrap();
-    l.refuse(&id("a"), code("not_idle")).unwrap();
-    assert!(matches!(
-        l.begin_delivery(&id("a"), code("r2")),
-        Err(LedgerError::Transition(TransitionError::RetryCapReached(_)))
-    ));
-    assert_eq!(state_of(&l, "a"), State::Failed);
 }
 
 #[test]
