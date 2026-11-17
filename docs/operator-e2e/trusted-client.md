@@ -50,9 +50,10 @@ It takes about two minutes.
   `guard` (Kiro; shows the trust-all warning with `No, exit` as the default and reads nothing until
   a file `accept` exists), `other` (Kiro; never on the orchestrator's list) and `oc` (OpenCode).
   The profiles file has `allow_arbitrary_command: true`.
-- Three clients: `ops` (`observe`, `read`, `control`, `start`, `remove`; no `start:args`),
-  `orch` (the same plus `start:args`; profiles `sandbox`, `guard`, `oc`) and `trusted` (adds
-  `start:arbitrary` and `dialog`; profile `sandbox`).
+- Four clients: `ops` (`observe`, `read`, `control`, `start`, `remove`; no `start:args`),
+  `orch` (the same plus `start:args`; profiles `sandbox`, `guard`, `oc`), `trusted` (adds
+  `start:arbitrary` and `dialog`; profile `sandbox`) and `arb` (`start:arbitrary` but no
+  `start:args`; profile `sandbox`; it shows that one scope does not stand in for the other).
 - An audit file in a directory of mode 700.
 
 ## The checks
@@ -60,8 +61,8 @@ It takes about two minutes.
 | # | What happens | What proves it |
 |---|--------------|----------------|
 | 1 | Holder, clients file, audit file and profiles start | MCP answers under the `ops` token |
-| 2 | `orch` starts `sandbox` with `extra_args ["-a", "--model", "claude-sonnet-4"]`: the returned `argv` ends with them, after the profile's own arguments, and the pane received them. `ops` (no `start:args`) is `forbidden` and the error names the scope; a profile off the list is `forbidden`; `start:arbitrary` does not stand in for `start:args`; `null` and `[]` are accepted without the scope and add nothing | `argv` in the reply; `args.txt` in the pane directory; `error` and `scope` |
-| 3 | Refusals, each `invalid_input` and none leaves a pane: a control character, an empty element, an element over 4096 bytes, more than 256 arguments, `extra_args` without a profile, `extra_args` with `argv`, and `--auto` on an OpenCode profile (with the `field` `extra_args`) | error code; no pane named `rej` in `list_panes` |
+| 2 | `orch` starts `sandbox` with `extra_args ["-a", "--model", "claude-sonnet-4"]`: the returned `argv` ends with them, after the profile's own arguments, and the pane received them. `ops` (no `start:args`) is `forbidden` and the error names the scope; a profile off the list is `forbidden`; `arb` (`start:arbitrary`, no `start:args`) is `forbidden` with the scope `start:args`, so `start:arbitrary` does not stand in for it; `null` and `[]` are accepted without the scope and add nothing | `argv` in the reply; `args.txt` in the pane directory; `error` and `scope` |
+| 3 | Refusals, each `invalid_input` and none leaves a pane: a control character, an empty element, an element over 4096 bytes, more than 256 arguments, `extra_args` without a profile, `extra_args` with `argv`, and `--auto` on an OpenCode profile (with the `field` `extra_args`) | error code; no pane named `refused-start` in `list_panes` |
 | 4 | The Kiro trust-all guard. The `guard` pane shows the warning; `send_input` is `pane_needs_trust_acceptance` with the pane named, nothing is typed, the pane is still live and `answer_dialog` is refused. After the warning is gone (the script creates `accept`, which stands for a person accepting it) a `send_input` works and the pane gets exactly that line | `typed.txt` absent for a window, then equal to the text; `get_status` `live` |
 | 5 | `agent` on an argv start. `ops` is `forbidden` for `argv`. `trusted` starts the same dialog program twice, with and without `agent: "kiro"`: with it `answer_dialog allow_once` reaches the pane, without it the call is `refused` and no key arrives. `agent` with a profile and an unknown agent are `invalid_input` | `received.txt`; error codes |
 | 6 | The audit file. The `orch` start records `launch` `profile+args`, `extra_args_n` and `flags` (flag names only); the argv start records `launch` `argv`, `argv0` and `agent`; the start without `agent` records none; the denied start is a `denied` line; a plain profile start has no `launch`. No argument value is in the file or in the holder log: a canary in a flag value, in an attached short flag value and after `=` never appears, nor the model name, the program text or the typed text. Canaries also sit in the refused calls (denied, profile not listed, control character, auto-approve flag), and the replies to those calls must not repeat them | Python over the JSON lines, with a bounded wait for the lines |
@@ -80,18 +81,23 @@ summary counts (`N passed, 0 failed, 1 skipped`) and which never decides `RESULT
 ## By hand, with a real kiro-cli (answers #111)
 
 The script cannot measure what only the real CLI shows. On a macOS host with kiro-cli 3.3.0 (and
-later the image's 3.1.0), in a throwaway directory, with a profile you started the usual way:
+later the image's 3.1.0), in a throwaway directory and a throwaway `HOME`, with a profile you started
+the usual way:
 
-1. **Does the choice persist?** Run `kiro-cli chat -a --trust-workspace`. At the warning choose
-   `Yes, and don't ask again`, quit, run it again, and note whether the warning returns and where
-   the choice is stored. Also note whether the phrase `trust all tools mode` stays on screen after
-   you accepted (a status line would keep the guard refusing until the first turn ends; if it
-   does, the fix is a stricter match, not state).
+1. **The choice persists (measured on 3.3.0).** `Yes, and don't ask again` writes
+   `chat.disableTrustAllConfirmation: true` to `$HOME/.kiro/settings/cli.json`, and the next
+   `kiro-cli chat -a --trust-workspace` with the same HOME shows no warning. `Yes, I accept`
+   persists nothing. After either choice the phrase `trust all tools mode` is gone within a
+   second and the footer reads `Trust All Tools active, confirmations are off`. To re-check on a
+   new Kiro version, repeat this in a throwaway HOME (a new empty directory), never your real one.
 2. **The guard on the real screen.** A profile with `"extra_args": ["--trust-workspace", "-a"]`
-   (or `start_pane` with `extra_args ["-a"]` from a client that holds `start:args`): `start_pane`,
-   then `send_input "hello"` is `pane_needs_trust_acceptance` and `list_panes` still shows Kiro
-   alive. Record the screen with `record-replay-fixture.sh` and replace the synthetic fixture
-   with it. Attach, accept the warning, and `send_input` works.
+   (or `start_pane` with `extra_args ["-a"]` from a client that holds `start:args`) and a pane HOME
+   without the persisted key: `start_pane`, then `send_input "hello"` is
+   `pane_needs_trust_acceptance` and `list_panes` still shows Kiro alive. The committed fixture
+   `tests/fixtures/kiro-3.3.0/trust-all-warning.screen.txt` is that screen as measured; it cannot
+   be re-recorded with `record-replay-fixture.sh`, which does not pass `-a`. Attach, accept the
+   warning, and `send_input` works. With the key persisted in the pane's HOME there is no warning
+   and `send_input` works at once, also after a restart.
 3. **`agent` with a real Kiro.** `start_pane {argv: ["kiro-cli", "chat", "--trust-workspace"],
    agent: "kiro", cwd}` from a client with `start:arbitrary`: one model prompt that asks for a
    shell command, `wait_status` is `blocked` and `answer_dialog allow_once` works. Without
