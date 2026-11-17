@@ -88,7 +88,11 @@ fn the_runbook_names_every_restart_script_and_each_name_exists() {
         "cleanup.sh",
     ];
     // The routine scenario for agent-created routines has its own runbook.
-    let dynamic = ["routine-dynamic.sh", "trusted-client.sh"];
+    let dynamic = [
+        "routine-dynamic.sh",
+        "trusted-client.sh",
+        "dialog-canary.sh",
+    ];
     for script in scripts() {
         let name = script.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
@@ -1013,4 +1017,225 @@ echo ALL-OK
     );
     assert!(out.contains("ALL-OK"), "{out}");
     std::fs::remove_dir_all(&base).ok();
+}
+
+// ---------------------------------------------------------------------------
+// The dialog drift canary (issue #65): the docs and dialog-canary.sh. No server starts.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_dialog_canary_runbook_names_the_script_and_the_script_exists() {
+    let runbook = read(&e2e_dir().join("dialog-canary.md"));
+    for needle in [
+        "dialog-canary.sh",
+        "dialog-canary-check.py",
+        "deny_once",
+        "KIRO_API_KEY",
+        "CANARY_DEVIN_CWD",
+        "8769",
+        "never logs in",
+        "SKIP",
+        "RESULT",
+        "#65",
+    ] {
+        // "never logs in" is in the README entry; the runbook says it in other words.
+        if needle == "never logs in" {
+            continue;
+        }
+        assert!(runbook.contains(needle), "dialog-canary.md omits {needle}");
+    }
+    assert!(e2e_dir().join("dialog-canary.sh").is_file());
+    assert!(e2e_dir().join("dialog-canary-check.py").is_file());
+    let readme = read(&e2e_dir().join("README.md"));
+    assert!(readme.contains("dialog-canary.md") && readme.contains("dialog-canary.sh"));
+    assert!(read(&root().join("docs/operations.md")).contains("operator-e2e/dialog-canary.md"));
+}
+
+#[test]
+fn the_dialog_canary_script_is_safe_and_reports() {
+    let text = read(&e2e_dir().join("dialog-canary.sh"));
+    assert!(text.contains("trap c_cleanup EXIT"));
+    assert!(text.contains("r_finish") && text.contains("r_skip"));
+    assert!(text.contains("C_SOURCE_ONLY"));
+    assert!(text.contains("remove_pane"));
+    // The grant is the six scopes of the brief and nothing else.
+    assert!(
+        text.contains(r#""scopes": ["observe", "read", "control", "start", "dialog", "remove"]"#)
+    );
+    // No login, no auto-approval, no arbitrary command, no key on a command line.
+    let code: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for banned in [
+        "kiro-cli login",
+        "auth login",
+        "--auto",
+        "autoaccept",
+        "allow_arbitrary_command\": True",
+        "Authorization",
+        "echo \"$KIRO_API_KEY",
+        "printf '%s' \"$KIRO_API_KEY",
+    ] {
+        // The messages tell the operator to log in themselves; they are strings in r_skip lines.
+        let hits: Vec<&str> = code
+            .lines()
+            .filter(|l| l.contains(banned) && !l.contains("C_REASON=") && !l.contains("r_skip"))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "dialog-canary.sh contains {banned}: {hits:?}"
+        );
+    }
+}
+
+/// Run the script's own setup functions in a scratch directory (no server) and load what it
+/// writes with the real loaders.
+#[test]
+fn the_files_the_dialog_canary_writes_are_accepted_by_the_real_loaders() {
+    let base = std::env::temp_dir().join(format!("shepherd-doctest-canary-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    for agent in ["kiro", "devin", "opencode"] {
+        let (home, work) = (
+            base.join(format!("shepherd-e2e-restart-doc-home-{agent}")),
+            base.join(format!("shepherd-e2e-restart-doc-work-{agent}")),
+        );
+        let out = Command::new("bash")
+            .arg("-c")
+            // Plain shell variables, not exported: a python heredoc that reads one from the
+            // environment instead of its command line would fail here as it did live.
+            .arg(
+                "R_HOME=\"$T_HOME\"; R_WORK=\"$T_WORK\"; \
+                 C_SOURCE_ONLY=1 source \"$SCRIPT\" && c_setup \"$AGENT\" /bin/echo",
+            )
+            .env("SCRIPT", e2e_dir().join("dialog-canary.sh"))
+            .env_remove("R_HOME")
+            .env_remove("R_WORK")
+            .env("T_HOME", &home)
+            .env("T_WORK", &work)
+            .env("AGENT", agent)
+            .env("SHEPHERD_BIN", "/bin/sh")
+            .output()
+            .expect("run c_setup");
+        assert!(
+            out.status.success(),
+            "{agent}: c_setup failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let policy = LaunchPolicy::from_json(&read(&home.join("profiles.json")))
+            .unwrap_or_else(|e| panic!("{agent}: the profiles file is refused: {e:?}"));
+        let profile = policy.profile("canary").expect("profile canary");
+        assert_eq!(profile.agent.as_str(), agent);
+        assert_eq!(profile.cwds.len(), 1, "{agent}");
+        assert_eq!(profile.env.len(), usize::from(agent == "kiro"), "{agent}");
+        if agent == "kiro" {
+            assert!(work.join("panes/canary/.kiro/agents/probe.json").is_file());
+        }
+        if agent == "opencode" {
+            assert!(work.join("panes/canary/opencode.jsonc").is_file());
+        }
+
+        let clients = Clients::load(&home.join("clients.json"), &root()).expect("clients load");
+        let token = read(&home.join("canary.token"));
+        assert!(token.starts_with("osh_canary_"), "{agent}");
+        let who = clients
+            .authenticate(Some(&format!("Bearer {}", token.trim())), 1)
+            .unwrap_or_else(|e| panic!("{agent}: the token does not authenticate: {e:?}"));
+        for scope in [
+            Scope::Observe,
+            Scope::Read,
+            Scope::Control,
+            Scope::Start,
+            Scope::Dialog,
+            Scope::Remove,
+        ] {
+            assert!(who.has(scope), "{agent}: missing {scope:?}");
+        }
+        for scope in [Scope::StartArbitrary, Scope::StartArgs, Scope::Routine] {
+            assert!(!who.has(scope), "{agent}: must not hold {scope:?}");
+        }
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&work).ok();
+    }
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// The version comparison and the pin lookup, on the repository's own Dockerfile.
+#[test]
+fn the_dialog_canary_reads_the_pins_from_the_dockerfile() {
+    let run = |script: &str| {
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!("C_SOURCE_ONLY=1 source \"$SCRIPT\" && {script}"))
+            .env("SCRIPT", e2e_dir().join("dialog-canary.sh"))
+            .output()
+            .expect("run bash");
+        assert!(
+            out.status.success(),
+            "{script}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let dockerfile = read(&root().join("Dockerfile"));
+    let pinned = |name: &str| {
+        dockerfile
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("ARG {name}=")))
+            .map(str::to_string)
+            .unwrap_or_default()
+    };
+    assert_eq!(run("c_pin kiro"), pinned("KIRO_CLI_VERSION"));
+    assert!(!run("c_pin kiro").is_empty());
+    assert_eq!(run("c_pin devin"), pinned("DEVIN_CLI_VERSION"));
+    // A version matches as a whole number, not as a prefix of a longer one.
+    assert_eq!(
+        run("c_version_matches 3.3.0 'kiro-cli 3.3.0' && echo yes"),
+        "yes"
+    );
+    assert_eq!(
+        run("c_version_matches 3.3.0 'kiro-cli 3.3.01' || echo no"),
+        "no"
+    );
+    assert_eq!(
+        run("c_version_matches 3.3.0 'kiro-cli 13.3.0' || echo no"),
+        "no"
+    );
+    assert_eq!(run("c_version_matches '' 'anything' || echo no"), "no");
+}
+
+/// A run that skipped something, or checked nothing, is not a PASS and does not exit 0.
+#[test]
+fn the_dialog_canary_does_not_report_pass_for_a_skipped_or_empty_run() {
+    let run = |counts: &str| {
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "C_SOURCE_ONLY=1 source \"$SCRIPT\" && {counts}; c_finish; echo \"exit=$?\""
+            ))
+            .env("SCRIPT", e2e_dir().join("dialog-canary.sh"))
+            .env("SHEPHERD_BIN", "/bin/echo")
+            .output()
+            .expect("run bash");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let skipped_only = run("R_PASSES=0 R_FAILS=0 R_SKIPS=1");
+    assert!(skipped_only.contains("RESULT: INCOMPLETE") && skipped_only.contains("exit=3"));
+    assert!(!skipped_only.contains("RESULT: PASS"), "{skipped_only}");
+    let nothing = run("R_PASSES=0 R_FAILS=0 R_SKIPS=0");
+    assert!(nothing.contains("RESULT: INCOMPLETE") && nothing.contains("exit=3"));
+    let partial = run("R_PASSES=5 R_FAILS=0 R_SKIPS=1");
+    assert!(partial.contains("RESULT: INCOMPLETE") && !partial.contains("RESULT: PASS"));
+    let failed = run("R_PASSES=5 R_FAILS=1 R_SKIPS=1");
+    assert!(
+        failed.contains("RESULT: FAIL") && failed.contains("exit=1"),
+        "{failed}"
+    );
+    let good = run("R_PASSES=8 R_FAILS=0 R_SKIPS=0");
+    assert!(
+        good.contains("RESULT: PASS") && good.contains("exit=0"),
+        "{good}"
+    );
 }
