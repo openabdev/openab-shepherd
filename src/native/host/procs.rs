@@ -119,7 +119,7 @@ impl Shared {
     }
 
     /// Test hook: a different age limit.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_max_age(max_age: Duration) -> Self {
         Self(os::Shared::new(max_age))
     }

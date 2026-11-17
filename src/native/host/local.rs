@@ -177,7 +177,7 @@ impl LocalHost {
     }
 
     /// Test hook: the age limit of the shared process-table snapshot.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_scan_max_age(mut self, max_age: Duration) -> Self {
         self.scans = Arc::new(procs::Shared::with_max_age(max_age));
         self
