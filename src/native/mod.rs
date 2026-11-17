@@ -177,6 +177,10 @@ struct Inner {
     /// would. Catches state that adoption forgets.
     #[cfg(test)]
     readopt: AtomicBool,
+    /// Test rig: the pause of the nudge, in milliseconds. Not a setting: a
+    /// build outside the tests always uses `NUDGE_PAUSE`.
+    #[cfg(test)]
+    nudge_pause_ms: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -303,6 +307,8 @@ impl NativeBackend {
                 leave_on_drop: AtomicBool::new(false),
                 #[cfg(test)]
                 readopt: AtomicBool::new(false),
+                #[cfg(test)]
+                nudge_pause_ms: std::sync::atomic::AtomicU64::new(NUDGE_PAUSE.as_millis() as u64),
             }),
         }
     }
@@ -314,6 +320,14 @@ impl NativeBackend {
         client: Arc<host::client::HolderClient>,
     ) -> Self {
         Self::with_host_meta(config, Box::new(|key| std::env::var_os(key)), client, true)
+    }
+
+    /// Test rig: how long the nudge waits before the return resize.
+    #[cfg(test)]
+    fn set_nudge_pause(&self, pause: Duration) {
+        self.inner
+            .nudge_pause_ms
+            .store(pause.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Drop the pane from the table and adopt it from the host again.
@@ -646,7 +660,11 @@ impl Inner {
         if shrunk.is_empty() {
             return;
         }
-        thread::sleep(NUDGE_PAUSE);
+        #[cfg(test)]
+        let pause = Duration::from_millis(self.nudge_pause_ms.load(Ordering::Relaxed));
+        #[cfg(not(test))]
+        let pause = NUDGE_PAUSE;
+        thread::sleep(pause);
         for pane in shrunk {
             match self.host.attach(&pane.id) {
                 Ok(now) => {
