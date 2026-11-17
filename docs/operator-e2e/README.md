@@ -8,13 +8,15 @@ The scripts for restart survival (`hold`, SIGUSR2, service restarts, the routine
 
 The script for agent-created routines (`routine_create` and the other three tools, with a restart, a downtime and the audit file) is `routine-dynamic.sh`, described in [routine-dynamic.md](routine-dynamic.md).
 
+The script for trusted clients (`extra_args` behind `start:args`, the `agent` field, the Kiro trust-all guard and the audit fields) is `trusted-client.sh`, described in [trusted-client.md](trusted-client.md).
+
 Validated against `origin/main` commit `afd73c9`; see [Known results](#known-results) and [Verified against](#verified-against).
 
 ## Safety rules
 
 These hold for every step. Do not relax them for a test.
 
-- Never use `--auto`, `autoaccept`, `bypass`, or `allow_arbitrary_command: true` anywhere.
+- Never use `--auto`, `autoaccept`, `bypass`, or `allow_arbitrary_command: true` anywhere. The one exception is `trusted-client.sh`, which writes `allow_arbitrary_command: true` into its own throwaway profiles file on a loopback port (see [trusted-client.md](trusted-client.md)).
 - The token file has mode 0600 (owner only) and lives outside every git repository and outside the folder the server starts from. The token is never printed, never placed on a command line, and never written into a working directory.
 - The server listens on loopback only.
 - Nothing here logs in to an agent. Only check the login state.

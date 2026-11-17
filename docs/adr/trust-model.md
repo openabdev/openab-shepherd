@@ -43,6 +43,8 @@ clients file:   {"id": "orchestrator",
 
 Leave `allow_arbitrary_command` false and drop `start:arbitrary` if the client should only steer the operator's profiles. There is no posture switch that does this in one setting: the three choices (server flag, scopes, profile list) are the posture, and a macro would hide which of them a client really has. A single-token deployment holds `start` and `start:arbitrary` but not `start:args`, so it cannot pass call-level flags; it needs a clients file (see [operations.md](../operations.md#who-can-use-it-a-single-token-cannot)).
 
+The operator end-to-end script for the recipe, with the refusals and the audit fields, is [operator-e2e/trusted-client.md](../operator-e2e/trusted-client.md).
+
 herdr passes any argument from any socket caller and Orca from any owner-socket caller; neither tells clients apart. Shepherd tells them apart over HTTP, so flags and programs are grants, not defaults.
 
 ## Decision test
