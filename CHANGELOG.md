@@ -4,6 +4,10 @@
 
 ### Added
 
+- `docs/operator-e2e/dialog-canary.sh <kiro|devin|opencode>` (issue #65): an operator script that
+  sends one prompt to the installed agent CLI, compares its permission dialog with the recorded
+  one and answers `deny_once` through the shipped parser. It never logs in and skips when the
+  agent cannot authenticate. No scheduled CI. See `docs/operator-e2e/dialog-canary.md`.
 - `agent` for `start_pane` with `argv` or `line` (issue #113). A caller that may start its own
   command can declare `kiro`, `devin` or `opencode`, so `answer_dialog` and the agent guards
   apply to the pane. No new scope; the declaration is audited (`launch`, `argv0`, `agent`) and
