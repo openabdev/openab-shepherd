@@ -1229,7 +1229,13 @@ fn the_dialog_canary_does_not_report_pass_for_a_skipped_or_empty_run() {
     let partial = run("R_PASSES=5 R_FAILS=0 R_SKIPS=1");
     assert!(partial.contains("RESULT: INCOMPLETE") && !partial.contains("RESULT: PASS"));
     let failed = run("R_PASSES=5 R_FAILS=1 R_SKIPS=1");
-    assert!(failed.contains("RESULT: FAIL") && failed.contains("exit=1"), "{failed}");
+    assert!(
+        failed.contains("RESULT: FAIL") && failed.contains("exit=1"),
+        "{failed}"
+    );
     let good = run("R_PASSES=8 R_FAILS=0 R_SKIPS=0");
-    assert!(good.contains("RESULT: PASS") && good.contains("exit=0"), "{good}");
+    assert!(
+        good.contains("RESULT: PASS") && good.contains("exit=0"),
+        "{good}"
+    );
 }

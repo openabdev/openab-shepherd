@@ -2,88 +2,180 @@
 
 ## Unreleased
 
+## 0.5.0
+
+Released 2026-11-17.
+
+This release lets the server restart without losing panes, adds clients with scopes and an audit
+log, lets agents create their own routines, lets a trusted client pass call-level flags, and adds
+the backend half of sharing a pane with a person. Nothing that a 0.4.0 deployment does by default
+stops working, with one exception: the container image now starts the pane holder (see below).
+
+### Upgrading from 0.4.x
+
+- **The container's default command changed.** The image now runs
+  `openab-shepherd hold -- --host 127.0.0.1 --port 8765` under tini, where 0.4.0 ran
+  `openab-shepherd --host 127.0.0.1 --port 8765`. The holder owns the panes, so `SIGUSR2` restarts
+  the server without ending them. Stopping the container still ends the panes. To keep the old
+  single-process behaviour, override the command with `openab-shepherd --host 127.0.0.1 --port 8765`.
+  The entrypoint (`tini --`) is unchanged. (#90)
+- **The `watchdog` profile key is now `routine`.** Rename the key. The old key still works as a
+  deprecated alias and prints one warning to stderr per profile; a profile that sets both keys is a
+  startup error. Limits and behaviour are unchanged. Anything that matches log or audit text must
+  change: the stderr lines are `routine nudge` and `routine gave up` (were `watchdog ...`), and the
+  audit actor is `system:routine` (was `system:watchdog`).
+- **New error codes.** Clients that match on the `error` field should handle:
+  `pane_replayed` (under `hold`, a pane whose output was longer than the 1 MiB tail refuses typed
+  input until it repaints; the only new code a server run as before can return),
+  `pane_human_controlled` and `pane_draft_pending` (a person holds the input lease or has an unsent
+  draft; nothing can take a lease in this release),
+  `routines_not_allowed` (`routine_*` on a pane whose profile has no `dynamic_routines`),
+  `pane_needs_trust_acceptance` (see the Kiro trust-all warning below) and
+  `audit_unavailable` (a mutating call when the audit file is set and cannot be written).
+- **New scopes and tools.** `routine` allows the new tools `routine_create`, `routine_list`,
+  `routine_update` and `routine_delete`. `start:args` allows `extra_args` on a profile start.
+  `draft_clear` is a new tool (scope `lease:preempt`). `attach` and `attach:write` are reserved.
+  No existing client gains any of them: a scope is held only if the clients file lists it, and the
+  single token holds the same seven scopes as before (`observe`, `read`, `control`, `start`,
+  `start:arbitrary`, `dialog`, `remove`). `start_pane` gains the optional properties `agent` and
+  `extra_args`, so a client that pins the tool schemas will see a change.
+- **A single-token deployment cannot use `extra_args`.** A server with only
+  `OPENAB_SHEPHERD_TOKEN` or a token file and no clients file gets `forbidden` naming `start:args`.
+  To use it: make a token and its SHA-256 hash, unset `OPENAB_SHEPHERD_TOKEN` and
+  `OPENAB_SHEPHERD_TOKEN_FILE` (a clients file refuses them), set `OPENAB_SHEPHERD_CLIENTS` and
+  `OPENAB_SHEPHERD_AUDIT_FILE`, write a clients file whose entry lists the old token's scopes plus
+  `start:args` and a short `profiles` list, give the client the token, and restart. The full recipe
+  is in `docs/operations.md` ("Call-level `extra_args` for a profile start").
+- **No migration for the audit file or the clients file.** Neither existed in 0.4.0 or any earlier
+  release, so there is no old shape to convert. The `legacy` client name and `allow_legacy_token`
+  existed only on `main` between releases (a clients file that still sets `allow_legacy_token` is
+  refused with a message to delete it).
+- **Kiro `-a` (trust all tools).** Kiro shows a warning first: "Kiro is running in trust all tools
+  mode", with `No, exit` as the default. Typed text is ignored and Enter ends the session.
+  Shepherd never answers it. A `send_input` or a routine nudge to a Kiro pane that has not finished
+  a turn and shows that warning is now refused with `pane_needs_trust_acceptance`, and nothing is
+  typed. A person accepts the warning, or the operator sets `chat.disableTrustAllConfirmation` to
+  `true` in the Kiro settings of the HOME the pane uses (measured on kiro-cli 3.3.0: choosing
+  `Yes, and don't ask again` writes it to `$HOME/.kiro/settings/cli.json`, while `Yes, I accept`
+  persists nothing). That setting removes the only human gate on the warning for every Kiro
+  started with that HOME; it is the operator's decision, never Shepherd's. (#114, #124)
+- **The image ships kiro-cli 3.3.0** (was 3.1.0), the version the dialog parser was measured on.
+  Rebuilt images pick up the new CLI. (#109)
+- **Pane children no longer get a descriptor sweep.** Shepherd still marks its own descriptors
+  close-on-exec and serializes spawns, but it no longer shuts descriptors inherited from its
+  parent before exec. Start Shepherd with a clean descriptor table (for example under a service manager or in a container). (#74)
+
 ### Added
 
 - `docs/operator-e2e/dialog-canary.sh <kiro|devin|opencode>` (issue #65): an operator script that
   sends one prompt to the installed agent CLI, compares its permission dialog with the recorded
   one and answers `deny_once` through the shipped parser. It never logs in and skips when the
   agent cannot authenticate. No scheduled CI. See `docs/operator-e2e/dialog-canary.md`.
-- `agent` for `start_pane` with `argv` or `line` (issue #113). A caller that may start its own
-  command can declare `kiro`, `devin` or `opencode`, so `answer_dialog` and the agent guards
-  apply to the pane. No new scope; the declaration is audited (`launch`, `argv0`, `agent`) and
-  never checked against the program. The `start_pane` input schema gains the optional `agent`
-  property. See `docs/operations.md`.
+- Restart survival (issue #76; #83 to #86, #88 to #92, #94). `openab-shepherd hold -- <server flags>`
+  runs a holder that owns the panes and starts the server as a child. `SIGUSR2` on the holder
+  restarts the server and the panes keep running; a new server adopts them, replays their output
+  silently, and rebuilds each pane's agent kind, `answered` flag and routine watch.
+  `survives_restart` is true under `hold`. A pane whose output exceeded the holder's 1 MiB tail is
+  refused typed input with `pane_replayed` until it repaints. The bare command is unchanged. See
+  "Restart survival" in `docs/operations.md`. Operator scripts for the real-server scenarios are in
+  `docs/operator-e2e/restart-survival.md`; `examples/record_tail.rs` records replay fixtures by hand.
+- Clients, scopes and the audit log (issue #4; #68, #75, #80). `OPENAB_SHEPHERD_CLIENTS` names a
+  clients file with one entry per caller (token hash, scopes, profiles, expiry), and
+  `OPENAB_SHEPHERD_AUDIT_FILE` records a `call` and an `outcome` line per mutating call. Scopes:
+  `observe`, `read`, `control`, `start`, `start:arbitrary`, `start:args`, `dialog`, `remove`,
+  `attach`, `attach:write`, `lease:preempt` and `routine`. The trust model is written down in
+  `docs/adr/trust-model.md` (#72), with a section on trusted clients.
 - Agent-created routines (issue #98; #100, #102 to #105). Four tools, `routine_create`,
   `routine_list`, `routine_update` and `routine_delete`, let an agent or any client with the new
   `routine` scope ask Shepherd to type a fixed line into a pane every N seconds (trigger `every`,
   action `text`). A profile opts in with `dynamic_routines`; without it `routines_not_allowed` is
   returned. Routines are kept in the pane's meta, survive a restart under `hold`, skip busy or
-  replayed ticks instead of queueing them, and are audited as `system:routine`. A pane's
-  program sees its own name in `SHEPHERD_PANE`. The single token holds no `routine` scope.
-  See `docs/routine.md`.
-- Clients, scopes and the audit log (issue #4; #68, #75, #80). `OPENAB_SHEPHERD_CLIENTS` names a
-  clients file with one entry per caller (token hash, scopes, profiles, expiry), and
-  `OPENAB_SHEPHERD_AUDIT_FILE` records a `call` and an `outcome` line per mutating call. Scopes:
-  `observe`, `read`, `control`, `start`, `start:arbitrary`, `dialog`, `remove`, `attach`,
-  `attach:write`, `lease:preempt` and `routine`.
-- Shared panes, steps 2 and 3 (issue #77; #96, #97). The `draft_clear` tool (scope
-  `lease:preempt`), the reserved scopes `attach`, `attach:write` and `lease:preempt`, a `human`
-  object in `get_status`, and resizing by the lease holder (10 to 500 columns, 5 to 300 rows). No client
-  can take a lease yet.
-- Shared panes, step 1 (issue #77). The native backend now has an input lease and a draft flag per
-  pane, as the backend half of letting a person type into a pane a bot also drives. While a person holds
-  the lease, or has typed and not pressed Enter, `send_input`, key presses, `answer_dialog`,
-  `interrupt_pane`, `remove_pane` and the routine's nudge are refused with the new errors
-  `pane_human_controlled` and `pane_draft_pending`, and are never queued. The draft is written to the
-  pane's meta before the person's first byte and survives a server restart under `hold`; a lease does not.
-  Nothing can take a lease yet, so a server started as before behaves as before. Refs #77.
-- Restart survival (issue #76). `openab-shepherd hold -- <server flags>` runs a holder that owns the
-  panes and starts the server as a child. `SIGUSR2` on the holder restarts the server and the panes keep
-  running; a new server adopts them, replays their output silently, and rebuilds each pane's agent kind,
-  `answered` flag and routine watch. A pane whose output exceeded the holder's 1 MiB tail is refused typed
-  input with the new error `pane_replayed` until it repaints. `survives_restart` is true under `hold`.
-  The bare command is unchanged. See "Restart survival" in `docs/operations.md`. Operator scripts for the
-  real-server scenarios are in `docs/operator-e2e/restart-survival.md`; `examples/record_tail.rs` records
-  replay fixtures by hand. Refs #76.
+  replayed ticks instead of queueing them, and are audited as `system:routine`. A pane's program
+  sees its own name in `SHEPHERD_PANE`, and a routine nudge writes an outcome line. The single
+  token holds no `routine` scope. See `docs/routine.md` and `docs/operator-e2e/routine-dynamic.md`.
+- Call-level `extra_args` for a profile start (issue #113; #116, #117). A client with the new scope
+  `start:args` can pass flags with `start_pane {profile, extra_args}`. They are appended after the
+  profile's own arguments and cannot replace or remove one, change the program, the directories,
+  the environment or the credentials. The call needs `start`, the profile on the client's list and
+  `start:args`; `start` and `start:arbitrary` do not imply it. `null` and `[]` add nothing and need
+  no scope. The agent's own refusals (OpenCode auto-approve flags, Devin `--permission-mode` and
+  `--respect-workspace-trust`) apply to the extra flags, and every `invalid_input` from
+  `extra_args` names the field (#122). The audit records `launch` `profile+args`, the count and the
+  flag names, never a value. Flags run with the profile's credentials, so never put a secret in them.
+- `agent` for `start_pane` with `argv` or `line` (issue #113; #115). A caller that may start its
+  own command can declare `kiro`, `devin` or `opencode`, so `answer_dialog` and the agent guards
+  apply to the pane. No new scope; the declaration is audited (`launch`, `argv0`, `agent`) and
+  never checked against the program.
+- Operator end-to-end scripts for the new features: `docs/operator-e2e/trusted-client.sh` (#118)
+  and `docs/operator-e2e/routine-dynamic.sh` (#105, #106, #112), each with a runbook.
+- Shared panes, the backend half only (issue #77; #95 to #97). The native backend has an input
+  lease and a draft flag per pane. While a person holds the lease, or has typed and not pressed
+  Enter, `send_input`, key presses, `answer_dialog`, `interrupt_pane`, `remove_pane` and the
+  routine's nudge are refused with `pane_human_controlled` or `pane_draft_pending`, and are never
+  queued. The draft is written to the pane's meta before the person's first byte and survives a
+  restart under `hold`; a lease does not. Also: the `draft_clear` tool (scope `lease:preempt`), a
+  `human` object in `get_status`, and resizing by the lease holder (10 to 500 columns, 5 to 300
+  rows). No client can take a lease yet and there is no attach transport, so a server started as
+  before behaves as before.
 
 ### Changed
 
-- Documentation: the trust model is an ADR (`docs/adr/trust-model.md`, #72); the README, the
-  operations reference and the ADR statuses were brought in line with the current design, and
-  diagrams were added.
-- Tests: a snapshot of the tool names and input schemas (#71), replay fixtures for kiro and opencode (#94),
-  tini and zombie handling in the image (#90, #91).
-- Container image: the default command is now `openab-shepherd hold -- --host 127.0.0.1 --port 8765`
-  (the pane holder under tini) instead of the bare `openab-shepherd --host 127.0.0.1 --port 8765`.
-  With the holder, `SIGUSR2` restarts the server and the panes keep running; stopping the
-  container still ends them. Override the command with the bare invocation to get the earlier
-  single-process behaviour. Refs #76.
-
+- Container image: the default command is the pane holder (see "Upgrading from 0.4.x"), and the
+  image ships kiro-cli 3.3.0 instead of 3.1.0. (#90, #109)
 - The built-in watchdog is now the routine: profile key `routine`, `src/routine.rs`, stderr lines
-  `routine nudge` / `routine gave up`, and audit actor `system:routine` (was `system:watchdog`).
-  Behaviour and limits are unchanged. The `watchdog` profile key (shipped in 0.4.0) is still
-  accepted as a deprecated alias that prints one warning to stderr; setting both keys is a
-  startup error.
+  `routine nudge` / `routine gave up`, and audit actor `system:routine`. Behaviour and limits are
+  unchanged.
 - Kiro permission dialogs: the tool name before the arrow must now be `shell`, `fs_write`, `mcp`
   or `web_fetch` (the set that was accepted by accident before); any other name is refused with a
   reason naming it. A command that wraps onto continuation lines is refused with a "wrapped
   command" reason instead of an options mismatch. The accepted set is unchanged. `answer_dialog`
   returns the Kiro tool name as `tool`. Measured on kiro-cli 3.3.0 (fixtures in
-  `tests/fixtures/kiro-3.3.0/`). Refs #7.
-
+  `tests/fixtures/kiro-3.3.0/`). (#70) Refs #7.
+- Kiro trust-all warning: `send_input` and the routine nudge refuse with
+  `pane_needs_trust_acceptance` only on a positive match: a Kiro pane at turn 0 or unknown, status
+  `idle`, whose screen shows both the title phrase and the `No, exit` option line. A blank screen,
+  a failed read or the phrase alone send as before. One screen read per send until the first turn,
+  none afterwards. (#114, #124)
+- A pane's `exited` event now waits for the pty to drain by progress: after the leader exits, the
+  reaper waits until the reader hits end of file, or 500 ms have passed with nothing queued or in
+  flight, or a 5 s cap. Normal exits are unchanged; a wedged output sink or a descendant that keeps
+  printing can delay `exited` by up to 5 s (was 500 ms). This stops `exited` overtaking the end of
+  a quick exit's output under load. (#125, issue #87)
+- Pane children no longer get a descriptor sweep (see "Upgrading from 0.4.x"). (#74)
 - Audit log: one `call` line before each mutating tool and a best-effort `outcome` line after it
-  (and after `read_output`); `list_panes`, `get_status` and `wait_status` write nothing. The records
-  no longer carry `v`, `seq`, `prev`, `recovered`, `intent_seq` or content digests, and the file is
-  no longer scanned or owner-checked at startup (the 0600/0700 mode checks stay). Failed
-  authentications go to stderr, not to the audit file. Fail-closed and fail-open behaviour is
-  unchanged.
+  (and after `read_output`); `list_panes`, `get_status` and `wait_status` write nothing. Failed
+  authentications go to stderr, not to the audit file. The 0600/0700 mode checks stay. (#75)
+- Clients file: the single token is the client `default`. With a clients file, a token file or an
+  env token is a startup error that names the fix. The 0600 mode check, the 1 MiB cap and the
+  bearer-length cap stay. (#80)
+- `sha2` 0.10 (no default features) is a new dependency, used for token hashes.
+- Documentation: the README, the operations reference and the ADR statuses were brought in line
+  with the current design, diagrams were added, and routine documentation moved to
+  `docs/routine.md`. (#67, #72, #82, #107)
 
-- Clients file: the single token is now the client `default` (it was `legacy` in unreleased
-  builds). With a clients file, a token file or an env token is a startup error that names the
-  fix, and `allow_legacy_token` is removed (a file that still sets it is refused with a message
-  to delete it). No released version had either, so this is not a breaking change. Removed: the
-  duplicate-key scan (the last value wins), the owner check, the client and profile count caps and
-  the dummy-digest compare. The 0600 mode check, the 1 MiB cap and the bearer-length cap stay.
+### Deprecated
+
+- The `watchdog` profile key. Use `routine`. The alias prints one warning to stderr per profile that uses it.
+
+### Fixed
+
+- Flaky tests: the fd-count and front-pid checks in the restart tests, the hidden-flags test
+  (now bounded) and the 1 MiB tail test (no longer goes through a front) were made deterministic
+  (#121); `large_output_of_a_quick_exit_is_received_up_to_the_cap` was a real race in the exit
+  drain (#125). No product behaviour changed except as listed under Changed.
+- `trusted-client.sh` gave a false failure for a client that held both `start:arbitrary` and
+  `start:args`; it now uses a client with `start:arbitrary` only. (#122)
+- `routine-dynamic.sh` read counters too early and failed on macOS, where `RLIMIT_FSIZE` is not
+  enforced; it now waits for the engine and skips that step on macOS. (#106, #112)
+
+### Internal
+
+- Tests: a snapshot of the tool names and input schemas (#71), replay fixtures for kiro and
+  opencode (#94), tini and zombie handling in the image (#90, #91), and the real Kiro trust-all
+  warning screen as a fixture (#124).
+- CI: the test step is split into build and test steps with step timeouts, a 60 s heartbeat, and
+  a diagnostic dump after 300 s without progress; it does not fix the macOS hang tracked in #108.
+  (#120)
 
 ## 0.4.0
 

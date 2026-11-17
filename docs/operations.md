@@ -257,16 +257,16 @@ other argument in a profile's `argv` or `extra_args`, or in a call-level `extra_
 ([below](#call-level-extra_args-for-a-profile-start)), and does not police it; the Kiro
 arguments decide trust. `permission_mode: bypass` with `allow_bypass: true` adds no
 flag, so the label and the real behaviour can disagree. (Measured on 3.3.0: with `-a`
-no `requires approval` dialog appears and the status never reports `blocked`; 3.1.0, the
-version in the container image, was not measured.)
+no `requires approval` dialog appears and the status never reports `blocked`; 3.3.0 is
+the version in the container image.)
 
 **Every `-a` start shows a warning first, unless the operator has persisted the choice.**
 Kiro prints "Warning: Kiro is running in trust all tools mode" with the choices
 `No, exit` (the default), `Yes, I accept` and `Yes, and don't ask again`. Kiro does not
 report it as blocked: the status stays `idle`. Typed text is ignored and Enter picks
 `No, exit`, which ends the session. The warning also appears with `--trust-all-tools`
-spelled out, and with `-a` plus an agent that trusts nothing. (Measured on 3.3.0; 3.1.0,
-the version in the container image, was not measured.)
+spelled out, and with `-a` plus an agent that trusts nothing. (Measured on 3.3.0, the
+version in the container image.)
 
 Shepherd never answers this warning. Instead `send_input` (and a routine nudge) refuses
 with `pane_needs_trust_acceptance` and types nothing, when all of these hold: the pane is
@@ -1567,7 +1567,7 @@ gh workflow run release.yml -f dry_run=true -f version=X.Y.Z
 Use a version that matches `Cargo.toml` on the ref you run it on. GitHub only accepts a
 dispatch for a workflow file that exists on the default branch.
 
-**Manual fallback** (used for 0.2.0 and 0.3.0, and valid if the workflow cannot publish).
+**Manual fallback** (used for 0.2.0, 0.3.0 and 0.4.0, and valid if the workflow cannot publish).
 After steps 1 and 2, push the annotated tag, create the release with
 `gh release create vX.Y.Z --verify-tag --title vX.Y.Z --notes-file notes.md`, then build
 each architecture on a host of that architecture (or emulated) and join them:
