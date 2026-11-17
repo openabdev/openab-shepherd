@@ -36,9 +36,18 @@ thread_local! {
 const READ_CHUNK: usize = 16 * 1024;
 /// How often the reader wakes to check for removal.
 const READ_POLL_MS: libc::c_int = 200;
-/// After the leader exits, how long the reaper waits for the reader to take
-/// the last output, so a read after `wait` returns `exit` shows it.
-const EXIT_DRAIN: Duration = Duration::from_millis(500);
+/// After the leader exits, how long the reaper waits for the reader to reach
+/// the end of the terminal before it decides nothing more is coming: a
+/// descendant that keeps the slave open without writing never gives the
+/// reader an end of file. The wait goes on past this while output the leader
+/// left is still being taken (see [`EXIT_DRAIN_CAP`]).
+pub(super) const EXIT_DRAIN: Duration = Duration::from_millis(500);
+/// The most the reaper waits for the reader after the leader exits, however
+/// slowly the sink takes the output or however long a descendant keeps
+/// writing. `exited` follows at the latest this long after the exit.
+pub(super) const EXIT_DRAIN_CAP: Duration = Duration::from_secs(5);
+/// How often the reaper looks again while it waits for the reader.
+const EXIT_DRAIN_POLL: Duration = Duration::from_millis(10);
 /// How often the reader refreshes the pane's process tree while the leader
 /// runs, so a descendant is known before its parent can exit (ADR §11).
 const TREE_POLL: Duration = Duration::from_millis(250);
@@ -99,6 +108,11 @@ pub(crate) struct Proc {
     /// lose a quick program's output; the reaper closes it at the exit.
     shutdown: AtomicBool,
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// The reader is taking a chunk: set once the terminal has output ready,
+    /// before the read, and cleared once the sink has the chunk. With the
+    /// terminal's queue it says whether output is still on its way to the
+    /// sink; see `Proc::output_pending`.
+    reading: AtomicBool,
     /// The last output bytes, when the host keeps a tail.
     tail: Option<Mutex<TailRing>>,
     /// Opaque metadata the front keeps with the pane.
@@ -236,6 +250,7 @@ impl PtyHost for LocalHost {
             stopping: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             reader: Mutex::new(None),
+            reading: AtomicBool::new(false),
             tail: self.tail_cap.map(|cap| Mutex::new(TailRing::new(cap))),
             meta: Mutex::new(Vec::new()),
         });
@@ -486,6 +501,16 @@ impl Proc {
             .exited
     }
 
+    /// Output is still on its way to the sink: bytes wait in the terminal, or
+    /// the reader holds a chunk it has not handed over. The queue is read
+    /// first: the reader marks itself busy before it takes bytes out of the
+    /// queue and clears the mark after the sink has them, so bytes that were
+    /// queued when the queue was read are either still queued or covered by
+    /// the mark read after it. Output a descendant writes later may be missed.
+    fn output_pending(&self) -> bool {
+        pty::queued(self.master.as_raw_fd()) > 0 || self.reading.load(Ordering::SeqCst)
+    }
+
     fn is_live(&self) -> bool {
         self.state.lock().is_ok_and(|st| st.live)
     }
@@ -622,7 +647,9 @@ fn read_loop(pane: Arc<Proc>, sink: SinkCell) {
     // The offset of the first byte of the next chunk; counted, not stored.
     let mut seq: u64 = 0;
     while !pane.shutdown.load(Ordering::Acquire) {
-        match pty::poll_read(fd, &mut buf, READ_POLL_MS) {
+        match pty::poll_read(fd, &mut buf, READ_POLL_MS, || {
+            pane.reading.store(true, Ordering::SeqCst);
+        }) {
             Ok(None) => {
                 if let Some(sink) = current(&sink) {
                     sink.idle(&pane.id);
@@ -648,6 +675,7 @@ fn read_loop(pane: Arc<Proc>, sink: SinkCell) {
                 break;
             }
         }
+        pane.reading.store(false, Ordering::SeqCst);
         if Instant::now() >= next_tree {
             // try_lock: a stop holds the tree, and the reader must keep
             // draining the terminal meanwhile.
@@ -659,6 +687,7 @@ fn read_loop(pane: Arc<Proc>, sink: SinkCell) {
             next_tree = Instant::now() + TREE_POLL;
         }
     }
+    pane.reading.store(false, Ordering::SeqCst);
     if let Ok(mut st) = pane.state.lock() {
         st.reader_done = true;
     }
@@ -697,12 +726,18 @@ fn reap(pane: Arc<Proc>, mut child: Child, slave: OwnedFd, sink: SinkCell) {
     let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
     st.exited = true;
     pane.changed.notify_all();
-    let deadline = Instant::now() + EXIT_DRAIN;
+    // Wait for the reader to take what the leader left. It is done at the
+    // end of file; or, once `EXIT_DRAIN` has passed, when no output is on its
+    // way to the sink; or at the hard cap. So a reader that is slow, or a
+    // sink that is, gets time while it makes progress, and a descendant that
+    // holds the terminal open in silence costs `EXIT_DRAIN`.
+    let start = Instant::now();
     while !st.reader_done {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        let elapsed = start.elapsed();
+        if elapsed >= EXIT_DRAIN_CAP || (elapsed >= EXIT_DRAIN && !pane.output_pending()) {
             break;
         }
+        let left = EXIT_DRAIN_CAP.saturating_sub(elapsed).min(EXIT_DRAIN_POLL);
         st = match pane.changed.wait_timeout(st, left) {
             Ok((next, _)) => next,
             Err(poisoned) => poisoned.into_inner().0,
