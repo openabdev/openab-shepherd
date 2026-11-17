@@ -803,7 +803,9 @@ Pane ids are `n:<k>`
   child, by pid and start time: by parent pid every 250 ms while the child runs and
   again before any stop, and by membership of the child's group and session. So a
   descendant that moves to its own group or session, or whose parent exits, is
-  still known. Removing a pane (`remove_pane`) and Shepherd's exit on SIGINT,
+  still known. On Linux the periodic look reads the process table once for all
+  panes, and a pane may use a read up to 250 ms old (so a descendant is seen
+  within about 500 ms, not 250 ms); a stop always reads it afresh. Removing a pane (`remove_pane`) and Shepherd's exit on SIGINT,
   SIGTERM or SIGHUP send SIGHUP and SIGTERM to the group and the descendants, wait
   up to 2 s (for `remove_pane`, its `timeout`), then stop (SIGSTOP) the group and
   descendants until no new one appears and SIGKILL them all. When the program exits

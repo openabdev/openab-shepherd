@@ -26,6 +26,8 @@ pub(super) mod tail;
 mod tests_drain;
 #[cfg(test)]
 pub(super) mod tests_link;
+#[cfg(all(test, target_os = "linux"))]
+mod tests_scan;
 pub(super) mod wire;
 
 use crate::backend::BackendError;

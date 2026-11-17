@@ -5,7 +5,9 @@
 //!
 //! Locking: a pane's `tree` is taken before its `state`; nothing here holds a
 //! lock across a sleep, a poll or a wait, except the condvar waits, which
-//! release `state`. The registry lock is held only to look a pane up or
+//! release `state`. The shared process-table snapshot (`procs::Shared`) has a
+//! lock of its own, taken under a pane's `tree` and never with anything else
+//! held; only the readers' periodic look uses it, never a stop. The registry lock is held only to look a pane up or
 //! change the list, never across a call into the sink or a wait.
 
 use super::tail::TailRing;
@@ -85,6 +87,8 @@ pub(crate) struct LocalHost {
     /// no memory and no copy per chunk.
     tail_cap: Option<usize>,
     finished_backstop: usize,
+    /// One snapshot of the process table for every pane's periodic look.
+    scans: Arc<procs::Shared>,
 }
 
 pub(crate) struct Proc {
@@ -98,6 +102,10 @@ pub(crate) struct Proc {
     changed: Condvar,
     /// Every descendant seen so far (ADR §11). Taken before `state`.
     tree: Mutex<procs::Tree>,
+    /// The host's snapshot, for the reader's periodic look at the tree.
+    scans: Arc<procs::Shared>,
+    /// When the pane was created: a snapshot that began earlier is not used.
+    born: Instant,
     /// A removal or shutdown is ending the pane: the reaper leaves the
     /// descendants' grace to it and reaps once it has released the pane.
     stopping: AtomicBool,
@@ -148,6 +156,7 @@ impl LocalHost {
             sink: Arc::new(Mutex::new(None)),
             tail_cap: None,
             finished_backstop: FINISHED_BACKSTOP,
+            scans: Arc::new(procs::Shared::new()),
         }
     }
 
@@ -165,6 +174,19 @@ impl LocalHost {
     pub(crate) fn with_finished_backstop(mut self, n: usize) -> Self {
         self.finished_backstop = n;
         self
+    }
+
+    /// Test hook: the age limit of the shared process-table snapshot.
+    #[cfg(test)]
+    pub(crate) fn with_scan_max_age(mut self, max_age: Duration) -> Self {
+        self.scans = Arc::new(procs::Shared::with_max_age(max_age));
+        self
+    }
+
+    /// Test hook: how many scans of the process table the host has taken.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn scans(&self) -> usize {
+        self.scans.scans()
     }
 
     /// With a tail kept, make room for one more finished pane: forget the
@@ -247,6 +269,8 @@ impl PtyHost for LocalHost {
             }),
             changed: Condvar::new(),
             tree: Mutex::new(procs::Tree::default()),
+            scans: Arc::clone(&self.scans),
+            born: Instant::now(),
             stopping: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             reader: Mutex::new(None),
@@ -678,10 +702,11 @@ fn read_loop(pane: Arc<Proc>, sink: SinkCell) {
         pane.reading.store(false, Ordering::SeqCst);
         if Instant::now() >= next_tree {
             // try_lock: a stop holds the tree, and the reader must keep
-            // draining the terminal meanwhile.
+            // draining the terminal meanwhile. The snapshot is shared with
+            // the other panes' readers; a stop takes its own fresh scan.
             if let Ok(mut tree) = pane.tree.try_lock() {
                 if pane.is_live() && pane.owns_group() {
-                    let _ = tree.refresh(pane.pid);
+                    let _ = tree.refresh_shared(pane.pid, &pane.scans, pane.born);
                 }
             }
             next_tree = Instant::now() + TREE_POLL;
