@@ -2,8 +2,8 @@
 //!
 //! The backend reports only `blocked`/`permission`; the dialog itself exists only
 //! as screen text. The layout below was measured on kiro-cli 3.1.0 and 3.3.0 (V3
-//! engine) for a shell tool call; 3.3.0 also for `fs_write`, `mcp` and `web_fetch`,
-//! which share it. Anything else is refused rather than guessed. The OSC 7501
+//! engine) for a shell tool call; 3.3.0 also for `fs_write` (edit and new file),
+//! `fs_read` (a read outside the workspace), `mcp` and `web_fetch`, which share it. Anything else is refused rather than guessed. The OSC 7501
 //! `kind` is `permission` for every tool, so it never selects a rule here.
 //!
 //! ```text
@@ -23,7 +23,7 @@ pub const CURSOR: char = '❯';
 
 /// Tool names (the text before the arrow) whose dialog layout was measured.
 /// Any other name is refused.
-pub const TOOLS: [&str; 4] = ["shell", "fs_write", "mcp", "web_fetch"];
+pub const TOOLS: [&str; 5] = ["shell", "fs_write", "fs_read", "mcp", "web_fetch"];
 
 /// The four options, in screen order. Only the first two can be chosen.
 pub const OPTION_ALLOW_ONCE: &str = "Allow once";
@@ -337,10 +337,29 @@ mod measured_tests {
     const WEB_SEARCH_1: &str = include_str!("../tests/fixtures/kiro-3.3.0/web_search-1.screen.txt");
     const WRAPPED_1: &str =
         include_str!("../tests/fixtures/kiro-3.3.0/shell_wrapped80-1.screen.txt");
+    const WRAPPED_2: &str =
+        include_str!("../tests/fixtures/kiro-3.3.0/shell_wrapped80-2.screen.txt");
+    const WRAPPED_3: &str =
+        include_str!("../tests/fixtures/kiro-3.3.0/shell_wrapped80-3.screen.txt");
+    const LONG_130: &str = include_str!("../tests/fixtures/kiro-3.3.0/shell_long130-1.screen.txt");
+    const FS_WRITE_NEW: &str =
+        include_str!("../tests/fixtures/kiro-3.3.0/fs_write_new-1.screen.txt");
+    const FS_READ: &str = include_str!("../tests/fixtures/kiro-3.3.0/fs_read_outside-1.screen.txt");
+    const MCP_ARGS: &str = include_str!("../tests/fixtures/kiro-3.3.0/mcp_args-1.screen.txt");
+    const FETCH_DOWN: &str =
+        include_str!("../tests/fixtures/kiro-3.3.0/web_fetch-down-1.screen.txt");
+    const FETCH_ESC: &str = include_str!("../tests/fixtures/kiro-3.3.0/web_fetch-esc-1.screen.txt");
+    const FETCH_SECOND: &str =
+        include_str!("../tests/fixtures/kiro-3.3.0/web_fetch-parallel-2.screen.txt");
+    const SEARCH_FIRST: &str =
+        include_str!("../tests/fixtures/kiro-3.3.0/web_search-parallel-1.screen.txt");
+    const SEARCH_ESC: &str =
+        include_str!("../tests/fixtures/kiro-3.3.0/web_search-esc-1.screen.txt");
 
     /// (fixture, tool, cursor) for the measured accepted dialogs.
-    fn accepted() -> [(&'static str, &'static str, usize); 4] {
+    fn accepted() -> [(&'static str, &'static str, usize); 5] {
         [
+            (FS_READ, "fs_read", 0),
             (FS_WRITE_1, "fs_write", 0),
             (FS_WRITE_2, "fs_write", 1),
             (MCP_1, "mcp", 0),
@@ -356,6 +375,137 @@ mod measured_tests {
             assert_eq!(dialog.cursor, cursor);
             assert!(dialog.command.starts_with(&format!("{tool} → ")));
         }
+    }
+
+    #[test]
+    fn accepts_the_new_measured_dialogs() {
+        for (screen, title, command) in [
+            (
+                FS_WRITE_NEW,
+                "Write File requires approval",
+                "fs_write → new.txt",
+            ),
+            (
+                FS_READ,
+                "Read File requires approval",
+                "fs_read → /private/etc/hosts",
+            ),
+            (
+                MCP_ARGS,
+                "probe_ping requires approval",
+                "mcp → probe_mcp/probe_ping",
+            ),
+            (
+                FETCH_DOWN,
+                "Fetch URL requires approval",
+                "web_fetch → example.com",
+            ),
+            (
+                FETCH_ESC,
+                "Fetch URL requires approval",
+                "web_fetch → example.com",
+            ),
+            (
+                FETCH_SECOND,
+                "Fetch URL requires approval",
+                "web_fetch → example.com",
+            ),
+        ] {
+            let dialog = parse(screen).unwrap();
+            assert_eq!(dialog.title, title);
+            assert_eq!(dialog.command, command);
+            assert_eq!(dialog.cursor, 0);
+        }
+    }
+
+    #[test]
+    fn fs_read_is_accepted_at_every_cursor_row() {
+        // Only row 0 was measured; the frame is the shared one, so the other rows
+        // are the same screen with the cursor moved (built here, not measured).
+        let options = [
+            "Allow once",
+            "Deny once",
+            "Create allow rule to approve future similar actions",
+            "Create deny rule to block future similar actions",
+        ];
+        let measured = options
+            .iter()
+            .enumerate()
+            .map(|(index, label)| format!("{}{label}\n", if index == 0 { " ❯ " } else { "   " }))
+            .collect::<String>();
+        assert!(FS_READ.contains(&measured));
+        for row in 0..4 {
+            let moved = options
+                .iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    format!("{}{label}\n", if index == row { " ❯ " } else { "   " })
+                })
+                .collect::<String>();
+            let screen = FS_READ.replacen(&measured, &moved, 1);
+            let dialog = parse(&screen).unwrap();
+            assert_eq!(dialog.tool, "fs_read");
+            assert_eq!(dialog.cursor, row, "{screen}");
+        }
+    }
+
+    #[test]
+    fn fs_read_is_on_the_allowlist() {
+        assert!(TOOLS.contains(&"fs_read"));
+        let dialog = parse(FS_READ).unwrap();
+        assert_eq!(dialog.tool, "fs_read");
+    }
+
+    #[test]
+    fn refuses_web_search_in_every_measured_capture() {
+        for screen in [SEARCH_FIRST, SEARCH_ESC] {
+            let err = parse(screen).unwrap_err();
+            assert_eq!(
+                err,
+                "the line after \"web_search requires approval\" is not \"<tool> → <command>\": \"web_search\""
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_every_wrapped_shell_with_the_dedicated_reason() {
+        for (screen, command, next) in [
+            (
+                WRAPPED_2,
+                "shell → echo long_argument_segment_one long_argument_segment_two",
+                "long_argument_segment_three long_argument_segment_four",
+            ),
+            (
+                WRAPPED_3,
+                "shell → echo long_argument_segment_one long_argument_segment_two",
+                "long_argument_segment_three long_argument_segment_four",
+            ),
+            (
+                LONG_130,
+                "shell → echo seg_one seg_two seg_three seg_four seg_five seg_six seg_seven seg_eight seg_nine seg_ten seg_eleven seg_twelve",
+                "seg_thirteen seg_fourteen seg_fifteen seg_sixteen seg_seventeen > marker_long.txt",
+            ),
+        ] {
+            let err = parse(screen).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "wrapped command: the line after {command:?} is {next:?}, not the options; a command that wraps is refused"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn the_second_dialog_of_a_turn_is_parsed_on_its_own() {
+        // After the first answer the screen holds only the next dialog. Here the
+        // first was a refused web_search and the second an accepted web_fetch;
+        // the earlier tool call remains only as transcript text above the rule.
+        assert!(parse(SEARCH_FIRST).is_err());
+        let second = parse(FETCH_SECOND).unwrap();
+        assert_eq!(second.tool, "web_fetch");
+        assert_eq!(second.command, "web_fetch → example.com");
+        assert_eq!(second.cursor, 0);
     }
 
     #[test]

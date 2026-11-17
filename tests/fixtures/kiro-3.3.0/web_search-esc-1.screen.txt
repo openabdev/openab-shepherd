@@ -1,0 +1,31 @@
+
+          ⣀⣤⣤⣶⣶⣤⣤⣄⡀
+        ⢠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣄
+        ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄
+       ⢸⣿⣿⣿⣿⣿⣿⠁⢹⣿⠁⢹⣿⣿⣧        Welcome to Kiro CLI V3
+       ⢸⣿⣿⣿⣿⣿⣿⣄⣼⣿⣄⣼⣿⣿⣿        Learn more: https://kiro.dev/docs/cli/v3/
+       ⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+      ⢰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿        kiro-cli --v2   Launch the previous experience instead
+      ⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃
+        ⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁
+         ⠙⠛⠛⠛⠋⠁⠙⠛⠛⠉
+
+
+▸ What's new
+  Approve for me, cloud sessions, memory, local sandbox and specs.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Call both of these tools in the SAME step, in parallel: the web search tool searching for kiro cli, and the web fetch tool on
+  https://example.com. Use the dedicated web tools, not shell. Do nothing else.
+
+↓ WebSearch "kiro cli"
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ web_search requires approval
+ web_search
+
+ ❯ Allow once
+   Deny once
+   Create allow rule to approve future similar actions
+   Create deny rule to block future similar actions
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ esc to close · ↑↓ to navigate · ↵ to select · Tab to edit

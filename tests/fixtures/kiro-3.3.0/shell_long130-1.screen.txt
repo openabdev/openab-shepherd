@@ -1,0 +1,40 @@
+
+          ⣀⣤⣤⣶⣶⣤⣤⣄⡀
+        ⢠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣄
+        ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄
+       ⢸⣿⣿⣿⣿⣿⣿⠁⢹⣿⠁⢹⣿⣿⣧        Welcome to Kiro CLI V3
+       ⢸⣿⣿⣿⣿⣿⣿⣄⣼⣿⣄⣼⣿⣿⣿        Learn more: https://kiro.dev/docs/cli/v3/
+       ⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+      ⢰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿        kiro-cli --v2   Launch the previous experience instead
+      ⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃
+        ⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁
+         ⠙⠛⠛⠛⠋⠁⠙⠛⠛⠉
+
+
+▸ What's new
+  Approve for me, cloud sessions, memory, local sandbox and specs.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Do these in order. 1) Use the shell tool once, with the description parameter set to exactly: Write a marker file that records a
+  deliberately very long description so that the approval title line is much longer than one hundred and thirty terminal columns
+  wide - and the command exactly: echo seg_one seg_two seg_three seg_four seg_five seg_six seg_seven seg_eight seg_nine seg_ten
+  seg_eleven seg_twelve seg_thirteen seg_fourteen seg_fifteen seg_sixteen seg_seventeen > marker_long.txt   2) Then call the
+  probe_ping tool of the probe_mcp MCP server once with text set to SECRET_ARG_TEXT_12345 and note set to NOTE_ARG_67890. Do
+  nothing else.
+
+↓ Shell echo seg_one seg_two seg_three seg_four seg_five seg_six seg_seven seg_eight seg_nine seg_ten seg_eleven seg_twelve
+  seg_thirteen seg_fourteen seg_fifteen seg_sixteen seg_seventeen > marker_long.txt
+    ╰ description=Write a marker file that records a deliberately very long description so that the approval title line is much
+      longer than one hundred and thirty terminal columns wide, run_in_background=false
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Write a marker file that records a deliberately very long description so that the approval title line is much longer tha...
+ requires approval
+ shell → echo seg_one seg_two seg_three seg_four seg_five seg_six seg_seven seg_eight seg_nine seg_ten seg_eleven seg_twelve
+ seg_thirteen seg_fourteen seg_fifteen seg_sixteen seg_seventeen > marker_long.txt
+
+ ❯ Allow once
+   Deny once
+   Create allow rule to approve future similar actions
+   Create deny rule to block future similar actions
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ esc to close · ↑↓ to navigate · ↵ to select · Tab to edit
