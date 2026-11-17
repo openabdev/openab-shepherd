@@ -17,7 +17,8 @@
 #   4     the Kiro trust-all guard: pane_needs_trust_acceptance, nothing typed, pane left open;
 #         after the warning is gone a send works
 #   5     agent on an argv start: answer_dialog allow_once works with it and is refused without
-#   6     the audit file: launch, agent, extra_args_n, flags, argv0, and no argument value
+#   6     the audit file and the holder log: launch, agent, extra_args_n, flags, argv0, and no
+#         argument value (canaries sit in accepted and in refused calls)
 #
 # Nothing in this script is Linux-only or macOS-only (it does not use RLIMIT_FSIZE, which
 # macOS does not enforce, nor `stat -f`); r_skip exists for a step that ever must be. The
@@ -279,6 +280,25 @@ count, width = int(sys.argv[1]), int(sys.argv[2])
 print(json.dumps(["x" * width] * count))' "$1" "$2"
 }
 
+# t_log_lacks NEEDLE... : the holder log ($R_LOG) holds none of the fixed strings.
+t_log_lacks() {
+  local args=() n
+  for n in "$@"; do args+=(-e "$n"); done
+  ! grep -q -F "${args[@]}" "$R_LOG" 2>/dev/null
+}
+
+# t_replies_lack NEEDLE TEXT... : none of the texts contains NEEDLE, and none is empty (an empty
+# reply would pass for the wrong reason).
+t_replies_lack() {
+  local needle="$1" t
+  shift
+  for t in "$@"; do
+    [ -n "$t" ] || return 1
+    case "$t" in *"$needle"*) return 1 ;; esac
+  done
+  return 0
+}
+
 # t_audit_check PYTHON_BODY : run Python over the audit records once (`records`, a list of dicts;
 # `raw`, the file's text). Success when the expression is true.
 t_audit_check() {
@@ -346,15 +366,15 @@ t_main() {
     t_until "$T_WAIT" t_file_is "$T_PANES/x1/args.txt" "$(printf -- '-a\n--model\nclaude-sonnet-4')"
 
   r_check "ops (no start:args): extra_args are forbidden" \
-    test "$(t_error t_start ops rej sandbox 'extra_args:=["-a"]')" = forbidden
+    test "$(t_error t_start ops rej sandbox 'extra_args:=["-a", "CANARYDENIED"]')" = forbidden
   r_check "...and the error names the scope start:args" \
-    test "$(t_start ops rej sandbox 'extra_args:=["-a"]' 2>/dev/null | t_py 'd["scope"]')" = start:args
+    test "$(t_start ops rej sandbox 'extra_args:=["-a", "CANARYDENIED"]' 2>/dev/null | t_py 'd["scope"]')" = start:args
   r_check "orch: a profile that is not on its list is forbidden even with start:args" \
-    test "$(t_error t_start orch rej other 'extra_args:=["-a"]')" = forbidden
+    test "$(t_error t_start orch rej other 'extra_args:=["-a", "CANARYLIST"]')" = forbidden
   r_check "start:arbitrary does not stand in for start:args" \
-    test "$(t_error t_start trusted rej sandbox 'extra_args:=["-a"]')" = forbidden
+    test "$(t_error t_start trusted rej sandbox 'extra_args:=["-a", "CANARYARB"]')" = forbidden
   r_check "...and the error names the scope start:args, not the profile list" \
-    test "$(t_start trusted rej sandbox 'extra_args:=["-a"]' 2>/dev/null | t_py 'd["scope"]')" = start:args
+    test "$(t_start trusted rej sandbox 'extra_args:=["-a", "CANARYARB"]' 2>/dev/null | t_py 'd["scope"]')" = start:args
   r_check "extra_args null is the same as none: ops may start" \
     r_quiet t_start ops x2 sandbox 'extra_args:=null'
   r_check "extra_args [] is the same as none: ops may start" \
@@ -366,9 +386,9 @@ t_main() {
 
   # --- Step 3: refusals ---------------------------------------------------------------------
   r_check "a control character in an element is invalid_input" \
-    test "$(t_error t_start orch rej sandbox 'extra_args:=["bad\u0001x"]')" = invalid_input
+    test "$(t_error t_start orch rej sandbox 'extra_args:=["bad\u0001CANARYCTL"]')" = invalid_input
   r_check "...and the error names the field extra_args" \
-    test "$(t_start orch rej sandbox 'extra_args:=["bad\u0001x"]' 2>/dev/null | t_py 'd["field"]')" = extra_args
+    test "$(t_start orch rej sandbox 'extra_args:=["bad\u0001CANARYCTL"]' 2>/dev/null | t_py 'd["field"]')" = extra_args
   r_check "an empty element is invalid_input" \
     test "$(t_error t_start orch rej sandbox 'extra_args:=[""]')" = invalid_input
   r_check "an element over 4096 bytes is invalid_input" \
@@ -380,10 +400,19 @@ t_main() {
   r_check "extra_args with argv are invalid_input" \
     test "$(t_error t_start_argv trusted rej '["/bin/sh", "-c", "true"]' 'extra_args:=["-a"]')" = invalid_input
   r_check "the OpenCode auto-approve flag in extra_args is invalid_input" \
-    test "$(t_error t_start orch rej oc 'extra_args:=["--auto"]')" = invalid_input
+    test "$(t_error t_start orch rej oc 'extra_args:=["--model", "CANARYOC", "--auto"]')" = invalid_input
   r_check "...and the error names the field extra_args" \
-    test "$(t_start orch rej oc 'extra_args:=["--auto"]' 2>/dev/null | t_py 'd["field"]')" = extra_args
+    test "$(t_start orch rej oc 'extra_args:=["--model", "CANARYOC", "--auto"]' 2>/dev/null | t_py 'd["field"]')" = extra_args
   r_check "none of the refused starts left a pane" t_no_pane rej
+  # The error text of a refused call must not repeat an argument value (the audit file and the
+  # log are checked in step 6; the reply is the third place a value could leak to).
+  r_check "the reply to a refused call does not echo an argument value" \
+    t_replies_lack CANARY \
+    "$(t_start ops rej sandbox 'extra_args:=["-a", "CANARYDENIED"]' 2>&1)" \
+    "$(t_start orch rej other 'extra_args:=["-a", "CANARYLIST"]' 2>&1)" \
+    "$(t_start orch rej sandbox 'extra_args:=["bad\u0001CANARYCTL"]' 2>&1)" \
+    "$(t_start orch rej oc 'extra_args:=["--model", "CANARYOC", "--auto"]' 2>&1)" \
+    "$(t_start trusted rej sandbox 'extra_args:=["-a", "CANARYARB"]' 2>&1)"
 
   # --- Step 4: the Kiro trust-all guard -----------------------------------------------------
   r_check "orch starts the guard pane (a Kiro pane showing the trust-all warning)" \
@@ -391,9 +420,9 @@ t_main() {
   r_check "the guard pane has printed its screen" t_until "$T_WAIT" t_file_is "$T_PANES/g1/ready.txt" ready
   r_check "the screen shows the warning" t_until "$T_WAIT" t_screen_has g1 "$T_WARNING"
   r_check "send_input is pane_needs_trust_acceptance" \
-    test "$(t_error as ops send_input g1 hello)" = pane_needs_trust_acceptance
+    test "$(t_error as ops send_input g1 TYPEDTOKEN77)" = pane_needs_trust_acceptance
   r_check "...and the error names the pane and the next step" \
-    test "$(as ops send_input g1 hello 2>/dev/null | t_py 'd["terminal"]')" = g1
+    test "$(as ops send_input g1 TYPEDTOKEN77 2>/dev/null | t_py 'd["terminal"]')" = g1
   r_check "nothing was typed into the pane (it reads nothing before accept)" \
     t_stays "$T_WINDOW" t_absent "$T_PANES/g1/typed.txt"
   r_check "the pane is still open" t_json_is true 'd["live"]' as ops get_status g1
@@ -403,8 +432,8 @@ t_main() {
   r_check "the warning is accepted: the pane printed accepted.txt" \
     t_until "$T_WAIT" t_file_is "$T_PANES/g1/accepted.txt" accepted
   r_check "the screen no longer shows the warning" t_until "$T_WAIT" t_screen_lacks g1 "$T_WARNING"
-  r_check "send_input works once the warning is gone" r_quiet as ops send_input g1 hello
-  r_check "the pane got exactly that line" t_until "$T_WAIT" t_file_is "$T_PANES/g1/typed.txt" hello
+  r_check "send_input works once the warning is gone" r_quiet as ops send_input g1 TYPEDTOKEN77
+  r_check "the pane got exactly that line" t_until "$T_WAIT" t_file_is "$T_PANES/g1/typed.txt" TYPEDTOKEN77
 
   # --- Step 5: agent on an argv start -------------------------------------------------------
   local dialog_script
@@ -449,9 +478,12 @@ t_main() {
     t_audit_wait 'any(r["client"] == "ops" and r["tool"] == "start_pane" and r["phase"] == "call" and r.get("pane") == "x2" and "launch" not in r for r in records)'
   # Absence checks hold over a window (the positive checks above already waited for the lines).
   r_check "audit: no argument value is in the file (canary, model name, script text)" \
-    t_stays "$T_WINDOW" t_audit_check '"CANARY" not in raw and "claude-sonnet-4" not in raw and "dialog.txt" not in raw and "printf" not in raw'
+    t_stays "$T_WINDOW" t_audit_check '"CANARY" not in raw and "claude-sonnet-4" not in raw and "dialog.txt" not in raw and "received.txt" not in raw'
   r_check "audit: the typed text is not in the file" \
-    t_stays "$T_WINDOW" t_audit_check '"hello" not in raw'
+    t_stays "$T_WINDOW" t_audit_check '"TYPEDTOKEN77" not in raw'
+
+  r_check "log: no argument value, no typed text is in the holder log" \
+    t_stays "$T_WINDOW" t_log_lacks CANARY claude-sonnet-4 TYPEDTOKEN77 received.txt
 
   r_finish
 }

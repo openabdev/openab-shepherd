@@ -970,6 +970,18 @@ T_AUDIT="$dir/missing.jsonl"
 T_AUDIT="$T_AUDIT_FILE"
 t_audit_wait 'len(records) == 3' || fail "audit wait"
 [ "$(t_list_json 2 3)" = '["xxx", "xxx"]' ] || fail t_list_json
+# --- the log scan and the reply scan --------------------------------------------------------
+R_LOG="$dir/holder.log"
+printf 'listening\nstarted pane x1\n' > "$R_LOG"
+t_log_lacks CANARY claude-sonnet-4 TYPEDTOKEN77 || fail "log clean"
+echo 'arg: CANARYDENIED' >> "$R_LOG"
+! t_log_lacks CANARY || fail "log with a canary"
+! t_log_lacks claude-sonnet-4 CANARYDENIED || fail "log, second needle"
+R_LOG="$dir/no-such-log"
+t_log_lacks CANARY || fail "missing log holds nothing"
+t_replies_lack CANARY '{"error":"forbidden"}' '{"error":"invalid_input"}' || fail "replies clean"
+! t_replies_lack CANARY '{"error":"forbidden"}' '{"detail":"CANARYX"}' || fail "reply with a canary"
+! t_replies_lack CANARY '{"error":"forbidden"}' "" || fail "an empty reply is not a pass"
 echo ALL-OK
 "#;
     let scratch = base.join("scratch");
