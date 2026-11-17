@@ -31,3 +31,14 @@ pub mod tools;
 mod testutil;
 #[cfg(test)]
 mod tool_flows;
+
+#[cfg(test)]
+mod ci_hang_proof {
+    #[test]
+    fn throwaway_hangs_forever_with_a_child() {
+        let _child = std::process::Command::new("sleep").arg("100000").spawn().unwrap();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+}
