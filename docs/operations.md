@@ -260,34 +260,52 @@ flag, so the label and the real behaviour can disagree. (Measured on 3.3.0: with
 no `requires approval` dialog appears and the status never reports `blocked`; 3.1.0, the
 version in the container image, was not measured.)
 
-**Every `-a` start shows a warning first.** Kiro prints "Kiro is running in trust all
-tools mode" with the choices `No, exit` (the default), `Yes, I accept` and `Yes, and
-don't ask again`. Kiro does not report it as blocked: the status stays `idle`. Typed text
-is ignored and Enter picks `No, exit`, which ends the session.
+**Every `-a` start shows a warning first, unless the operator has persisted the choice.**
+Kiro prints "Warning: Kiro is running in trust all tools mode" with the choices
+`No, exit` (the default), `Yes, I accept` and `Yes, and don't ask again`. Kiro does not
+report it as blocked: the status stays `idle`. Typed text is ignored and Enter picks
+`No, exit`, which ends the session. The warning also appears with `--trust-all-tools`
+spelled out, and with `-a` plus an agent that trusts nothing. (Measured on 3.3.0; 3.1.0,
+the version in the container image, was not measured.)
 
 Shepherd never answers this warning. Instead `send_input` (and a routine nudge) refuses
-with `pane_needs_trust_acceptance` and types nothing, when all three hold: the pane is a
-Kiro pane, it has not finished a turn (`turn` is absent or 0), and the visible screen
-contains `trust all tools mode`. The pane stays open. A person attaches, accepts the
-warning, and then `send_input` works. The check reads the screen once per send until the
-first turn, and not at all afterwards. It refuses only on a positive match: a blank
-screen (a send right after the start can beat the first render), a backend without screen
-text, or a failed read all send as before. If the phrase were still on screen after the
-warning was accepted, the pane would stay refused until its first turn; if you see that,
-report it.
+with `pane_needs_trust_acceptance` and types nothing, when all of these hold: the pane is
+a Kiro pane, it has not finished a turn (`turn` is absent or 0), its status is `idle`, and
+the visible screen shows both the title phrase `trust all tools mode` and the dialog's
+`No, exit` option line. The pane stays open. A person attaches, accepts the warning, and
+then `send_input` works. The check reads the screen once per send until the first turn,
+and not at all afterwards. It refuses only on a positive match: a blank screen (a send
+right after the start can beat the first render), a backend without screen text, a failed
+read, or the phrase alone (typed text, a restored transcript) all send as before. After
+the warning is accepted the phrase is gone within a second and never returns; the footer
+then reads `Trust All Tools active, confirmations are off`, which the guard does not match.
 
-- **Unmeasured:** whether `Yes, and don't ask again` persists, and where Kiro stores it.
-  Until that is measured, treat every `-a` start as showing the warning, and do not plan
-  an unattended restart around the choice being remembered.
-- Accept by hand in a disposable directory: start the pane, attach, choose
-  `Yes, I accept`, detach.
+What Kiro remembers (measured on 3.3.0):
+
+- `Yes, and don't ask again` writes `chat.disableTrustAllConfirmation: true` to
+  `$HOME/.kiro/settings/cli.json`. The next `-a` launch with the same HOME starts at the
+  prompt with no warning, and an unattended pane can type into it at once.
+- `Yes, I accept` persists nothing: the file stays empty and the warning returns on every
+  launch.
+- The setting belongs to the HOME, so it covers every Kiro started with that HOME. It
+  removes the only human gate on the `-a` warning there. Setting it is an operator
+  decision that Shepherd never makes.
+
+To run an unattended `-a` pane that Shepherd can restart, set the key once in the HOME the
+pane's Kiro uses: start Kiro with `-a` in a disposable HOME and a disposable directory,
+choose `Yes, and don't ask again`, and start the pane with that HOME. (The dialog's
+third option is the way measured to set the key; writing the file by hand was not
+tried.) The HOME must survive a restart, or the warning comes back; then the guard refuses and the pane is
+unavailable but not damaged. Where the key is not set, accept by hand: start the pane,
+attach, choose `Yes, I accept`, detach.
+
 - The risks of an unattended trust-all pane: a routine nudge into it runs anything with
   no gate; there is no `answer_dialog` audit record for what the model runs (only the
   `send_input` text is audited); Kiro's tools inherit `KIRO_API_KEY`. Pair such a profile
   with a disposable `cwd`, a small `max_consecutive_nudges` and no `dynamic_routines`.
 - The test fixture for the warning screen
-  (`tests/fixtures/kiro-3.3.0/trust-all-warning-synthetic.screen.txt`) is synthetic,
-  written from the description of the warning, until one is recorded.
+  (`tests/fixtures/kiro-3.3.0/trust-all-warning.screen.txt`) is the screen measured on
+  Kiro 3.3.0.
 
 ### Routine (optional, per profile)
 

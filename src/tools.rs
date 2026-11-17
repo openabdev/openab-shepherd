@@ -1724,23 +1724,32 @@ fn trust_prompt_shown(sh: &Shepherd, pane: &TerminalRef) -> bool {
     false
 }
 
-/// What Kiro prints at every start with `-a` / `--trust-all-tools` (measured on
-/// kiro-cli 3.3.0). A short fragment so a wrapped line still matches.
+/// The title of the dialog Kiro shows at a start with `-a` / `--trust-all-tools`
+/// (measured on kiro-cli 3.3.0: `Warning: Kiro is running in trust all tools mode`).
+/// A short fragment on one line, matched case-sensitively so the footer
+/// `Trust All Tools active, confirmations are off` never matches.
 const KIRO_TRUST_WARNING: &str = "trust all tools mode";
+
+/// The dialog's default option (`No, exit`). The title alone is not enough: the
+/// phrase can sit in typed text or a restored transcript. The guard refuses only
+/// when the title and an option line are on the same screen.
+const KIRO_TRUST_WARNING_OPTION: &str = "No, exit";
 
 const TRUST_ACCEPTANCE_NEXT: &str =
     "a person attaches and accepts the warning, or start the pane without -a; nothing was typed";
 
-/// True when the visible screen shows Kiro's trust-all-tools warning. One read,
-/// no waiting: a blank screen, a backend without screen text and a failed read
-/// are all "not shown", so the guard refuses only on a positive match.
+/// True when the visible screen shows Kiro's trust-all-tools warning: the title
+/// phrase and the `No, exit` option line together. One read, no waiting: a blank
+/// screen, a backend without screen text and a failed read are all "not shown",
+/// so the guard refuses only on a positive match.
 fn kiro_trust_warning_shown(sh: &Shepherd, pane: &TerminalRef) -> bool {
     if !sh.backend.capabilities().screen_text {
         return false;
     }
-    sh.backend
-        .read(pane, 0)
-        .is_ok_and(|screen| strip_terminal_escapes(&screen.text).contains(KIRO_TRUST_WARNING))
+    sh.backend.read(pane, 0).is_ok_and(|screen| {
+        let text = strip_terminal_escapes(&screen.text);
+        text.contains(KIRO_TRUST_WARNING) && text.contains(KIRO_TRUST_WARNING_OPTION)
+    })
 }
 
 /// A launch profile's run: its fixed argv, a cwd it allows, no caller env.
@@ -2086,6 +2095,10 @@ fn send_text_inner(
     }
     if sh.agent_of(terminal) == Some(Agent::Kiro)
         && matches!(now.turn, None | Some(0))
+        && now
+            .status
+            .as_ref()
+            .is_some_and(|status| status.state == State::Idle)
         && kiro_trust_warning_shown(sh, &pane)
     {
         return Err(ToolError::new(
@@ -3725,7 +3738,7 @@ mod tests {
     }
 
     const KIRO_TRUST_WARNING_SCREEN: &str =
-        include_str!("../tests/fixtures/kiro-3.3.0/trust-all-warning-synthetic.screen.txt");
+        include_str!("../tests/fixtures/kiro-3.3.0/trust-all-warning.screen.txt");
 
     /// A Kiro pane named `work` at `turn`, showing `screen`.
     fn kiro_pane(turn: Option<u64>, screen: Option<&str>) -> (Shepherd, FakeBackend) {
@@ -3766,11 +3779,58 @@ mod tests {
 
     #[test]
     fn the_kiro_trust_guard_sees_through_escapes_in_the_phrase() {
-        let screen = "\x1b[1mKiro is running in trust all\x1b[0m tools mode";
+        let screen =
+            "\x1b[1mKiro is running in trust all\x1b[0m tools mode\n \x1b[36m❯\x1b[0m No, exit";
         let (sh, fake) = kiro_pane(Some(0), Some(screen));
         let err = send_hello(&sh).unwrap_err();
         assert_eq!(err.data["error"], "pane_needs_trust_acceptance");
         assert!(fake.state.lock().unwrap().sent.is_empty());
+    }
+
+    #[test]
+    fn the_kiro_trust_guard_needs_an_option_line_with_the_title() {
+        // The phrase alone (typed text, a restored transcript) is not the dialog.
+        let screens = [
+            "Kiro is running in trust all tools mode",
+            "> explain what trust all tools mode does",
+            "Warning: Kiro is running in trust all tools mode\n\nYes, I accept",
+        ];
+        for screen in screens {
+            let (sh, fake) = kiro_pane(Some(0), Some(screen));
+            send_hello(&sh).unwrap();
+            assert_eq!(fake.state.lock().unwrap().sent.len(), 1, "{screen:?}");
+        }
+        // The option line alone is not the dialog either.
+        let (sh, fake) = kiro_pane(Some(0), Some("  ❯ No, exit\n    Yes, I accept"));
+        send_hello(&sh).unwrap();
+        assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
+    }
+
+    #[test]
+    fn the_kiro_trust_guard_sends_when_the_footer_says_trust_all_is_active() {
+        let screen =
+            " ask a question or describe a task\n Trust All Tools active, confirmations are off";
+        let (sh, fake) = kiro_pane(Some(0), Some(screen));
+        send_hello(&sh).unwrap();
+        assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
+    }
+
+    #[test]
+    fn the_kiro_trust_guard_is_off_unless_the_pane_is_idle() {
+        for state in [State::Working, State::Done] {
+            let (sh, fake) = kiro_pane(Some(0), Some(KIRO_TRUST_WARNING_SCREEN));
+            fake.state.lock().unwrap().panes[0].status = Some(ProgramStatus { state, kind: None });
+            send_hello(&sh).unwrap();
+            assert_eq!(fake.state.lock().unwrap().sent.len(), 1);
+        }
+    }
+
+    #[test]
+    fn the_real_trust_all_warning_fixture_has_the_title_and_the_default_option() {
+        assert!(
+            KIRO_TRUST_WARNING_SCREEN.contains("Warning: Kiro is running in trust all tools mode")
+        );
+        assert!(KIRO_TRUST_WARNING_SCREEN.contains("❯ No, exit"));
     }
 
     #[test]
@@ -5486,17 +5546,22 @@ mod tests {
         );
         {
             let mut state = fake.state.lock().unwrap();
+            state.panes[0].status = Some(ProgramStatus {
+                state: State::Idle,
+                kind: None,
+            });
             state.panes[0].turn = Some(0);
             state.screen = Some(
-                include_str!("../tests/fixtures/kiro-3.3.0/trust-all-warning-synthetic.screen.txt")
+                include_str!("../tests/fixtures/kiro-3.3.0/trust-all-warning.screen.txt")
                     .to_string(),
             );
         }
         let t0 = Instant::now();
         sh.routine_tick_at(t0);
         sh.routine_tick_at(t0 + Duration::from_secs(11));
+        // The dialog reports idle, and a Kiro routine nudges only a finished
+        // (`done`) turn, so it never reaches the guard here.
         assert!(fake.state.lock().unwrap().sent.is_empty());
-        assert!(fake.calls().contains(&"read"));
     }
 
     #[test]
@@ -6153,7 +6218,7 @@ mod tests {
             });
             state.panes[0].turn = Some(0);
             state.screen = Some(
-                include_str!("../tests/fixtures/kiro-3.3.0/trust-all-warning-synthetic.screen.txt")
+                include_str!("../tests/fixtures/kiro-3.3.0/trust-all-warning.screen.txt")
                     .to_string(),
             );
         }
@@ -6955,7 +7020,7 @@ mod extra_args_tests {
             let mut state = s.fake.state.lock().unwrap();
             state.panes[0].turn = Some(0);
             state.screen = Some(
-                include_str!("../tests/fixtures/kiro-3.3.0/trust-all-warning-synthetic.screen.txt")
+                include_str!("../tests/fixtures/kiro-3.3.0/trust-all-warning.screen.txt")
                     .to_string(),
             );
         }
