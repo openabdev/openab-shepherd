@@ -18,7 +18,7 @@ It is not wired into any running code. Nothing in the server creates a ledger or
 | `depends_on` | Dispatches that must be `done` first. They must already exist, so a cycle cannot be written |
 | `attempt` | The number of the latest delivery request, never reused: it rises by one for every `delivery_started`, even if the runtime refused the request. 0 before the first. Requests that did not reach the worker keep their number but do not use the retry budget |
 | `request_id` | The id of the latest delivery request. Every answer from the runtime must name it |
-| `max_retries` | Redeliveries allowed after the first. Deliveries that may have reached the worker: `max_retries + 1` (a refused request, or one shown as not injected, is not counted). Using them up sets `failed` with reason `retry_cap_reached`. The call that finds the cap logs that `failed` and then returns an error. At most 4294967293 (`u32::MAX - 2`); a larger value is refused when the dispatch is created. The counter is a `u32`: at its end `begin_delivery` is refused |
+| `max_retries` | Redeliveries allowed after the first. Deliveries that may have reached the worker: `max_retries + 1` (a refused request, or one shown as not injected, is not counted). Using them up sets `failed` with reason `retry_cap_reached`. The call that finds the cap logs that `failed` and then returns an error. At most 4294967293 (`u32::MAX - 2`); a larger value is refused when the dispatch is created. The counter is a `u32`: when no request number is left, `begin_delivery` logs `failed` with reason `request_counter_exhausted` and returns an error |
 | `state` | See below |
 | `created_at`, `updated_at`, `delivered_at` | Milliseconds since the Unix epoch, from an injected clock |
 
@@ -124,7 +124,11 @@ A record is accepted only if all of these hold. The first check that fails is th
    logged event, a record cannot satisfy a dispatch before its delivery was logged.
 
 A record that arrives while the dispatch is in `delivery_unknown` is rejected as `not_delivered`.
-The sender must resend it after the runtime's audit shows the injection happened.
+The sender must resend it after the runtime's audit shows the injection happened, so whatever
+uses this ledger needs a way to ask the worker to report again.
+
+Unblocking does not give a dispatch new retries. If its retry budget is already used, the next
+`begin_delivery` after `unblock` logs `failed` with reason `retry_cap_reached`.
 
 A rejected record is appended as `record_rejected` with the reason. It changes no dispatch. There is
 no "latest record wins" and no fallback to any other signal. The rule is the pure function

@@ -275,8 +275,9 @@ pub struct Dispatch {
     /// Dispatches that must be `done` first.
     pub depends_on: Vec<DispatchId>,
     pub state: State,
-    /// The open attempt: the number of deliveries that may have reached the
-    /// worker. 0 until the first delivery starts.
+    /// The number of the latest delivery request, never reused. It rises by one
+    /// for every request, including one that did not reach the worker (see
+    /// `unsent`). 0 until the first request.
     pub attempt: u32,
     /// Redeliveries allowed after the first delivery.
     pub max_retries: u32,
@@ -308,8 +309,10 @@ impl Dispatch {
         u64::from(self.attempt) - u64::from(self.unsent)
     }
 
-    /// Redeliveries used so far.
+    /// Redeliveries used so far: charged deliveries after the first. A refused
+    /// request, or one shown as not injected, is not counted, which matches
+    /// the retry cap.
     pub fn retries(&self) -> u32 {
-        self.attempt.saturating_sub(1)
+        u32::try_from(self.spent().saturating_sub(1)).unwrap_or(u32::MAX)
     }
 }

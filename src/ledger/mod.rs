@@ -247,13 +247,17 @@ impl<S: Store> Ledger<S> {
         request_id: Code,
     ) -> Result<u32, LedgerError> {
         let d = self.find(id)?;
-        // Refused requests do not use the retry budget, so the counter itself
-        // is the only bound on them: at u32::MAX the call is refused.
-        let attempt = d
-            .attempt
-            .checked_add(1)
-            .ok_or_else(|| TransitionError::RetryCapReached(id.clone()))?;
         let at = self.now();
+        // Refused requests do not use the retry budget, so the counter itself
+        // is the only bound on them. At u32::MAX no request number is left:
+        // a `ready` dispatch is logged as `failed`, like any dispatch with no
+        // request left.
+        let Some(attempt) = d.attempt.checked_add(1) else {
+            if d.state == State::Ready {
+                return self.fail_with(id, "request_counter_exhausted", at);
+            }
+            return Err(TransitionError::RetryCapReached(id.clone()).into());
+        };
         if d.state == State::Ready && d.spent() + 1 > u64::from(d.max_retries) + 1 {
             return self.fail_at_cap(id, at);
         }
@@ -362,9 +366,13 @@ impl<S: Store> Ledger<S> {
 
     /// Log `failed` for a dispatch that used its attempts, then report it.
     fn fail_at_cap<T>(&mut self, id: &DispatchId, at: u64) -> Result<T, LedgerError> {
+        self.fail_with(id, "retry_cap_reached", at)
+    }
+
+    fn fail_with<T>(&mut self, id: &DispatchId, reason: &str, at: u64) -> Result<T, LedgerError> {
         self.commit(Event::Failed {
             id: id.clone(),
-            reason: Code::new("retry_cap_reached").expect("a fixed valid code"),
+            reason: Code::new(reason).expect("a fixed valid code"),
             at,
         })?;
         Err(TransitionError::RetryCapReached(id.clone()).into())

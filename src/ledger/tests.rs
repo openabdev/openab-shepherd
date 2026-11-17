@@ -1457,3 +1457,35 @@ fn max_retries_is_bounded_so_the_cap_stays_reachable() {
     assert_eq!(l.store.bytes(), log_before);
     assert!(l.get(&id("big")).is_none());
 }
+
+/// Review finding: `retries()` follows the retry cap, so refused requests are
+/// not counted, and an exhausted request counter ends in `failed`.
+#[test]
+fn retries_ignore_refused_requests_and_an_exhausted_counter_fails_the_dispatch() {
+    let (mut l, _) = open_mem(&MemStore::default());
+    l.create(new_dispatch("a", "s1", 0, &[])).unwrap();
+    for n in 0..6 {
+        let r = Code::new(format!("r{n}")).unwrap();
+        l.begin_delivery(&id("a"), r.clone()).unwrap();
+        l.refuse_delivery(&id("a"), &r, Code::new("busy").unwrap())
+            .unwrap();
+    }
+    let d = l.get(&id("a")).unwrap();
+    assert_eq!((d.attempt, d.spent(), d.retries()), (6, 0, 0));
+    deliver(&mut l, "a");
+    let d = l.get(&id("a")).unwrap();
+    assert_eq!((d.attempt, d.spent(), d.retries()), (7, 1, 0));
+
+    l.create(new_dispatch("b", "s1", 0, &[])).unwrap();
+    l.state.set_attempt_for_test(&id("b"), u32::MAX);
+    let before = l.store.bytes();
+    assert!(matches!(
+        l.begin_delivery(&id("b"), Code::new("rx").unwrap()),
+        Err(LedgerError::Transition(TransitionError::RetryCapReached(_)))
+    ));
+    assert_eq!(state_of(&l, "b"), State::Failed);
+    assert!(
+        l.store.bytes().len() > before.len(),
+        "the failure is logged"
+    );
+}

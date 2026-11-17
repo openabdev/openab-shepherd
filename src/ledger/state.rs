@@ -143,6 +143,15 @@ impl LedgerState {
         self.dispatches.get(id)
     }
 
+    /// Test only: put a dispatch's request counter at a boundary value.
+    #[cfg(test)]
+    pub(crate) fn set_attempt_for_test(&mut self, id: &DispatchId, attempt: u32) {
+        self.dispatches
+            .get_mut(id)
+            .expect("a known dispatch")
+            .attempt = attempt;
+    }
+
     /// All dispatches, ordered by id.
     pub fn iter(&self) -> impl Iterator<Item = &Dispatch> {
         self.dispatches.values()
