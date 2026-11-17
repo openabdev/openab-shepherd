@@ -1819,28 +1819,29 @@ fn extra_args_arg(args: &Args, profile: &Profile) -> Result<Vec<String>, ToolErr
     if !crate::clients::extra_args_present(args) {
         return Ok(Vec::new());
     }
+    // Every refusal below names the field and never an argument value: the text carries the
+    // reason and an element's index, `validate_input`'s message names the problem only.
+    let invalid = |text: String| ToolError::from(text).with("field", "extra_args");
     let items = args
         .get("extra_args")
         .and_then(Value::as_array)
-        .ok_or_else(|| "extra_args must be a list of strings".to_string())?;
+        .ok_or_else(|| invalid("extra_args must be a list of strings".to_string()))?;
     let mut extra = Vec::with_capacity(items.len());
     for (i, item) in items.iter().enumerate() {
         let text = item
             .as_str()
-            .ok_or_else(|| "extra_args must be a list of strings".to_string())?;
-        extra.push(validate_input(text).map_err(|err| format!("extra_args[{i}]: {err}"))?);
+            .ok_or_else(|| invalid("extra_args must be a list of strings".to_string()))?;
+        extra.push(validate_input(text).map_err(|err| invalid(format!("extra_args[{i}]: {err}")))?);
     }
     if profile.argv.len() + extra.len() > MAX_ARGV {
-        return Err(format!(
+        return Err(invalid(format!(
             "extra_args: the profile's argv and extra_args may have at most {MAX_ARGV} elements together"
-        )
-        .into());
+        )));
     }
     let mut combined = profile.argv.clone();
     combined.extend(extra.iter().cloned());
-    check_agent_argv(profile.agent, &combined).map_err(|reason| {
-        ToolError::from(format!("extra_args: {reason}")).with("field", "extra_args")
-    })?;
+    check_agent_argv(profile.agent, &combined)
+        .map_err(|reason| invalid(format!("extra_args: {reason}")))?;
     Ok(extra)
 }
 
