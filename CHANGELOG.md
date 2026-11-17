@@ -67,6 +67,10 @@ stops working, with one exception: the container image now starts the pane holde
 
 ### Added
 
+- `docs/operator-e2e/dialog-canary.sh <kiro|devin|opencode>` (issue #65): an operator script that
+  sends one prompt to the installed agent CLI, compares its permission dialog with the recorded
+  one and answers `deny_once` through the shipped parser. It never logs in and skips when the
+  agent cannot authenticate. No scheduled CI. See `docs/operator-e2e/dialog-canary.md`.
 - Restart survival (issue #76; #83 to #86, #88 to #92, #94). `openab-shepherd hold -- <server flags>`
   runs a holder that owns the panes and starts the server as a child. `SIGUSR2` on the holder
   restarts the server and the panes keep running; a new server adopts them, replays their output
