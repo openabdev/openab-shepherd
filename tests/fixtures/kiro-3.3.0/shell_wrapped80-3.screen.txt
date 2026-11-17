@@ -1,0 +1,44 @@
+       ⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+      ⢰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿        kiro-cli --v2   Launch the previous experience
+      ⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃                        instead
+        ⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁
+         ⠙⠛⠛⠛⠋⠁⠙⠛⠛⠉
+
+
+▸ What's new
+  Approve for me, cloud sessions, memory, local sandbox and specs.
+────────────────────────────────────────────────────────────────────────────────
+  Use the shell tool twice, in this order, each as its own call, running exactly
+  these commands and nothing else: first: echo long_argument_segment_one
+  long_argument_segment_two long_argument_segment_three
+  long_argument_segment_four long_argument_segment_five
+  long_argument_segment_six long_argument_segment_seven > marker_a.txt   second:
+  echo long_argument_segment_one long_argument_segment_two
+  long_argument_segment_three long_argument_segment_four
+  long_argument_segment_five long_argument_segment_six
+  long_argument_segment_seven > marker_b.txt
+
+• Shell echo long_argument_segment_one long_argument_segment_two
+  long_argument_segment_three long_argument_segment_four
+  long_argument_segment_five long_argument_segment_six
+  long_argument_segment_seven > marker_a.txt
+    ╰ description=Write first marker file, run_in_background=false
+↓ Shell echo long_argument_segment_one long_argument_segment_two
+  long_argument_segment_three long_argument_segment_four
+  long_argument_segment_five long_argument_segment_six
+  long_argument_segment_seven > marker_b.txt
+    ╰ description=Write second marker file, run_in_background=false
+
+────────────────────────────────────────────────────────────────────────────────
+ Write second marker file requires approval
+ shell → echo long_argument_segment_one long_argument_segment_two
+ long_argument_segment_three long_argument_segment_four
+ long_argument_segment_five long_argument_segment_six
+ long_argument_segment_seven > marker_b.txt
+
+ ❯ Allow once
+   Deny once
+   Create allow rule to approve future similar actions
+   Create deny rule to block future similar actions
+────────────────────────────────────────────────────────────────────────────────
+ esc to close · ↑↓ to navigate · ↵ to select · Tab to edit

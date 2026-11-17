@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Kiro permission dialogs: `fs_read` (a read outside the workspace, measured on kiro-cli 3.3.0)
+  is now accepted, so `answer_dialog` can answer it. Web search and wrapped shell commands stay
+  refused. Fixtures for the new-file write, web fetch and web search keys and the wrapped shell
+  dialogs are added under `tests/fixtures/kiro-3.3.0/`.
+
 ## 0.5.0
 
 Released 2026-11-17.
