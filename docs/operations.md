@@ -1620,14 +1620,18 @@ try to update itself at run time).
   from screen text, for the pane's agent. Kiro dialogs were measured on kiro-cli 3.3.0
   (V3 engine); shell dialogs were also measured on 3.1.0. Devin
   is tested against the layouts measured on Devin CLI 3000.12.43 and 3000.12.57 for shell commands.
-  Kiro on 3.3.0, parsed (tool name before the arrow must be `shell`, `fs_write`, `mcp` or
-  `web_fetch`; `answer_dialog` returns it as `tool`): `shell`, edit of an existing file
-  (`fs_write`), MCP tool call, web fetch. Refused on purpose: web search (no `<tool> → <command>`
-  line) and a command that wraps onto continuation lines (reason "wrapped command"), because
-  only one wrapped sample at 80 columns was captured and Enter and Down were not tried on it.
-  Not measured, so refused: new-file write, reads outside the workspace, `use_aws`,
-  subagent, `knowledge`, `thinking`, `todo`, any other tool name, and Down or Esc on web
-  fetch and web search. The OSC 7501 `kind` is `permission` for every tool, so it never
+  Kiro on 3.3.0, parsed (tool name before the arrow must be `shell`, `fs_write`, `fs_read`,
+  `mcp` or `web_fetch`; `answer_dialog` returns it as `tool`): `shell`, write of a new file or
+  edit of an existing one (`fs_write`), read outside the workspace (`fs_read`; the dialog shows
+  the resolved path, and a read inside the workspace shows no dialog), MCP tool call, web fetch
+  (Enter, Down and Esc were measured). Measured and refused on purpose: web search (the dialog
+  has no `<tool> → <command>` line and shows no query) and a command that wraps onto
+  continuation lines at 80 or 130 columns (reason "wrapped command"; the whole command is on the
+  screen, but a parser rule for it was not asked for). Not offered in this Kiro build, so not
+  measurable and still refused if one ever appears: `use_aws`, subagent, a `knowledge`
+  dialog (its `show` action ran with no dialog), `todo`, and `thinking` (not a tool); any other
+  tool name is refused too. Not measured: Down and Esc on `fs_read` and on the new-file write,
+  and a write outside the workspace. The OSC 7501 `kind` is `permission` for every tool, so it never
   selects a parsing rule. The MCP dialog shows no arguments and the web fetch dialog shows
   only the host; whether those may stay approvable remotely is an open design question,
   not decided by the parser. Other programs, other versions, and `kind` values

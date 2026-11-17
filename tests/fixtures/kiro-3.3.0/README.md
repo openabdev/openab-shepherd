@@ -11,6 +11,13 @@ email, quota or credential text.
 | `fs_write-2` | same, after one Down | accept, cursor 1 |
 | `mcp-1` | `mcp → probe_mcp/probe_ping` | accept, cursor 0 |
 | `web_fetch-1` | `web_fetch → example.com` | accept, cursor 0 |
+| `fs_write_new-1` | `fs_write → new.txt` (new file) | accept, cursor 0 |
+| `fs_read_outside-1` | `fs_read → /private/etc/hosts` (resolved path kept: it is the measured fact) | accept, cursor 0 |
+| `mcp_args-1` | `mcp → probe_mcp/probe_ping` (arguments not shown) | accept, cursor 0 |
+| `web_fetch-down-1`, `web_fetch-esc-1`, `web_fetch-parallel-2` | `web_fetch → example.com` | accept, cursor 0 |
+| `web_search-parallel-1`, `web_search-esc-1` | `web_search` (no arrow) | refuse |
+| `shell_wrapped80-2`, `shell_wrapped80-3` | wrapped shell, 80 columns | refuse, "wrapped command" |
+| `shell_long130-1` | wrapped title and shell command, 130 columns | refuse, "wrapped command" |
 | `web_search-1` | `web_search` (no arrow) | refuse |
 | `shell_wrapped80-1` | `shell → …` wrapped over three continuation lines | refuse, "wrapped command" |
 
