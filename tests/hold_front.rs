@@ -248,17 +248,22 @@ fn children(parent: i32) -> Vec<(i32, String)> {
 }
 
 /// What each open descriptor of `pid` is, on Linux (for a failure message).
+/// An entry whose link cannot be read was closed between the directory read
+/// and the link read (the holder's own `/proc` reads come and go): it is no
+/// descriptor now, and is left out rather than listed with an empty target.
 fn fd_list(pid: i32) -> Vec<String> {
     let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
         return Vec::new();
     };
     let mut out: Vec<String> = dir
         .flatten()
-        .map(|e| {
-            let target = std::fs::read_link(e.path())
-                .map(|t| t.display().to_string())
-                .unwrap_or_default();
-            format!("{} -> {target}", e.file_name().to_string_lossy())
+        .filter_map(|e| {
+            let target = std::fs::read_link(e.path()).ok()?;
+            Some(format!(
+                "{} -> {}",
+                e.file_name().to_string_lossy(),
+                target.display()
+            ))
         })
         .collect();
     out.sort();
@@ -291,6 +296,23 @@ fn fd_count(pid: i32) -> Option<usize> {
             .filter(|l| l.starts_with('f') && l[1..].chars().all(|c| c.is_ascii_digit()))
             .count(),
     )
+}
+
+/// The descriptor count once it has been the same for two samples 50 ms
+/// apart (bounded 5 s), with the last listing. The holder's pane tree refresh
+/// (every 250 ms) opens and closes descriptors, so one sample can be one off;
+/// a real leak keeps growing and never settles on the baseline.
+fn settled_fd_count(pid: i32) -> Option<(usize, Vec<String>)> {
+    let mut last = fd_count(pid)?;
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let now = fd_count(pid)?;
+        if now == last || Instant::now() >= end {
+            return Some((now, fd_list(pid)));
+        }
+        last = now;
+    }
 }
 
 /// A front's own line, not the holder's quote of one.
@@ -376,17 +398,29 @@ fn fifty_sigusr2_cycles_leave_no_defunct_front_and_a_stable_fd_count() {
     let mut h = Holder::start("cycles", &["work"], &[], &[]);
     let mut at = h.wait_attached_after(0);
     let pane = h.pane_pid("work");
+    // Each front's pid comes from its own `started (pid P)` line, in order.
+    // The holder logs it just after the front may print `attached`, so the
+    // newest `started` line right after an `attach` can still be the
+    // previous front's.
+    let (mut cursor, line) = h.wait_line_from(0, "the first front started", |l| {
+        front_started_pid(l).is_some()
+    });
+    cursor += 1;
+    let mut pids = vec![front_started_pid(&line).unwrap()];
     std::thread::sleep(Duration::from_millis(300));
-    let fds_before = fd_count(h.pid());
-    let mut pids = vec![h.front_pid()];
+    let fds_before = settled_fd_count(h.pid());
     for _ in 0..50 {
         h.signal(libc::SIGUSR2);
+        let (idx, line) = h.wait_line_from(cursor, "the next front started", |l| {
+            front_started_pid(l).is_some()
+        });
+        cursor = idx + 1;
+        pids.push(front_started_pid(&line).unwrap());
         at = h.wait_attached_after(at + 1);
-        pids.push(h.front_pid());
     }
     std::thread::sleep(Duration::from_millis(300));
     let kids = children(h.pid());
-    let current = h.front_pid();
+    let current = *pids.last().unwrap();
     assert!(
         kids.iter().all(|(_, stat)| !stat.starts_with('Z')),
         "a defunct child: {kids:?}"
@@ -404,12 +438,10 @@ fn fifty_sigusr2_cycles_leave_no_defunct_front_and_a_stable_fd_count() {
     for old in &pids[..pids.len() - 1] {
         assert!(!running(*old), "the old front {old} is still around");
     }
-    if let (Some(before), Some(after)) = (fds_before, fd_count(h.pid())) {
+    if let (Some((before, listed)), Some((after, now))) = (fds_before, settled_fd_count(h.pid())) {
         assert_eq!(
-            before,
-            after,
-            "the holder's descriptors after 50 restarts; now: {:?}",
-            fd_list(h.pid())
+            before, after,
+            "the holder's descriptors after 50 restarts; before: {listed:?}; now: {now:?}"
         );
     } else {
         eprintln!("no way to count descriptors here; that check is skipped");
@@ -558,16 +590,47 @@ fn a_front_that_does_not_leave_on_sigterm_is_killed_after_five_seconds() {
     wait_gone(front1, "the stopped front");
 }
 
+/// Run `EXE args` with an empty environment and wait at most `limit`; a child
+/// that outlives it is killed and the test fails with what it had printed.
+fn run_bounded(args: &[&str], limit: Duration) -> std::process::Output {
+    let mut child = Command::new(EXE)
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let end = Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "`{}` did not exit in {limit:?}; stderr: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// Whether descriptor `fd` is open in this process.
+fn fd_open(fd: i32) -> bool {
+    // SAFETY: F_GETFD only reads the descriptor's flags.
+    unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+}
+
 #[test]
 fn the_front_subcommand_alone_and_the_bare_command_refuse_the_hidden_flags() {
-    let run = |args: &[&str]| {
-        Command::new(EXE)
-            .args(args)
-            .env_clear()
-            .stdin(Stdio::null())
-            .output()
-            .unwrap()
-    };
+    // A child inherits every descriptor that is not close-on-exec. Two
+    // numbers that are open here would be adopted by the front as its links
+    // and it would then serve forever, so use two that are closed.
+    let mut closed = (40..200).filter(|fd| !fd_open(*fd));
+    let (ops, events) = (closed.next().unwrap(), closed.next().unwrap());
+    let run = |args: &[&str]| run_bounded(args, Duration::from_secs(20));
     let out = run(&["front"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--ops-fd"));
@@ -575,9 +638,9 @@ fn the_front_subcommand_alone_and_the_bare_command_refuse_the_hidden_flags() {
     let out = run(&[
         "front",
         "--ops-fd",
-        "40",
+        &ops.to_string(),
         "--events-fd",
-        "41",
+        &events.to_string(),
         "--no-listen",
     ]);
     assert_eq!(out.status.code(), Some(1), "{:?}", out);

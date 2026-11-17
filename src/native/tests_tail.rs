@@ -122,17 +122,20 @@ fn the_single_process_host_keeps_no_tail() {
     host.end_all();
 }
 
+/// A sink that discards everything.
+struct Discard;
+
+impl HostEvents for Discard {
+    fn output(&self, _: &str, _: u64, _: &[u8]) -> bool {
+        true
+    }
+    fn idle(&self, _: &str) {}
+    fn exited(&self, _: &str, _: Option<i64>) {}
+    fn gap(&self, _: &str, _: u64) {}
+}
+
 /// A pane on `host` with a sink that discards everything.
 fn host_rig(host: &LocalHost) -> String {
-    struct Discard;
-    impl HostEvents for Discard {
-        fn output(&self, _: &str, _: u64, _: &[u8]) -> bool {
-            true
-        }
-        fn idle(&self, _: &str) {}
-        fn exited(&self, _: &str, _: Option<i64>) {}
-        fn gap(&self, _: &str, _: u64) {}
-    }
     host.set_sink(Arc::new(Discard));
     let dir = TempDir::new("tail-rig");
     let env = pty::child_env(|key| std::env::var_os(key), &[]).unwrap();
@@ -452,28 +455,47 @@ fn a_meta_write_the_host_refuses_stays_in_memory_for_the_next() {
 fn the_default_tail_is_one_mebibyte() {
     use super::host::tail::TAIL_CAP;
     assert_eq!(TAIL_CAP, 1024 * 1024);
-    let host = Arc::new(Counting::new(LocalHost::with_tail(TAIL_CAP)));
-    let b = front(&host, true);
+    // The host ring is what is under test, so the pane runs on the host with
+    // a sink that discards. Through a front, the 1.1 MiB would also go
+    // through the screen emulator on the reader thread, which a debug build
+    // takes 3 s to 10 s over (more on a loaded host) and the test needs none
+    // of it.
+    let host = LocalHost::with_tail(TAIL_CAP);
+    host.set_sink(Arc::new(Discard));
     let dir = TempDir::new("tail-1mib");
+    let env = pty::child_env(|key| std::env::var_os(key), &[]).unwrap();
     // About 1.1 MiB, in pieces, ending in a marker.
-    let info = b
-        .run(&sh(
-            "big",
-            "yes 0123456789abcdef | head -c 1153434; printf END-MARK; sleep 30",
-            &dir,
-        ))
-        .unwrap();
-    let at = eventually("the output", || {
+    let id = host
+        .spawn(SpawnReq {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "yes 0123456789abcdef | head -c 1153434; printf END-MARK; sleep 30".into(),
+            ],
+            cwd: dir.path().to_string_lossy().into_owned(),
+            env,
+        })
+        .unwrap()
+        .id;
+    let mut reached = 0;
+    let end = Instant::now() + LONG;
+    let at = loop {
         thread::sleep(Duration::from_millis(40));
-        let at = host.attach(&info.id).ok()?;
-        String::from_utf8_lossy(&at.bytes)
-            .ends_with("END-MARK")
-            .then_some(at)
-    });
+        if let Ok(at) = host.attach(&id) {
+            reached = at.bytes.len();
+            if String::from_utf8_lossy(&at.bytes).ends_with("END-MARK") {
+                break at;
+            }
+        }
+        assert!(
+            Instant::now() < end,
+            "timed out waiting for the output; the tail held {reached} bytes"
+        );
+    };
     assert_eq!(at.bytes.len(), TAIL_CAP);
     assert_eq!(at.tail_end - at.tail_start, TAIL_CAP as u64);
     assert!(at.tail_start > 0, "1.1 MiB of output wrapped a 1 MiB tail");
-    b.shutdown();
+    host.end_all();
 }
 
 // ---- issue #98, PR2: the routines key in the meta ----
