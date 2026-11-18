@@ -189,6 +189,12 @@ impl LocalHost {
         self.scans.scans()
     }
 
+    /// Test hook: every periodic look at the shared snapshot, in order.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn scan_requests(&self) -> Vec<procs::Request> {
+        self.scans.requests()
+    }
+
     /// With a tail kept, make room for one more finished pane: forget the
     /// oldest finished ones beyond the backstop.
     fn evict_finished(&self) {

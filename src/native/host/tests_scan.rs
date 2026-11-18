@@ -58,28 +58,54 @@ fn a_stop_scans_afresh_and_ends_a_child_the_shared_snapshot_missed() {
     );
 }
 
-/// Eight panes polling for descendants cost about one scan per tick, not
-/// eight. The exact count (one scan per 250 ms window) is pinned by
-/// `eight_pollers_take_exactly_one_scan_per_window` in `procs.rs`, where the
-/// clock is supplied. Real pane readers wake every 200 ms, so their looks
-/// land where the scheduler and the wake grid put them: panes started
-/// together cluster and gave 3 scans in 1.5 s. The hard limit is one scan per
-/// window, at most 7 in 1.5 s. Zero scans (no periodic look) and about 48 (no
-/// sharing) both fail.
+/// The window one scan serves. A literal, so a change to `SNAPSHOT_MAX_AGE`
+/// fails the test rather than moving its expectation with it.
+const WINDOW: Duration = Duration::from_millis(250);
+
+/// Eight panes take exactly one scan per 250 ms window. Every look the pane
+/// readers made is replayed against that rule: a look reuses the last scan
+/// when the scan began within the window and not before the look's pane was
+/// spawned, and otherwise a scan must have been taken. The expected count is
+/// the number of scans the rule gives for the looks that really happened, so
+/// it does not depend on the readers' wake timing. A doubled window, or a
+/// look that scans when it could reuse, fails.
 #[test]
 fn eight_panes_share_one_scan_per_tick() {
     let host = Arc::new(LocalHost::new());
     let rig = Rig::new(Arc::clone(&host) as Arc<dyn PtyHost>, "scan-share");
     let panes: Vec<_> = (0..8).map(|_| rig.spawn(&["sleep", "30"])).collect();
-    // Past the first look of every pane, and a few ticks in.
-    std::thread::sleep(Duration::from_millis(700));
-    let before = host.scans();
     std::thread::sleep(Duration::from_millis(1500));
-    let taken = host.scans() - before;
+    let looks = host.scan_requests();
     assert!(
-        (1..=7).contains(&taken),
-        "{taken} scans in 1.5 s for 8 panes, expected 1 to 7 (at most one per 250 ms window)"
+        looks.len() >= 8,
+        "{} looks for 8 panes: not every pane looked",
+        looks.len()
     );
+    let mut began: Option<Instant> = None;
+    let mut expected = 0;
+    for look in &looks {
+        let reusable = began
+            .is_some_and(|b| b >= look.not_before && look.at.saturating_duration_since(b) < WINDOW);
+        assert_eq!(
+            look.scanned,
+            !reusable,
+            "look at {:?} (pane spawned at {:?}): the shared snapshot rule says {}",
+            look.at,
+            look.not_before,
+            if reusable { "reuse" } else { "scan" }
+        );
+        if !reusable {
+            began = Some(look.at);
+            expected += 1;
+        }
+    }
+    assert_eq!(
+        host.scans(),
+        expected,
+        "scans taken for {} looks",
+        looks.len()
+    );
+    assert!(expected >= 1);
     for pane in &panes {
         host.kill(&pane.id, Duration::from_secs(2)).unwrap();
     }

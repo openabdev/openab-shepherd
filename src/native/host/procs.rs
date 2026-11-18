@@ -28,6 +28,9 @@ pub(crate) const SNAPSHOT_MAX_AGE: Duration = Duration::from_millis(250);
 /// process: a pid that is reused gets a later start time.
 pub(crate) type Start = u64;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use os::Request;
+
 /// The pane's known descendants (the leader itself is not a member).
 #[derive(Default)]
 pub(crate) struct Tree {
@@ -137,6 +140,12 @@ impl Shared {
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn scans(&self) -> usize {
         self.0.scans()
+    }
+
+    /// Every request this has answered, in order, and whether each scanned.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn requests(&self) -> Vec<os::Request> {
+        self.0.requests()
     }
 }
 
@@ -275,6 +284,9 @@ mod os {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
+    /// The root of the process table on Linux.
+    const PROC: &str = "/proc";
+
     pub(super) struct Stat {
         pub(super) ppid: i32,
         pub(super) pgrp: i32,
@@ -326,18 +338,33 @@ mod os {
         Failed,
     }
 
-    /// Reads `/proc/<pid>/stat` into a path and a buffer it keeps, so a scan
+    /// Reads `<root>/<pid>/stat` into a path and a buffer it keeps, so a scan
     /// of every process allocates once, not once per process.
-    #[derive(Default)]
     pub(super) struct Reader {
+        root: String,
         path: String,
         buf: Vec<u8>,
     }
 
+    impl Default for Reader {
+        fn default() -> Self {
+            Self::in_root(PROC)
+        }
+    }
+
     impl Reader {
+        /// A reader over another table with the same layout: a test seam.
+        pub(super) fn in_root(root: &str) -> Self {
+            Self {
+                root: root.to_owned(),
+                path: String::new(),
+                buf: Vec::new(),
+            }
+        }
+
         pub(super) fn read(&mut self, pid: i32) -> StatRead {
             self.path.clear();
-            if write!(self.path, "/proc/{pid}/stat").is_err() {
+            if write!(self.path, "{}/{pid}/stat", self.root).is_err() {
                 return StatRead::Failed;
             }
             self.buf.clear();
@@ -386,10 +413,16 @@ mod os {
     impl Snapshot {
         /// Scans `/proc`. The leader and the tty are not used on Linux, so
         /// the result serves every pane.
-        pub(super) fn take(_leader: i32, _tty: &mut Option<u32>) -> Self {
+        pub(super) fn take(leader: i32, tty: &mut Option<u32>) -> Self {
+            Self::take_in(PROC, leader, tty)
+        }
+
+        /// [`Snapshot::take`] over the table at `root`. A listing that
+        /// cannot be read makes the snapshot incomplete, not empty.
+        pub(super) fn take_in(root: &str, _leader: i32, _tty: &mut Option<u32>) -> Self {
             let mut listed = true;
             let mut pids = Vec::new();
-            match std::fs::read_dir("/proc") {
+            match std::fs::read_dir(root) {
                 Ok(entries) => {
                     for entry in entries {
                         match entry {
@@ -408,7 +441,7 @@ mod os {
                 }
                 Err(_) => listed = false,
             }
-            let mut reader = Reader::default();
+            let mut reader = Reader::in_root(root);
             Self::build(pids, listed, |pid| reader.read(pid))
         }
 
@@ -475,13 +508,26 @@ mod os {
         }
     }
 
-    /// The newest scan and when it began. One scan serves every reader that
-    /// asks within `max_age`; the lock is held across the scan, so readers
-    /// that arrive meanwhile wait for it instead of each taking their own.
+    /// One request to [`Shared::snapshot_at`] and what it decided.
+    #[cfg(test)]
+    #[derive(Clone, Copy)]
+    pub(crate) struct Request {
+        pub(crate) at: Instant,
+        pub(crate) not_before: Instant,
+        pub(crate) scanned: bool,
+    }
+
+    /// The newest complete scan and when it began. One scan serves every
+    /// reader that asks within `max_age`; the lock is held across the scan,
+    /// so readers that arrive meanwhile wait for it instead of each taking
+    /// their own.
     pub(super) struct Shared {
         max_age: Duration,
         last: Mutex<Option<(Instant, Arc<Snapshot>)>>,
         scans: AtomicUsize,
+        /// Every request in order, for the exact-count test.
+        #[cfg(test)]
+        requests: Mutex<Vec<Request>>,
     }
 
     impl Shared {
@@ -490,13 +536,16 @@ mod os {
                 max_age,
                 last: Mutex::new(None),
                 scans: AtomicUsize::new(0),
+                #[cfg(test)]
+                requests: Mutex::new(Vec::new()),
             }
         }
 
-        /// A scan that began at or after `not_before` and less than
-        /// `max_age` before `now`, taking one if there is none. A scan that
-        /// is not complete is returned to its caller but not kept, so the
-        /// next reader takes a fresh one.
+        /// A complete scan that began at or after `not_before` and less than
+        /// `max_age` before `now` is reused; otherwise a new scan is taken.
+        /// An incomplete scan is returned to its caller only and never kept.
+        /// It does not replace an older complete scan, so a later reader may
+        /// still reuse that older one while it is within `max_age`.
         pub(super) fn snapshot(
             &self,
             leader: i32,
@@ -515,22 +564,52 @@ mod os {
             take: impl FnOnce() -> Snapshot,
         ) -> Arc<Snapshot> {
             let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some((began, snap)) = &*last {
-                if *began >= not_before && now.saturating_duration_since(*began) < self.max_age {
-                    return Arc::clone(snap);
+            let reused = match &*last {
+                Some((began, snap))
+                    if *began >= not_before
+                        && now.saturating_duration_since(*began) < self.max_age =>
+                {
+                    Some(Arc::clone(snap))
                 }
-            }
-            let snap = Arc::new(take());
-            self.scans.fetch_add(1, Ordering::Relaxed);
-            if snap.complete() {
-                *last = Some((now, Arc::clone(&snap)));
-            }
+                _ => None,
+            };
+            #[cfg(test)]
+            let scanned = reused.is_none();
+            let snap = match reused {
+                Some(snap) => snap,
+                None => {
+                    let snap = Arc::new(take());
+                    self.scans.fetch_add(1, Ordering::Relaxed);
+                    if snap.complete() {
+                        *last = Some((now, Arc::clone(&snap)));
+                    }
+                    snap
+                }
+            };
+            #[cfg(test)]
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Request {
+                    at: now,
+                    not_before,
+                    scanned,
+                });
             snap
         }
 
         #[cfg(test)]
         pub(super) fn scans(&self) -> usize {
             self.scans.load(Ordering::Relaxed)
+        }
+
+        /// Every request so far, in order.
+        #[cfg(test)]
+        pub(super) fn requests(&self) -> Vec<Request> {
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
         }
     }
 }
@@ -972,6 +1051,55 @@ mod tests {
                     .snapshot_at(t0 + at, not_before, || Snapshot::of(std::iter::empty()));
             }
             assert_eq!(shared.scans(), 6);
+        }
+
+        /// A listing that cannot be read (here `/proc` does not exist under
+        /// the root) is a degraded scan: it finds nothing, so it must not
+        /// prune any pane, and it is not kept.
+        #[test]
+        fn a_missing_listing_is_degraded_and_prunes_no_pane_member() {
+            let fx = Fixture::new("procs-no-listing");
+            let mut tree = Tree::default();
+            assert_eq!(tree.refresh(fx.pid()), 4);
+            let before = sorted(&tree);
+            let dir = crate::testutil::TempDir::new("procs-no-listing-root");
+            let missing = dir.path().join("no-such-proc");
+            let degraded = Snapshot::take_in(missing.to_str().unwrap(), fx.pid(), &mut None);
+            assert!(!degraded.complete());
+            assert_eq!(tree.apply(fx.pid(), &degraded), 0);
+            assert_eq!(sorted(&tree), before);
+            let shared = Shared::with_max_age(Duration::from_secs(3600));
+            let t0 = Instant::now();
+            let not_before = t0 - Duration::from_secs(60);
+            shared.0.snapshot_at(t0, not_before, || {
+                Snapshot::take_in(missing.to_str().unwrap(), 0, &mut None)
+            });
+            let next = shared.0.snapshot_at(t0, not_before, || {
+                Snapshot::take_in(missing.to_str().unwrap(), 0, &mut None)
+            });
+            assert!(!next.complete());
+            assert_eq!(shared.scans(), 2, "a degraded scan was reused");
+        }
+
+        /// Every read fails with an error that is not "gone" (a directory
+        /// where `stat` should be fails with EISDIR, as a read does when a
+        /// descriptor is not usable). The listing works, so the scan is
+        /// degraded, and the pane keeps every member it had.
+        #[test]
+        fn a_failed_read_on_disk_prunes_no_pane_member() {
+            let fx = Fixture::new("procs-eisdir");
+            let mut tree = Tree::default();
+            assert_eq!(tree.refresh(fx.pid()), 4);
+            let before = sorted(&tree);
+            let dir = crate::testutil::TempDir::new("procs-eisdir-root");
+            for &pid in &fx.members {
+                std::fs::create_dir_all(dir.path().join(pid.to_string()).join("stat")).unwrap();
+            }
+            let root = dir.path().to_str().unwrap();
+            let degraded = Snapshot::take_in(root, fx.pid(), &mut None);
+            assert!(!degraded.complete());
+            assert_eq!(tree.apply(fx.pid(), &degraded), 0);
+            assert_eq!(sorted(&tree), before);
         }
 
         /// A degraded scan (a read failed, here every read) is handed to its
