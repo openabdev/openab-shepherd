@@ -13,7 +13,7 @@
 # test. A frozen VM stops the heartbeat; a hung test keeps it going with a stale
 # "last finished". If no test finishes for $HANG_SECS (300) the script dumps
 # `ps`, `lsof` and (macOS) `sample` into $CI_LOG_DIR/diagnostics.txt and to the
-# log, kills the test's process group with SIGKILL and exits 1 with a line
+# log, kills the test and its process tree with SIGKILL and exits 1 with a line
 # `HANG: no progress for <n> s in <binary>; last finished: <line>`.
 # The same dump runs when the step is cancelled (SIGINT/SIGTERM).
 #
@@ -21,7 +21,6 @@
 # bounded: the polling loop ends when the process exits or the hang rule fires,
 # and each diagnostic command runs under a kill timer.
 set -uo pipefail
-set -m # one process group per background job, so a hang can be killed whole
 
 list=${1:-}
 doc=no
@@ -66,7 +65,9 @@ bounded() {
   return $rc
 }
 
-# Pids of the test process, its descendants and everything still in its group.
+# Pids of the test process and its descendants. The test runs in the wrapper's
+# own group (no `set -m`, issue #123: a separate group was hit by SIGHUP on hosted
+# macOS), so the tree is followed by parent pid.
 tree_pids() {
   ps -axo pid=,ppid=,pgid= 2> /dev/null | awk -v root="$1" '
     { n++; pid[n] = $1; par[$1] = $2; grp[$1] = $3 }
@@ -154,10 +155,10 @@ dump_diagnostics() {
 }
 
 kill_group() {
-  local pid=$1
-  kill -KILL -- "-$pid" 2> /dev/null
+  local pid=$1 ids
+  ids=$(tree_pids "$pid") # before any kill: orphans would leave the tree
+  for p in $ids; do kill -KILL "$p" 2> /dev/null; done
   kill -KILL "$pid" 2> /dev/null
-  for p in $(tree_pids "$pid"); do kill -KILL "$p" 2> /dev/null; done
   wait "$pid" 2> /dev/null
 }
 
