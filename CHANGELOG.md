@@ -7,6 +7,12 @@
   refused. Fixtures for the new-file write, web fetch and web search keys and the wrapped shell
   dialogs are added under `tests/fixtures/kiro-3.3.0/`.
 
+### Added
+
+- A task ledger module (`src/ledger/`, `docs/ledger.md`): dispatch states, an append-only fsynced event
+  log with replay and crash recovery to `delivery_unknown`, and a pure matching rule for worker
+  completion records. Self-contained and not wired into the server; no behavior changes.
+
 ## 0.5.0
 
 Released 2026-11-17.
