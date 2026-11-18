@@ -286,32 +286,34 @@ mod os {
         std::str::from_utf8(token).ok()?.parse().ok()
     }
 
-    /// The fields of one `/proc/<pid>/stat` line, or None for a zombie, a
-    /// dead process, or a line that is cut short. Read in place: no
-    /// allocation. Bytes, not text, so a command name that is not UTF-8
-    /// does not hide the process.
-    pub(super) fn parse_stat(line: &[u8]) -> Option<Stat> {
+    /// The fields of one `/proc/<pid>/stat` line: `Ok(Some)` for a process,
+    /// `Ok(None)` for a zombie or dead one, and `Err` for a line that is not
+    /// a stat line (cut short or malformed). Read in place: no allocation.
+    /// Bytes, not text, so a command name that is not UTF-8 does not hide the
+    /// process.
+    pub(super) fn parse_stat(line: &[u8]) -> Result<Option<Stat>, ()> {
         // The command name may hold spaces and parentheses: fields start
         // after the last ')'.
-        let rest = &line[line.iter().rposition(|&b| b == b')')? + 1..];
-        let mut fields = rest
+        let after = line.iter().rposition(|&b| b == b')').ok_or(())?;
+        let mut fields = line[after + 1..]
             .split(|b| b.is_ascii_whitespace())
             .filter(|field| !field.is_empty());
         // The first field is field 3 of proc(5): state, ppid, pgrp, session,
         // ..., starttime (field 22, the 16th field after session).
-        if matches!(fields.next()?, b"Z" | b"X") {
-            return None;
+        let state = fields.next().ok_or(())?;
+        if matches!(state, b"Z" | b"X") {
+            return Ok(None);
         }
-        let ppid = int(fields.next()?)?;
-        let pgrp = int(fields.next()?)?;
-        let session = int(fields.next()?)?;
-        let start = int(fields.nth(15)?)?;
-        Some(Stat {
+        let ppid = int(fields.next().ok_or(())?).ok_or(())?;
+        let pgrp = int(fields.next().ok_or(())?).ok_or(())?;
+        let session = int(fields.next().ok_or(())?).ok_or(())?;
+        let start = int(fields.nth(15).ok_or(())?).ok_or(())?;
+        Ok(Some(Stat {
             ppid,
             pgrp,
             session,
             start,
-        })
+        }))
     }
 
     /// What one read of `/proc/<pid>/stat` found. `Gone` is normal (the
@@ -340,7 +342,12 @@ mod os {
             }
             self.buf.clear();
             match File::open(&self.path).and_then(|mut f| f.read_to_end(&mut self.buf)) {
-                Ok(_) => parse_stat(&self.buf).map_or(StatRead::Gone, StatRead::Stat),
+                Ok(_) if self.buf.is_empty() => StatRead::Gone,
+                Ok(_) => match parse_stat(&self.buf) {
+                    Ok(Some(stat)) => StatRead::Stat(stat),
+                    Ok(None) => StatRead::Gone,
+                    Err(()) => StatRead::Failed,
+                },
                 Err(err) if matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
                     StatRead::Gone
                 }
@@ -729,7 +736,22 @@ mod tests {
         }
 
         fn fields(bytes: &[u8]) -> Option<(i32, i32, i32, u64)> {
-            parse_stat(bytes).map(|s| (s.ppid, s.pgrp, s.session, s.start))
+            parse_stat(bytes)
+                .ok()
+                .flatten()
+                .map(|s| (s.ppid, s.pgrp, s.session, s.start))
+        }
+
+        /// A zombie is gone; a line that is not a stat line is an unreadable
+        /// process, so the snapshot is incomplete and keeps its members.
+        #[test]
+        fn an_unparseable_line_is_a_failed_read_not_a_gone_process() {
+            assert!(matches!(parse_stat(&line(7, b"z", "Z")), Ok(None)));
+            assert!(matches!(
+                parse_stat(b"7 (sleep) S x 20 30 1 2 3 4 5 6 7 8 9 10 11 12 13 4242"),
+                Err(())
+            ));
+            assert!(matches!(parse_stat(b""), Err(())));
         }
 
         #[test]

@@ -78,7 +78,10 @@ which answers a permission dialog may receive.
 - **Process-tree cleanup.** `remove_pane`, a program's own exit and Shepherd's
   shutdown signal the pane's process group and every descendant Shepherd has seen,
   then kill what is left. Descendants are found by looking at the process table
-  about every 250 ms, so a process that fully detaches faster than that is missed
+  about every 250 ms (up to about 450 ms apart), so a process that fully detaches
+  before the next look is missed. On Linux a look may use a snapshot up to 250 ms
+  old: a descendant is seen within about 500 ms nominal and at most about 700 ms.
+  On macOS the bound is about 450 ms
   (see [Status and known limits](#status-and-known-limits)).
 - **Container image.** The `Dockerfile` builds a Debian image that runs as uid 1000
   under tini, with kiro-cli pinned to 3.3.0 (the version the Kiro dialog parser was measured on) and checked against a SHA-256. The image
@@ -220,8 +223,10 @@ is in [docs/adr/restart-survival-and-shared-panes.md](docs/adr/restart-survival-
   `deny_once` is answered with Esc; `allow_once` presses Enter only when the styled
   screen cells show `Allow once` with a background that differs from the other two options, which match each other.
 - **A fast detached descendant escapes cleanup.** A descendant that is re-parented
-  and fully detaches (new session, no terminal, parents gone) within the 250 ms
-  between looks at the process table is never seen and survives. macOS has no
+  and fully detaches (new session, no terminal, parents gone) before the first look
+  at the process table that would see it is never seen and survives. That look comes
+  within about 500 ms nominal and at most about 700 ms on Linux, and about 450 ms on
+  macOS. macOS has no
   unprivileged way to close this gap. On Linux the holder is deliberately not a subreaper;
   an orphan that escapes the scan is reaped by PID 1 (tini in the image).
 - **Panes survive a server restart only under `hold`.** A bare `openab-shepherd` owns

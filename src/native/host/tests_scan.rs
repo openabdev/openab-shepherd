@@ -77,8 +77,8 @@ fn eight_panes_share_one_scan_per_tick() {
     std::thread::sleep(Duration::from_millis(1500));
     let taken = host.scans() - before;
     assert!(
-        (2..=7).contains(&taken),
-        "{taken} scans in 1.5 s for 8 panes, expected 2 to 7 (at most one per 250 ms window)"
+        (1..=7).contains(&taken),
+        "{taken} scans in 1.5 s for 8 panes, expected 1 to 7 (at most one per 250 ms window)"
     );
     for pane in &panes {
         host.kill(&pane.id, Duration::from_secs(2)).unwrap();

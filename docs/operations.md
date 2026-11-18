@@ -807,9 +807,13 @@ Pane ids are `n:<k>`
   panes, and a pane may use a read up to 250 ms old. A look is nominally every
   250 ms, and up to about 450 ms apart because the reader wakes every 200 ms. So a
   descendant is seen within about 500 ms nominal and at most about 700 ms (see
-  Known limits). A stop always reads it afresh. Removing a pane (`remove_pane`)
-  and Shepherd's exit on SIGINT, SIGTERM or SIGHUP send SIGHUP and SIGTERM to the
-  group and the descendants, wait
+  Known limits). A stop always reads it afresh. The snapshot lists every process
+  on the host, so its memory grows with the host's process count (about 0.9 MiB
+  more than the base at 302 processes). A scan that cannot read every process is
+  not kept, and it prunes nothing: under a lasting read failure a tree keeps a
+  member until a complete scan no longer lists it. Each signal still re-checks the
+  start time. Removing a pane (`remove_pane`) and Shepherd's exit on SIGINT,
+  SIGTERM or SIGHUP send SIGHUP and SIGTERM to the group and the descendants, wait
   up to 2 s (for `remove_pane`, its `timeout`), then stop (SIGSTOP) the group and
   descendants until no new one appears and SIGKILL them all. When the program exits
   on its own, what it left behind gets the same treatment at once. The leader stays
