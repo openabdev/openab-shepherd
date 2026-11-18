@@ -1250,7 +1250,16 @@ fn a_failed_write_refuses_the_change_and_leaves_state_unchanged() {
 
         // Reopening replays whatever is durable and works again.
         let (mut l2, _) = open_mem(&store);
-        assert!(l2.get(&id("a")).is_some());
+        // A record that may have reached the disk before the failed sync
+        // recovers as delivery_unknown, never as ready or done.
+        let after = state_of(&l2, "a");
+        assert!(
+            after == State::Ready || after == State::DeliveryUnknown,
+            "{after:?}"
+        );
+        if !sync_fails {
+            assert_eq!(after, State::Ready);
+        }
         l2.create(new_dispatch("b", "s1", 0, &[])).unwrap();
     }
 }
@@ -1335,7 +1344,21 @@ fn file_store_round_trip_mode_and_single_writer() {
     assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     drop(l);
 
-    let (l2, rec2) = Ledger::open(FileStore::open(&path).unwrap(), system_clock()).unwrap();
+    // A child forked by another test (pre_exec) holds a copy of the locked
+    // descriptor until it execs, so the lock can stay busy for a moment after
+    // the drop. Retry a busy lock briefly; any other error fails at once.
+    let mut tries = 0;
+    let store2 = loop {
+        match FileStore::open(&path) {
+            Ok(s) => break s,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock && tries < 200 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => panic!("reopen failed: {e}"),
+        }
+    };
+    let (l2, rec2) = Ledger::open(store2, system_clock()).unwrap();
     assert_eq!(rec2.records, 3);
     assert_eq!(l2.get(&id("a")).unwrap().state, State::Delivered);
 }

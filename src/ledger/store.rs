@@ -29,6 +29,10 @@ pub trait Store {
 /// the path is refused. The mode applies when the file is created: a file that
 /// already exists keeps its mode. Local filesystem and cooperating writers
 /// only, because `flock` does not exclude writers on some network filesystems.
+///
+/// A process that forks and runs code before `exec` holds a copy of the locked
+/// descriptor until the `exec`. A reopen right after a drop can therefore see a
+/// busy lock for a moment; callers that fork should retry `WouldBlock` briefly.
 pub struct FileStore {
     file: File,
     /// Length of the last durable record boundary.
