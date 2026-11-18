@@ -809,10 +809,13 @@ Pane ids are `n:<k>`
   descendant is seen within about 500 ms in the nominal case, and at most about
   700 ms provided each scan finishes within the 250 ms age limit (see Known
   limits). A stop always reads it afresh. The snapshot lists every process
-  on the host, so its memory grows with the host's process count (about 0.9 MiB
-  more than the base at 302 processes). A scan that cannot read every process is
-  not kept, and it prunes nothing: under a lasting read failure a tree keeps a
-  member until a complete scan no longer lists it. Each signal still re-checks the
+  on the host, so its memory grows with the host's process count (measured on
+  the Linux build host at 302 processes: about 720 KiB more than the isolated
+  base run and about 864 KiB more than the concurrent base run). A scan that
+  cannot read every process is not kept, and it prunes nothing: under a lasting
+  read failure a tree keeps a member until a complete scan no longer lists it.
+  While the failure lasts, no scan is kept, so each pane's look takes its own
+  scan, as it did before this change. Each signal still re-checks the
   start time. Removing a pane (`remove_pane`) and Shepherd's exit on SIGINT,
   SIGTERM or SIGHUP send SIGHUP and SIGTERM to the group and the descendants, wait
   up to 2 s (for `remove_pane`, its `timeout`), then stop (SIGSTOP) the group and
@@ -1663,8 +1666,8 @@ try to update itself at run time).
   detaches (calls `setsid`, so it has no group, session or terminal link to the
   pane, and its parents exit) before the first look that would see it, is never
   seen. That look comes at most about 700 ms after the fork on Linux, provided each
-  scan finishes within 250 ms, and about 450 ms on macOS. It survives `remove_pane`, the program's own exit,
-  and Shepherd's shutdown. One that only changes process group, or stays under a
+  scan finishes within 250 ms, and about 450 ms on macOS. It survives
+  `remove_pane`, the program's own exit, and Shepherd's shutdown. One that only changes process group, or stays under a
   live parent until the next look, is ended (issue #10). macOS offers no
   unprivileged way to close this: kqueue `NOTE_TRACK` answers `ENOTSUP`, only root
   can create a coalition, and there is no subreaper or cgroup (measured on macOS

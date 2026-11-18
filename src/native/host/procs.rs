@@ -542,21 +542,27 @@ mod os {
         }
 
         /// A complete scan that began at or after `not_before` and less than
-        /// `max_age` before `now` is reused; otherwise a new scan is taken.
-        /// An incomplete scan is returned to its caller only and never kept.
-        /// It does not replace an older complete scan, so a later reader may
-        /// still reuse that older one while it is within `max_age`.
+        /// `max_age` before the time the lock was taken is reused; otherwise a
+        /// new scan is taken. The age is read after the lock, so a reader that
+        /// waited for another's scan judges the snapshot at the moment it uses
+        /// it. An incomplete scan is returned to its caller only and never
+        /// kept. It does not replace an older complete scan, so a later reader
+        /// may still reuse that older one while it is within `max_age`.
         pub(super) fn snapshot(
             &self,
             leader: i32,
             tty: &mut Option<u32>,
             not_before: Instant,
         ) -> Arc<Snapshot> {
-            self.snapshot_at(Instant::now(), not_before, || Snapshot::take(leader, tty))
+            let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+            self.reuse_or_take(&mut last, Instant::now(), not_before, || {
+                Snapshot::take(leader, tty)
+            })
         }
 
         /// [`Shared::snapshot`] with the time and the scan supplied, so the
         /// age limit can be tested exactly.
+        #[cfg(test)]
         pub(super) fn snapshot_at(
             &self,
             now: Instant,
@@ -564,6 +570,17 @@ mod os {
             take: impl FnOnce() -> Snapshot,
         ) -> Arc<Snapshot> {
             let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+            self.reuse_or_take(&mut last, now, not_before, take)
+        }
+
+        /// The decision of [`Shared::snapshot`], made under the lock.
+        fn reuse_or_take(
+            &self,
+            last: &mut Option<(Instant, Arc<Snapshot>)>,
+            now: Instant,
+            not_before: Instant,
+            take: impl FnOnce() -> Snapshot,
+        ) -> Arc<Snapshot> {
             let reused = match &*last {
                 Some((began, snap))
                     if *began >= not_before

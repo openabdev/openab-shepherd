@@ -7,8 +7,9 @@
 //! lock across a sleep, a poll or a wait, except the condvar waits, which
 //! release `state`. The shared process-table snapshot (`procs::Shared`) has a
 //! lock of its own, taken under a pane's `tree` and never with anything else
-//! held; only the readers' periodic look uses it, never a stop. The registry lock is held only to look a pane up or
-//! change the list, never across a call into the sink or a wait.
+//! held; only the readers' periodic look uses it, never a stop. The registry
+//! lock is held only to look a pane up or change the list, never across a call
+//! into the sink or a wait.
 
 use super::tail::TailRing;
 use super::{

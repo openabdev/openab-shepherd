@@ -82,8 +82,7 @@ which answers a permission dialog may receive.
   before the next look is missed. On Linux a look may use a snapshot up to 250 ms
   old: a descendant is seen within about 500 ms in the nominal case, and at most
   about 700 ms provided each scan finishes within 250 ms. On macOS the bound is
-  about 450 ms
-  (see [Status and known limits](#status-and-known-limits)).
+  about 450 ms (see [Status and known limits](#status-and-known-limits)).
 - **Container image.** The `Dockerfile` builds a Debian image that runs as uid 1000
   under tini, with kiro-cli pinned to 3.3.0 (the version the Kiro dialog parser was measured on) and checked against a SHA-256. The image
   holds no token and no profiles file. Its default command runs the pane holder

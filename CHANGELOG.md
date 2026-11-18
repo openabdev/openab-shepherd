@@ -10,8 +10,8 @@
   not once per pane, so idle CPU for eight panes drops. The cost is detection latency. A
   descendant that detaches with `setsid` and whose parents exit is now seen within about 500 ms
   in the nominal case, and at most about 700 ms provided each scan finishes within 250 ms (it was
-  about 250 ms nominal). On macOS the bound stays about 450 ms. Stops still read the table afresh, and a failed read never removes a process from a
-  pane's tree.
+  about 250 ms nominal). On macOS the bound stays about 450 ms. Stops still read the table afresh,
+  and a failed read never removes a process from a pane's tree.
 - Native panes: a process whose command name is not valid UTF-8 is now trackable, so it is found
   and, on `remove_pane` or shutdown, signalled. Before, it escaped the descendant tree and survived.
 
