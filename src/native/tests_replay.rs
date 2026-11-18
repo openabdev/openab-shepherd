@@ -254,11 +254,6 @@ fn front_with(host: &Arc<Rec>, config: NativeConfig) -> NativeBackend {
     )
 }
 
-/// The nudge pause of the tests that must tolerate a slow program: above the
-/// 0.4 s answer of the slow-answer test plus the scheduling delay of a program
-/// on a starved host (1.5 s failed 1 of 300 loaded runs at load 52 on 4 cores).
-const SLOW_NUDGE_PAUSE: Duration = Duration::from_millis(3000);
-
 /// A host and the front over it. `kill_front` drops the front and keeps the
 /// host and its panes; `new_front` starts another one and adopts.
 struct Split {
@@ -266,8 +261,6 @@ struct Split {
     front: Option<NativeBackend>,
     /// What every front of this split is built with.
     config: NativeConfig,
-    /// The nudge pause of every front of this split, when a test sets one.
-    nudge_pause: Option<Duration>,
 }
 
 impl Split {
@@ -282,16 +275,7 @@ impl Split {
             host,
             front,
             config,
-            nudge_pause: None,
         }
-    }
-
-    /// Give every front of this split a nudge pause above what a slow
-    /// program under load needs to answer the smaller size.
-    fn with_nudge_pause(mut self, pause: Duration) -> Self {
-        self.nudge_pause = Some(pause);
-        self.b().set_nudge_pause(pause);
-        self
     }
 
     fn b(&self) -> &NativeBackend {
@@ -309,9 +293,6 @@ impl Split {
         assert!(self.front.is_none(), "kill the front first");
         self.host.connect();
         let front = front_with(&self.host, self.config.clone());
-        if let Some(pause) = self.nudge_pause {
-            front.set_nudge_pause(pause);
-        }
         let adoption = front.adopt().unwrap();
         self.front = Some(front);
         adoption
@@ -989,7 +970,7 @@ fn replaying_queries_writes_nothing_and_a_live_query_is_still_answered() {
 
 #[test]
 fn the_nudge_shrinks_and_restores_the_terminal_and_a_repaint_releases_the_pane() {
-    let mut s = Split::new(4096).with_nudge_pause(SLOW_NUDGE_PAUSE);
+    let mut s = Split::new(4096);
     let script = "yes 0123456789 | head -c 20000; n=0; \
          trap 'n=$((n+1)); if [ $n -ge 2 ]; then printf REPAINT-$n; fi' WINCH; \
          echo READY; while :; do sleep 0.02; done";
@@ -1020,7 +1001,7 @@ fn the_nudge_shrinks_and_restores_the_terminal_and_a_repaint_releases_the_pane()
 
 #[test]
 fn a_repaint_that_answers_the_smaller_size_does_not_release_the_pane() {
-    let mut s = Split::new(4096).with_nudge_pause(SLOW_NUDGE_PAUSE);
+    let mut s = Split::new(4096);
     // Paints once, on the first resize (the one-row-smaller one).
     let script = "yes 0123456789 | head -c 20000; \
          trap 'printf PAINT-SMALL; trap - WINCH' WINCH; \
@@ -1042,16 +1023,16 @@ fn a_repaint_that_answers_the_smaller_size_does_not_release_the_pane() {
     );
 }
 
-/// A program that answers the smaller size 0.4 s late, as one on a starved
-/// host can. The test pause (3 s) is well above that, so the answer is
-/// taken for what it is and the pane stays replayed.
-#[test]
-fn a_slow_answer_to_the_smaller_size_is_still_not_a_release_with_a_longer_pause() {
-    let mut s = Split::new(4096).with_nudge_pause(SLOW_NUDGE_PAUSE);
-    let script = "yes 0123456789 | head -c 20000; \
-         trap 'sleep 0.4; printf PAINT-SMALL; trap - WINCH' WINCH; \
-         echo READY; while :; do sleep 0.02; done";
-    let (info, _dir) = s.run("p", script);
+/// Programs that answer the smaller size late, as one on a starved host
+/// can. The nudge waits for the answer, so the pane stays replayed.
+fn slow_answer_keeps_the_pane_replayed(delay: &str) {
+    let mut s = Split::new(4096);
+    let script = format!(
+        "yes 0123456789 | head -c 20000; \
+         trap 'sleep {delay}; printf PAINT-SMALL; trap - WINCH' WINCH; \
+         echo READY; while :; do sleep 0.02; done"
+    );
+    let (info, _dir) = s.run("p", &script);
     wait_screen(s.b(), &info, "READY");
     wait_wrapped(&s.host, &info);
     s.kill_front();
@@ -1060,28 +1041,18 @@ fn a_slow_answer_to_the_smaller_size_is_still_not_a_release_with_a_longer_pause(
     thread::sleep(Duration::from_millis(800));
     assert!(
         is_replayed(s.b(), &info),
-        "a 0.4 s answer to the 119-row size must not release"
+        "a {delay} s answer to the 119-row size must not release"
     );
 }
 
-/// Documents the default (150 ms, unchanged): an answer slower than the
-/// pause counts as the answer to the return resize and releases the pane.
-/// A follow-up issue tracks the heuristic; this test pins today's behavior.
 #[test]
-fn with_the_default_pause_an_answer_slower_than_it_releases_the_pane_early() {
-    let mut s = Split::new(4096);
-    let script = "yes 0123456789 | head -c 20000; \
-         trap 'sleep 0.4; printf PAINT-SMALL; trap - WINCH' WINCH; \
-         echo READY; while :; do sleep 0.02; done";
-    let (info, _dir) = s.run("p", script);
-    wait_screen(s.b(), &info, "READY");
-    wait_wrapped(&s.host, &info);
-    s.kill_front();
-    s.new_front();
-    wait_screen(s.b(), &info, "PAINT-SMALL");
-    eventually("the early release", || {
-        (!is_replayed(s.b(), &info)).then_some(())
-    });
+fn a_slow_answer_of_0_4_s_to_the_smaller_size_does_not_release_the_pane() {
+    slow_answer_keeps_the_pane_replayed("0.4");
+}
+
+#[test]
+fn a_slow_answer_of_1_s_to_the_smaller_size_does_not_release_the_pane() {
+    slow_answer_keeps_the_pane_replayed("1");
 }
 
 #[test]

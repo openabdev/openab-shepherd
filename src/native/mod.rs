@@ -108,10 +108,10 @@ const READ_SYNC_WAIT: Duration = Duration::from_millis(150);
 const INTERRUPT_DEFAULT: Duration = Duration::from_secs(10);
 /// How often interrupt re-reads the foreground group.
 const INTERRUPT_POLL: Duration = Duration::from_millis(50);
-/// How long an adopted pane keeps the one-row-smaller terminal before the
-/// return resize, so a program that repaints on SIGWINCH has painted the
-/// smaller size by the time the offset that counts is taken.
-const NUDGE_PAUSE: Duration = Duration::from_millis(150);
+/// The most an adopted pane keeps the one-row-smaller terminal while the
+/// nudge waits for the program to answer it (first output, then quiet for
+/// `SETTLE_QUIET`). A program that never answers costs this once per adoption.
+const NUDGE_MAX: Duration = Duration::from_secs(3);
 
 const CAPABILITIES: Capabilities = Capabilities {
     conditional_input: true,
@@ -177,10 +177,6 @@ struct Inner {
     /// would. Catches state that adoption forgets.
     #[cfg(test)]
     readopt: AtomicBool,
-    /// Test rig: the pause of the nudge, in milliseconds. Not a setting: a
-    /// build outside the tests always uses `NUDGE_PAUSE`.
-    #[cfg(test)]
-    nudge_pause_ms: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -307,8 +303,6 @@ impl NativeBackend {
                 leave_on_drop: AtomicBool::new(false),
                 #[cfg(test)]
                 readopt: AtomicBool::new(false),
-                #[cfg(test)]
-                nudge_pause_ms: std::sync::atomic::AtomicU64::new(NUDGE_PAUSE.as_millis() as u64),
             }),
         }
     }
@@ -320,14 +314,6 @@ impl NativeBackend {
         client: Arc<host::client::HolderClient>,
     ) -> Self {
         Self::with_host_meta(config, Box::new(|key| std::env::var_os(key)), client, true)
-    }
-
-    /// Test rig: how long the nudge waits before the return resize.
-    #[cfg(test)]
-    fn set_nudge_pause(&self, pause: Duration) {
-        self.inner
-            .nudge_pause_ms
-            .store(pause.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Drop the pane from the table and adopt it from the host again.
@@ -644,28 +630,28 @@ impl Inner {
 }
 
 impl Inner {
-    /// Make each pane repaint: shrink its terminal by one row, give the
-    /// program a moment, then restore the size. Only the terminal changes;
+    /// Make each pane repaint: shrink its terminal by one row, wait for the
+    /// program to answer (output, then quiet), then restore the size. Only the terminal changes;
     /// the emulator of an adopted pane is new, at 200x120. Output at or after the offset
     /// the host has when the return resize goes out clears `replayed`, so a
     /// repaint answering the smaller size never does.
     fn nudge(&self, panes: &[Arc<Pane>]) {
         let mut shrunk = Vec::new();
         for pane in panes {
+            let base = pane.lock_state().map_or(0, |st| st.fed_end);
             match self.host.resize(&pane.id, COLS, ROWS - 1) {
-                Ok(()) => shrunk.push(pane),
+                Ok(()) => shrunk.push((pane, base)),
                 Err(err) => eprintln!("openab-shepherd: native: {}: nudge failed: {err}", pane.id),
             }
         }
         if shrunk.is_empty() {
             return;
         }
-        #[cfg(test)]
-        let pause = Duration::from_millis(self.nudge_pause_ms.load(Ordering::Relaxed));
-        #[cfg(not(test))]
-        let pause = NUDGE_PAUSE;
-        thread::sleep(pause);
-        for pane in shrunk {
+        let end = Instant::now() + NUDGE_MAX;
+        for (pane, base) in &shrunk {
+            pane.await_answer(*base, end);
+        }
+        for (pane, _) in shrunk {
             match self.host.attach(&pane.id) {
                 Ok(now) => {
                     let mut st = pane.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1026,6 +1012,33 @@ impl Pane {
             }
         }
         Ok(())
+    }
+
+    /// Wait for the program's answer to a resize: output past `base`, then
+    /// quiet for `SETTLE_QUIET`, until `end` at the latest or the pane exits.
+    fn await_answer(&self, base: u64, end: Instant) {
+        let Ok(mut st) = self.lock_state() else {
+            return;
+        };
+        loop {
+            let now = Instant::now();
+            if now >= end || !st.live {
+                return;
+            }
+            let wait = if st.fed_end > base {
+                let quiet_until = st.last_output + SETTLE_QUIET;
+                if now >= quiet_until {
+                    return;
+                }
+                quiet_until.min(end) - now
+            } else {
+                end - now
+            };
+            st = match self.wait_changed(st, wait) {
+                Ok(st) => st,
+                Err(_) => return,
+            };
+        }
     }
 
     /// Wait until the pane has been quiet for 100 ms since `pasted` (or its
