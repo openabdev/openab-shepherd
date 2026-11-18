@@ -19,7 +19,7 @@ For `kiro`, `devin` or `opencode` (one per run):
 2. Compares `<cli> --version` with the version pinned in the repository's `Dockerfile`
    (`KIRO_CLI_VERSION`, `DEVIN_CLI_VERSION`; OpenCode has no pin, and its parser was measured on
    2.2.7). A different version is a notice, not a failure: the result then describes the new version.
-3. Starts a loopback Shepherd on port 8769 with a throwaway token, a clients file that grants only
+3. Starts a loopback Shepherd on port 8769 with a throwaway token, an audit file (the server requires one with a clients file), a clients file that grants only
    `observe`, `read`, `control`, `start`, `dialog` and `remove`, and one launch profile for the agent.
 4. Starts the pane. If the first screen asks for a login, the pane is removed and the check is a
    `SKIP`; nothing is typed.
