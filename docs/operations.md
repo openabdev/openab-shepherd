@@ -804,17 +804,21 @@ Pane ids are `n:<k>`
   again before any stop, and by membership of the child's group and session. So a
   descendant that moves to its own group or session, or whose parent exits, is
   still known. On Linux the periodic look reads the process table once for all
-  panes, and a pane may use a read up to 250 ms old (so a descendant is seen
-  within about 500 ms, not 250 ms); a stop always reads it afresh. Removing a pane (`remove_pane`) and Shepherd's exit on SIGINT,
-  SIGTERM or SIGHUP send SIGHUP and SIGTERM to the group and the descendants, wait
+  panes, and a pane may use a read up to 250 ms old. A look is nominally every
+  250 ms, and up to about 450 ms apart because the reader wakes every 200 ms. So a
+  descendant is seen within about 500 ms nominal and at most about 700 ms (see
+  Known limits). A stop always reads it afresh. Removing a pane (`remove_pane`)
+  and Shepherd's exit on SIGINT, SIGTERM or SIGHUP send SIGHUP and SIGTERM to the
+  group and the descendants, wait
   up to 2 s (for `remove_pane`, its `timeout`), then stop (SIGSTOP) the group and
   descendants until no new one appears and SIGKILL them all. When the program exits
   on its own, what it left behind gets the same treatment at once. The leader stays
   an unreaped zombie only during that stop, so its pid (the group and session id)
   cannot be reused while Shepherd signals by it; a descendant is signalled only
   while its pid still has the recorded start time. Known limit: a descendant that
-  is re-parented and fully detaches (new session, no terminal) before the next
-  look at the process table (about every 250 ms) is never seen and survives
+  is re-parented and fully detaches (new session, no terminal) before the first
+  look that would see it (within about 700 ms of its fork on Linux, about 450 ms
+  on macOS; see Known limits) is never seen and survives
   (see Known limits). If Shepherd is killed with SIGKILL, children get only the
   PTY hangup.
 - **Status.** OSC 7501 reports from the program are parsed in the emulator's
@@ -1651,8 +1655,9 @@ try to update itself at run time).
   without cursor save) is not emulated.
 - **Native: a fast daemon escapes.** A descendant that is re-parented and fully
   detaches (calls `setsid`, so it has no group, session or terminal link to the
-  pane, and its parents exit) before the next look at the process table, about
-  every 250 ms, is never seen. It survives `remove_pane`, the program's own exit,
+  pane, and its parents exit) before the first look that would see it, is never
+  seen. That look comes within about 700 ms of the fork on Linux and about 450 ms
+  on macOS. It survives `remove_pane`, the program's own exit,
   and Shepherd's shutdown. One that only changes process group, or stays under a
   live parent until the next look, is ended (issue #10). macOS offers no
   unprivileged way to close this: kqueue `NOTE_TRACK` answers `ENOTSUP`, only root

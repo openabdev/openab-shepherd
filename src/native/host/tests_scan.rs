@@ -59,7 +59,13 @@ fn a_stop_scans_afresh_and_ends_a_child_the_shared_snapshot_missed() {
 }
 
 /// Eight panes polling for descendants cost about one scan per tick, not
-/// eight.
+/// eight. The exact count (one scan per 250 ms window) is pinned by
+/// `eight_pollers_take_exactly_one_scan_per_window` in `procs.rs`, where the
+/// clock is supplied. Real pane readers wake every 200 ms, so their looks
+/// land where the scheduler and the wake grid put them: panes started
+/// together cluster and gave 3 scans in 1.5 s. The hard limit is one scan per
+/// window, at most 7 in 1.5 s. Zero scans (no periodic look) and about 48 (no
+/// sharing) both fail.
 #[test]
 fn eight_panes_share_one_scan_per_tick() {
     let host = Arc::new(LocalHost::new());
@@ -70,8 +76,10 @@ fn eight_panes_share_one_scan_per_tick() {
     let before = host.scans();
     std::thread::sleep(Duration::from_millis(1500));
     let taken = host.scans() - before;
-    // About 6 ticks; one scan per pane per tick would be about 48.
-    assert!(taken <= 14, "{taken} scans in 1.5 s for 8 panes");
+    assert!(
+        (2..=7).contains(&taken),
+        "{taken} scans in 1.5 s for 8 panes, expected 2 to 7 (at most one per 250 ms window)"
+    );
     for pane in &panes {
         host.kill(&pane.id, Duration::from_secs(2)).unwrap();
     }

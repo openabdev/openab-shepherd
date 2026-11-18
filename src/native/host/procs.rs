@@ -14,7 +14,9 @@
 //! [`SNAPSHOT_MAX_AGE`] old, so a tick costs one scan, not one per pane. The
 //! stop path never uses it: it takes its own fresh scan ([`Tree::refresh`]),
 //! and a signal is sent only after the pid and its start time are read again.
-//! `Shared`'s lock is a leaf: nothing else is taken while it is held.
+//! `Shared`'s lock is a leaf: nothing else is taken while it is held. A scan
+//! that could not read every process is not kept, and a tree applied from it
+//! keeps the members it could not check.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -60,11 +62,18 @@ impl Tree {
         self.apply(leader, &snap)
     }
 
+    /// A member the snapshot shows with another start time has been replaced
+    /// and is dropped. A member the snapshot does not show is dropped only
+    /// when the snapshot is complete: a degraded one (a failed read) cannot
+    /// tell "gone" from "not read", so it keeps the member.
     fn apply(&mut self, leader: i32, snap: &os::Snapshot) -> usize {
         let mut known: HashMap<i32, Start> = self
             .members
             .iter()
-            .filter(|(&pid, &start)| snap.start(pid) == Some(start))
+            .filter(|(&pid, &start)| match snap.start(pid) {
+                Some(now) => now == start,
+                None => !snap.complete(),
+            })
             .map(|(&pid, &start)| (pid, start))
             .collect();
         let me = std::process::id() as i32;
@@ -128,12 +137,6 @@ impl Shared {
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn scans(&self) -> usize {
         self.0.scans()
-    }
-}
-
-impl Default for Shared {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -216,6 +219,11 @@ mod os {
             start_time(pid)
         }
 
+        /// Every answer is a live kernel query, so nothing here is degraded.
+        pub(super) fn complete(&self) -> bool {
+            true
+        }
+
         pub(super) fn children(&self, pid: i32) -> Vec<i32> {
             // SAFETY: the buffer and its size come from `pids`.
             pids(|buf, size| unsafe { libc::proc_listchildpids(pid, buf, size) })
@@ -290,7 +298,7 @@ mod os {
             .split(|b| b.is_ascii_whitespace())
             .filter(|field| !field.is_empty());
         // The first field is field 3 of proc(5): state, ppid, pgrp, session,
-        // ..., starttime (field 22, 15 fields after session).
+        // ..., starttime (field 22, the 16th field after session).
         if matches!(fields.next()?, b"Z" | b"X") {
             return None;
         }
@@ -306,6 +314,16 @@ mod os {
         })
     }
 
+    /// What one read of `/proc/<pid>/stat` found. `Gone` is normal (the
+    /// process exited, or is a zombie). `Failed` is not: the read could not
+    /// be made (for example, out of file descriptors), so the process may
+    /// well be alive.
+    pub(super) enum StatRead {
+        Stat(Stat),
+        Gone,
+        Failed,
+    }
+
     /// Reads `/proc/<pid>/stat` into a path and a buffer it keeps, so a scan
     /// of every process allocates once, not once per process.
     #[derive(Default)]
@@ -315,16 +333,27 @@ mod os {
     }
 
     impl Reader {
-        /// `/proc/<pid>/stat`, or None when it is gone or a zombie.
-        pub(super) fn stat(&mut self, pid: i32) -> Option<Stat> {
+        pub(super) fn read(&mut self, pid: i32) -> StatRead {
             self.path.clear();
-            write!(self.path, "/proc/{pid}/stat").ok()?;
+            if write!(self.path, "/proc/{pid}/stat").is_err() {
+                return StatRead::Failed;
+            }
             self.buf.clear();
-            File::open(&self.path)
-                .ok()?
-                .read_to_end(&mut self.buf)
-                .ok()?;
-            parse_stat(&self.buf)
+            match File::open(&self.path).and_then(|mut f| f.read_to_end(&mut self.buf)) {
+                Ok(_) => parse_stat(&self.buf).map_or(StatRead::Gone, StatRead::Stat),
+                Err(err) if matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+                    StatRead::Gone
+                }
+                Err(_) => StatRead::Failed,
+            }
+        }
+
+        /// `/proc/<pid>/stat`, or None when it cannot be read.
+        pub(super) fn stat(&mut self, pid: i32) -> Option<Stat> {
+            match self.read(pid) {
+                StatRead::Stat(stat) => Some(stat),
+                StatRead::Gone | StatRead::Failed => None,
+            }
         }
     }
 
@@ -334,31 +363,74 @@ mod os {
 
     /// One read of every process in `/proc`, with the lookups the tree needs
     /// indexed once: by parent, and by process group and session.
+    ///
+    /// The snapshot does not depend on the leader it was taken for. A
+    /// degraded one (the listing failed, or a read failed) is `incomplete`:
+    /// it can miss live processes, so it must not be cached or used to drop
+    /// members.
     pub(super) struct Snapshot {
         procs: HashMap<i32, Stat>,
         children: HashMap<i32, Vec<i32>>,
         /// Members of each process group and session, by its id.
         peers: HashMap<i32, Vec<i32>>,
+        complete: bool,
     }
 
     impl Snapshot {
+        /// Scans `/proc`. The leader and the tty are not used on Linux, so
+        /// the result serves every pane.
         pub(super) fn take(_leader: i32, _tty: &mut Option<u32>) -> Self {
-            let pids = std::fs::read_dir("/proc")
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok());
-            Self::of(pids)
+            let mut listed = true;
+            let mut pids = Vec::new();
+            match std::fs::read_dir("/proc") {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok(entry) => {
+                                if let Some(pid) = entry
+                                    .file_name()
+                                    .to_str()
+                                    .and_then(|name| name.parse::<i32>().ok())
+                                {
+                                    pids.push(pid);
+                                }
+                            }
+                            Err(_) => listed = false,
+                        }
+                    }
+                }
+                Err(_) => listed = false,
+            }
+            let mut reader = Reader::default();
+            Self::build(pids, listed, |pid| reader.read(pid))
         }
 
         /// The listed processes that can still be read: one that left
         /// between the listing and the read is skipped.
+        #[cfg(test)]
         pub(super) fn of(pids: impl IntoIterator<Item = i32>) -> Self {
             let mut reader = Reader::default();
-            let procs: HashMap<i32, Stat> = pids
-                .into_iter()
-                .filter_map(|pid| Some((pid, reader.stat(pid)?)))
-                .collect();
+            Self::build(pids, true, |pid| reader.read(pid))
+        }
+
+        /// Builds the snapshot from the listing and one `read` per listed
+        /// process. A `Failed` read makes the snapshot incomplete.
+        pub(super) fn build(
+            pids: impl IntoIterator<Item = i32>,
+            listed: bool,
+            mut read: impl FnMut(i32) -> StatRead,
+        ) -> Self {
+            let mut complete = listed;
+            let mut procs = HashMap::new();
+            for pid in pids {
+                match read(pid) {
+                    StatRead::Stat(stat) => {
+                        procs.insert(pid, stat);
+                    }
+                    StatRead::Gone => {}
+                    StatRead::Failed => complete = false,
+                }
+            }
             let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
             let mut peers: HashMap<i32, Vec<i32>> = HashMap::new();
             for (&pid, s) in &procs {
@@ -372,7 +444,14 @@ mod os {
                 procs,
                 children,
                 peers,
+                complete,
             }
+        }
+
+        /// Whether every process was listed and read. A snapshot that is not
+        /// complete can miss live processes.
+        pub(super) fn complete(&self) -> bool {
+            self.complete
         }
 
         pub(super) fn start(&self, pid: i32) -> Option<Start> {
@@ -408,23 +487,37 @@ mod os {
         }
 
         /// A scan that began at or after `not_before` and less than
-        /// `max_age` ago, taking one if there is none.
+        /// `max_age` before `now`, taking one if there is none. A scan that
+        /// is not complete is returned to its caller but not kept, so the
+        /// next reader takes a fresh one.
         pub(super) fn snapshot(
             &self,
             leader: i32,
             tty: &mut Option<u32>,
             not_before: Instant,
         ) -> Arc<Snapshot> {
+            self.snapshot_at(Instant::now(), not_before, || Snapshot::take(leader, tty))
+        }
+
+        /// [`Shared::snapshot`] with the time and the scan supplied, so the
+        /// age limit can be tested exactly.
+        pub(super) fn snapshot_at(
+            &self,
+            now: Instant,
+            not_before: Instant,
+            take: impl FnOnce() -> Snapshot,
+        ) -> Arc<Snapshot> {
             let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some((began, snap)) = &*last {
-                if *began >= not_before && began.elapsed() < self.max_age {
+                if *began >= not_before && now.saturating_duration_since(*began) < self.max_age {
                     return Arc::clone(snap);
                 }
             }
-            let began = Instant::now();
-            let snap = Arc::new(Snapshot::take(leader, tty));
+            let snap = Arc::new(take());
             self.scans.fetch_add(1, Ordering::Relaxed);
-            *last = Some((began, Arc::clone(&snap)));
+            if snap.complete() {
+                *last = Some((now, Arc::clone(&snap)));
+            }
             snap
         }
 
@@ -618,7 +711,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod linux {
         use super::*;
-        use os::{parse_stat, Reader, Snapshot};
+        use os::{parse_stat, Reader, Snapshot, StatRead};
 
         /// A stat line with `comm` between the parentheses; the fields after
         /// it are state, ppid 10, pgrp 20, session 30, then filler up to
@@ -812,6 +905,88 @@ mod tests {
                 Tree::default().refresh_shared(me, &shared, epoch);
             }
             assert_eq!(shared.scans(), 1);
+        }
+
+        /// The snapshot is reused just before `SNAPSHOT_MAX_AGE` and replaced
+        /// at it. The window is 250 ms; a doubled constant fails here.
+        #[test]
+        fn a_snapshot_is_reused_until_the_age_limit_and_no_longer() {
+            assert_eq!(SNAPSHOT_MAX_AGE, Duration::from_millis(250));
+            let shared = Shared::new();
+            let t0 = Instant::now();
+            let not_before = t0 - Duration::from_secs(60);
+            let first = shared
+                .0
+                .snapshot_at(t0, not_before, || Snapshot::of(std::iter::empty()));
+            let before_limit =
+                shared
+                    .0
+                    .snapshot_at(t0 + Duration::from_millis(249), not_before, || {
+                        Snapshot::of(std::iter::empty())
+                    });
+            assert!(std::sync::Arc::ptr_eq(&first, &before_limit));
+            let at_limit = shared.0.snapshot_at(t0 + SNAPSHOT_MAX_AGE, not_before, || {
+                Snapshot::of(std::iter::empty())
+            });
+            assert!(!std::sync::Arc::ptr_eq(&first, &at_limit));
+            assert_eq!(shared.scans(), 2);
+        }
+
+        /// Eight panes, each polling every 250 ms from its own phase, take one
+        /// scan per 250 ms window: exactly six in 1.5 s. A doubled window
+        /// gives three.
+        #[test]
+        fn eight_pollers_take_exactly_one_scan_per_window() {
+            let shared = Shared::with_max_age(SNAPSHOT_MAX_AGE);
+            let t0 = Instant::now();
+            let not_before = t0 - Duration::from_secs(60);
+            let mut polls: Vec<Duration> = (0..8u64)
+                .flat_map(|pane| (0..6u64).map(move |k| Duration::from_millis(pane * 31 + 250 * k)))
+                .collect();
+            polls.sort();
+            for at in polls {
+                shared
+                    .0
+                    .snapshot_at(t0 + at, not_before, || Snapshot::of(std::iter::empty()));
+            }
+            assert_eq!(shared.scans(), 6);
+        }
+
+        /// A degraded scan (a read failed, here every read) is handed to its
+        /// caller but not kept, so the next reader takes a fresh scan.
+        #[test]
+        fn a_degraded_snapshot_is_not_cached() {
+            let shared = Shared::with_max_age(Duration::from_secs(3600));
+            let t0 = Instant::now();
+            let not_before = t0 - Duration::from_secs(60);
+            let degraded = shared.0.snapshot_at(t0, not_before, || {
+                Snapshot::build(std::iter::empty(), false, |_| StatRead::Failed)
+            });
+            assert!(!degraded.complete());
+            let next = shared
+                .0
+                .snapshot_at(t0, not_before, || Snapshot::of(std::iter::empty()));
+            assert!(next.complete());
+            assert_eq!(shared.scans(), 2);
+        }
+
+        /// A failed read (out of file descriptors, say) cannot tell a gone
+        /// member from an unread one, so a degraded snapshot prunes nothing:
+        /// two panes keep every member they had.
+        #[test]
+        fn a_degraded_snapshot_prunes_no_pane_member() {
+            let fx = Fixture::new("procs-degraded");
+            let mut first = Tree::default();
+            let mut second = Tree::default();
+            assert_eq!(first.refresh(fx.pid()), 4);
+            assert_eq!(second.refresh(fx.pid()), 4);
+            let before = sorted(&first);
+            let degraded = Snapshot::build(fx.members.iter().copied(), true, |_| StatRead::Failed);
+            assert!(!degraded.complete());
+            assert_eq!(first.apply(fx.pid(), &degraded), 0);
+            assert_eq!(second.apply(fx.pid(), &degraded), 0);
+            assert_eq!(sorted(&first), before);
+            assert_eq!(sorted(&second), before);
         }
 
         /// On the fixture the snapshot answers with the known tree: three

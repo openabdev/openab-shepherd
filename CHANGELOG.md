@@ -6,6 +6,14 @@
   is now accepted, so `answer_dialog` can answer it. Web search and wrapped shell commands stay
   refused. Fixtures for the new-file write, web fetch and web search keys and the wrapped shell
   dialogs are added under `tests/fixtures/kiro-3.3.0/`.
+- Native panes (Linux): the holder reads the process table once per 250 ms for all its panes,
+  not once per pane, so idle CPU for eight panes drops from about 14.9 % to about 1.9 %. The
+  cost is detection latency. A descendant that detaches with `setsid` and whose parents exit is
+  now seen within about 500 ms nominal and at most about 700 ms (it was about 250 ms nominal).
+  On macOS the bound stays about 450 ms. Stops still read the table afresh, and a failed read
+  never removes a process from a pane's tree.
+- Native panes: a process whose command name is not valid UTF-8 is now tracked. Before, it
+  escaped the descendant tree, so `remove_pane` and shutdown did not signal it. They now do.
 
 ## 0.5.0
 

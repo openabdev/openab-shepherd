@@ -663,7 +663,8 @@ impl Proc {
 }
 
 /// The reader thread: output to the sink until EOF, EIO or removal, and every
-/// `TREE_POLL` a fresh look for the pane's descendants.
+/// `TREE_POLL` a look at the pane's descendants (on Linux, from the holder's
+/// shared process-table snapshot, up to `SNAPSHOT_MAX_AGE` old).
 fn read_loop(pane: Arc<Proc>, sink: SinkCell) {
     let fd = pane.master.as_raw_fd();
     let mut buf = vec![0u8; READ_CHUNK];
