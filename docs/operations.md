@@ -800,10 +800,23 @@ Pane ids are `n:<k>`
   `OPENAB_SHEPHERD_BACKEND` and everything else never reach a child. Shepherd's own descriptors are close-on-exec and native spawns are serialized, so one pane's terminal does not reach another pane. Shepherd does not sweep descriptors inherited from its parent; launch it with a clean descriptor table.
 - **Process groups and descendants.** Each child is a session and group leader with
   the PTY as its controlling terminal. Shepherd also tracks every descendant of the
-  child, by pid and start time: by parent pid every 250 ms while the child runs and
-  again before any stop, and by membership of the child's group and session. So a
-  descendant that moves to its own group or session, or whose parent exits, is
-  still known. Removing a pane (`remove_pane`) and Shepherd's exit on SIGINT,
+  child, by pid and start time: by parent pid at each periodic look while the child
+  runs (every 250 ms as the target; at most about 450 ms apart because the reader
+  wakes every 200 ms) and again before any stop, and by membership of the child's
+  group and session. So a descendant that moves to its own group or session, or
+  whose parent exits, is still known. On Linux the periodic look reads the process
+  table once for all panes, and a look may use a read up to 250 ms old. A
+  descendant is seen within about 500 ms in the nominal case, and at most about
+  700 ms provided each scan finishes within the 250 ms age limit (see Known
+  limits). A stop always reads it afresh. The snapshot lists every process
+  on the host, so its memory grows with the host's process count (measured on
+  the Linux build host at 302 processes: about 720 KiB more than the isolated
+  base run and about 864 KiB more than the concurrent base run). A scan that
+  cannot read every process is not kept, and it prunes nothing: under a lasting
+  read failure a tree keeps a member until a complete scan no longer lists it.
+  While the failure lasts, no scan is kept, so each pane's look takes its own
+  scan, as it did before this change. Each signal still re-checks the
+  start time. Removing a pane (`remove_pane`) and Shepherd's exit on SIGINT,
   SIGTERM or SIGHUP send SIGHUP and SIGTERM to the group and the descendants, wait
   up to 2 s (for `remove_pane`, its `timeout`), then stop (SIGSTOP) the group and
   descendants until no new one appears and SIGKILL them all. When the program exits
@@ -811,8 +824,10 @@ Pane ids are `n:<k>`
   an unreaped zombie only during that stop, so its pid (the group and session id)
   cannot be reused while Shepherd signals by it; a descendant is signalled only
   while its pid still has the recorded start time. Known limit: a descendant that
-  is re-parented and fully detaches (new session, no terminal) before the next
-  look at the process table (about every 250 ms) is never seen and survives
+  is re-parented and fully detaches (new session, no terminal) before the first
+  look that would see it (at most about 700 ms after its fork on Linux, provided
+  each scan finishes within 250 ms; about 450 ms on macOS; see Known limits) is
+  never seen and survives
   (see Known limits). If Shepherd is killed with SIGKILL, children get only the
   PTY hangup.
 - **Status.** OSC 7501 reports from the program are parsed in the emulator's
@@ -1649,9 +1664,10 @@ try to update itself at run time).
   without cursor save) is not emulated.
 - **Native: a fast daemon escapes.** A descendant that is re-parented and fully
   detaches (calls `setsid`, so it has no group, session or terminal link to the
-  pane, and its parents exit) before the next look at the process table, about
-  every 250 ms, is never seen. It survives `remove_pane`, the program's own exit,
-  and Shepherd's shutdown. One that only changes process group, or stays under a
+  pane, and its parents exit) before the first look that would see it, is never
+  seen. That look comes at most about 700 ms after the fork on Linux, provided each
+  scan finishes within 250 ms, and about 450 ms on macOS. It survives
+  `remove_pane`, the program's own exit, and Shepherd's shutdown. One that only changes process group, or stays under a
   live parent until the next look, is ended (issue #10). macOS offers no
   unprivileged way to close this: kqueue `NOTE_TRACK` answers `ENOTSUP`, only root
   can create a coalition, and there is no subreaper or cgroup (measured on macOS

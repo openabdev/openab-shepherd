@@ -8,12 +8,28 @@
 //! (on macOS: the processes whose controlling terminal is the pane's). The
 //! reader thread refreshes the tree every `TREE_POLL` while the
 //! leader runs, and the stop path refreshes it again before signalling.
+//!
+//! On Linux every refresh needs the whole process table. The reader threads
+//! of all the holder's panes share one [`Shared`] snapshot of it, at most
+//! [`SNAPSHOT_MAX_AGE`] old, so a tick costs one scan, not one per pane. The
+//! stop path never uses it: it takes its own fresh scan ([`Tree::refresh`]),
+//! and a signal is sent only after the pid and its start time are read again.
+//! `Shared`'s lock is a leaf: nothing else is taken while it is held. A scan
+//! that could not read every process is not kept, and a tree applied from it
+//! keeps the members it could not check.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+/// The oldest a shared snapshot may be when a pane's reader uses it.
+pub(crate) const SNAPSHOT_MAX_AGE: Duration = Duration::from_millis(250);
 
 /// When a process started, in platform units. With the pid it names one
 /// process: a pid that is reused gets a later start time.
 pub(crate) type Start = u64;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use os::Request;
 
 /// The pane's known descendants (the leader itself is not a member).
 #[derive(Default)]
@@ -31,10 +47,36 @@ impl Tree {
     /// processes were new.
     pub(crate) fn refresh(&mut self, leader: i32) -> usize {
         let snap = os::Snapshot::take(leader, &mut self.tty);
+        self.apply(leader, &snap)
+    }
+
+    /// Like [`Tree::refresh`], from the holder-wide snapshot when it is
+    /// recent enough and was taken at or after `not_before` (when the pane
+    /// was spawned, so it cannot predate the leader). For the periodic
+    /// look only: a stop must use `refresh`, because a snapshot up to
+    /// `SNAPSHOT_MAX_AGE` old can miss a process forked since.
+    pub(crate) fn refresh_shared(
+        &mut self,
+        leader: i32,
+        shared: &Shared,
+        not_before: Instant,
+    ) -> usize {
+        let snap = shared.0.snapshot(leader, &mut self.tty, not_before);
+        self.apply(leader, &snap)
+    }
+
+    /// A member the snapshot shows with another start time has been replaced
+    /// and is dropped. A member the snapshot does not show is dropped only
+    /// when the snapshot is complete: a degraded one (a failed read) cannot
+    /// tell "gone" from "not read", so it keeps the member.
+    fn apply(&mut self, leader: i32, snap: &os::Snapshot) -> usize {
         let mut known: HashMap<i32, Start> = self
             .members
             .iter()
-            .filter(|(&pid, &start)| snap.start(pid) == Some(start))
+            .filter(|(&pid, &start)| match snap.start(pid) {
+                Some(now) => now == start,
+                None => !snap.complete(),
+            })
             .map(|(&pid, &start)| (pid, start))
             .collect();
         let me = std::process::id() as i32;
@@ -80,6 +122,33 @@ impl Tree {
     }
 }
 
+/// The process table as seen by one holder, shared by its panes' readers.
+pub(crate) struct Shared(os::Shared);
+
+impl Shared {
+    pub(crate) fn new() -> Self {
+        Self(os::Shared::new(SNAPSHOT_MAX_AGE))
+    }
+
+    /// Test hook: a different age limit.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_max_age(max_age: Duration) -> Self {
+        Self(os::Shared::new(max_age))
+    }
+
+    /// How many scans of the process table this has taken.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn scans(&self) -> usize {
+        self.0.scans()
+    }
+
+    /// Every request this has answered, in order, and whether each scanned.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn requests(&self) -> Vec<os::Request> {
+        self.0.requests()
+    }
+}
+
 /// Signal `pid` only if it is still the process that started at `start`.
 /// The window between the check and the kill is a few microseconds; a pid
 /// is reused only after the pid space wraps, so a reuse inside it is not a
@@ -97,6 +166,7 @@ fn signal_if_same(pid: i32, start: Start, signal: libc::c_int) {
 mod os {
     use super::Start;
     use std::mem::{size_of, MaybeUninit};
+    use std::time::{Duration, Instant};
 
     /// `PROC_TTY_ONLY` in `<sys/proc_info.h>`: processes whose session's
     /// controlling terminal is the given device.
@@ -158,6 +228,11 @@ mod os {
             start_time(pid)
         }
 
+        /// Every answer is a live kernel query, so nothing here is degraded.
+        pub(super) fn complete(&self) -> bool {
+            true
+        }
+
         pub(super) fn children(&self, pid: i32) -> Vec<i32> {
             // SAFETY: the buffer and its size come from `pids`.
             pids(|buf, size| unsafe { libc::proc_listchildpids(pid, buf, size) })
@@ -177,59 +252,246 @@ mod os {
             out
         }
     }
+
+    /// macOS asks the kernel per question and keeps no table, so there is
+    /// nothing to share: each look is its own.
+    pub(super) struct Shared;
+
+    impl Shared {
+        pub(super) fn new(_max_age: Duration) -> Self {
+            Self
+        }
+
+        pub(super) fn snapshot(
+            &self,
+            leader: i32,
+            tty: &mut Option<u32>,
+            _not_before: Instant,
+        ) -> Snapshot {
+            Snapshot::take(leader, tty)
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 mod os {
     use super::Start;
     use std::collections::HashMap;
+    use std::fmt::Write as _;
+    use std::fs::File;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::{Duration, Instant};
 
-    struct Stat {
-        ppid: i32,
-        pgrp: i32,
-        session: i32,
-        start: Start,
+    /// The root of the process table on Linux.
+    const PROC: &str = "/proc";
+
+    pub(super) struct Stat {
+        pub(super) ppid: i32,
+        pub(super) pgrp: i32,
+        pub(super) session: i32,
+        pub(super) start: Start,
     }
 
-    /// `/proc/<pid>/stat`, or None when it is gone or a zombie.
-    fn stat(pid: i32) -> Option<Stat> {
-        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    fn int<T: std::str::FromStr>(token: &[u8]) -> Option<T> {
+        std::str::from_utf8(token).ok()?.parse().ok()
+    }
+
+    /// The fields of one `/proc/<pid>/stat` line: `Ok(Some)` for a process,
+    /// `Ok(None)` for a zombie or dead one, and `Err` for a line that is not
+    /// a stat line (cut short or malformed). Read in place: no allocation.
+    /// Bytes, not text, so a command name that is not UTF-8 does not hide the
+    /// process.
+    pub(super) fn parse_stat(line: &[u8]) -> Result<Option<Stat>, ()> {
         // The command name may hold spaces and parentheses: fields start
         // after the last ')'.
-        let rest = &text[text.rfind(')')? + 1..];
-        let fields: Vec<&str> = rest.split_whitespace().collect();
-        // fields[0] is field 3 of proc(5): state, ppid, pgrp, session, ...,
-        // starttime (field 22).
-        if matches!(fields.first(), Some(&"Z") | Some(&"X") | None) {
-            return None;
+        let after = line.iter().rposition(|&b| b == b')').ok_or(())?;
+        let mut fields = line[after + 1..]
+            .split(|b| b.is_ascii_whitespace())
+            .filter(|field| !field.is_empty());
+        // The first field is field 3 of proc(5): state, ppid, pgrp, session,
+        // ..., starttime (field 22, the 16th field after session).
+        let state = fields.next().ok_or(())?;
+        if matches!(state, b"Z" | b"X") {
+            return Ok(None);
         }
-        Some(Stat {
-            ppid: fields.get(1)?.parse().ok()?,
-            pgrp: fields.get(2)?.parse().ok()?,
-            session: fields.get(3)?.parse().ok()?,
-            start: fields.get(19)?.parse().ok()?,
-        })
+        let ppid = int(fields.next().ok_or(())?).ok_or(())?;
+        let pgrp = int(fields.next().ok_or(())?).ok_or(())?;
+        let session = int(fields.next().ok_or(())?).ok_or(())?;
+        let start = int(fields.nth(15).ok_or(())?).ok_or(())?;
+        Ok(Some(Stat {
+            ppid,
+            pgrp,
+            session,
+            start,
+        }))
+    }
+
+    /// What one read of `/proc/<pid>/stat` found. `Gone` is normal (the
+    /// process exited, or is a zombie). `Failed` is not: the read could not
+    /// be made (for example, out of file descriptors), so the process may
+    /// well be alive.
+    pub(super) enum StatRead {
+        Stat(Stat),
+        Gone,
+        Failed,
+    }
+
+    /// Reads `<root>/<pid>/stat` into a path and a buffer it keeps, so a scan
+    /// of every process allocates once, not once per process.
+    pub(super) struct Reader {
+        root: String,
+        path: String,
+        buf: Vec<u8>,
+    }
+
+    impl Default for Reader {
+        fn default() -> Self {
+            Self::in_root(PROC)
+        }
+    }
+
+    impl Reader {
+        /// A reader over another table with the same layout: a test seam.
+        pub(super) fn in_root(root: &str) -> Self {
+            Self {
+                root: root.to_owned(),
+                path: String::new(),
+                buf: Vec::new(),
+            }
+        }
+
+        pub(super) fn read(&mut self, pid: i32) -> StatRead {
+            self.path.clear();
+            if write!(self.path, "{}/{pid}/stat", self.root).is_err() {
+                return StatRead::Failed;
+            }
+            self.buf.clear();
+            match File::open(&self.path).and_then(|mut f| f.read_to_end(&mut self.buf)) {
+                Ok(_) if self.buf.is_empty() => StatRead::Gone,
+                Ok(_) => match parse_stat(&self.buf) {
+                    Ok(Some(stat)) => StatRead::Stat(stat),
+                    Ok(None) => StatRead::Gone,
+                    Err(()) => StatRead::Failed,
+                },
+                Err(err) if matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+                    StatRead::Gone
+                }
+                Err(_) => StatRead::Failed,
+            }
+        }
+
+        /// `/proc/<pid>/stat`, or None when it cannot be read.
+        pub(super) fn stat(&mut self, pid: i32) -> Option<Stat> {
+            match self.read(pid) {
+                StatRead::Stat(stat) => Some(stat),
+                StatRead::Gone | StatRead::Failed => None,
+            }
+        }
     }
 
     pub(super) fn start_time(pid: i32) -> Option<Start> {
-        stat(pid).map(|s| s.start)
+        Reader::default().stat(pid).map(|s| s.start)
     }
 
-    /// One read of every process in `/proc`.
+    /// One read of every process in `/proc`, with the lookups the tree needs
+    /// indexed once: by parent, and by process group and session.
+    ///
+    /// The snapshot does not depend on the leader it was taken for. A
+    /// degraded one (the listing failed, or a read failed) is `incomplete`:
+    /// it can miss live processes, so it must not be cached or used to drop
+    /// members.
     pub(super) struct Snapshot {
         procs: HashMap<i32, Stat>,
+        children: HashMap<i32, Vec<i32>>,
+        /// Members of each process group and session, by its id.
+        peers: HashMap<i32, Vec<i32>>,
+        complete: bool,
     }
 
     impl Snapshot {
-        pub(super) fn take(_leader: i32, _tty: &mut Option<u32>) -> Self {
-            let procs = std::fs::read_dir("/proc")
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
-                .filter_map(|pid| Some((pid, stat(pid)?)))
-                .collect();
-            Self { procs }
+        /// Scans `/proc`. The leader and the tty are not used on Linux, so
+        /// the result serves every pane.
+        pub(super) fn take(leader: i32, tty: &mut Option<u32>) -> Self {
+            Self::take_in(PROC, leader, tty)
+        }
+
+        /// [`Snapshot::take`] over the table at `root`. A listing that
+        /// cannot be read makes the snapshot incomplete, not empty.
+        pub(super) fn take_in(root: &str, _leader: i32, _tty: &mut Option<u32>) -> Self {
+            let mut listed = true;
+            let mut pids = Vec::new();
+            match std::fs::read_dir(root) {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok(entry) => {
+                                if let Some(pid) = entry
+                                    .file_name()
+                                    .to_str()
+                                    .and_then(|name| name.parse::<i32>().ok())
+                                {
+                                    pids.push(pid);
+                                }
+                            }
+                            Err(_) => listed = false,
+                        }
+                    }
+                }
+                Err(_) => listed = false,
+            }
+            let mut reader = Reader::in_root(root);
+            Self::build(pids, listed, |pid| reader.read(pid))
+        }
+
+        /// The listed processes that can still be read: one that left
+        /// between the listing and the read is skipped.
+        #[cfg(test)]
+        pub(super) fn of(pids: impl IntoIterator<Item = i32>) -> Self {
+            let mut reader = Reader::default();
+            Self::build(pids, true, |pid| reader.read(pid))
+        }
+
+        /// Builds the snapshot from the listing and one `read` per listed
+        /// process. A `Failed` read makes the snapshot incomplete.
+        pub(super) fn build(
+            pids: impl IntoIterator<Item = i32>,
+            listed: bool,
+            mut read: impl FnMut(i32) -> StatRead,
+        ) -> Self {
+            let mut complete = listed;
+            let mut procs = HashMap::new();
+            for pid in pids {
+                match read(pid) {
+                    StatRead::Stat(stat) => {
+                        procs.insert(pid, stat);
+                    }
+                    StatRead::Gone => {}
+                    StatRead::Failed => complete = false,
+                }
+            }
+            let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
+            let mut peers: HashMap<i32, Vec<i32>> = HashMap::new();
+            for (&pid, s) in &procs {
+                children.entry(s.ppid).or_default().push(pid);
+                peers.entry(s.pgrp).or_default().push(pid);
+                if s.session != s.pgrp {
+                    peers.entry(s.session).or_default().push(pid);
+                }
+            }
+            Self {
+                procs,
+                children,
+                peers,
+                complete,
+            }
+        }
+
+        /// Whether every process was listed and read. A snapshot that is not
+        /// complete can miss live processes.
+        pub(super) fn complete(&self) -> bool {
+            self.complete
         }
 
         pub(super) fn start(&self, pid: i32) -> Option<Start> {
@@ -237,20 +499,134 @@ mod os {
         }
 
         pub(super) fn children(&self, pid: i32) -> Vec<i32> {
-            self.procs
-                .iter()
-                .filter(|(_, s)| s.ppid == pid)
-                .map(|(&p, _)| p)
-                .collect()
+            self.children.get(&pid).cloned().unwrap_or_default()
         }
 
         /// The leader's group and session.
         pub(super) fn peers(&self, leader: i32) -> Vec<i32> {
-            self.procs
-                .iter()
-                .filter(|(_, s)| s.pgrp == leader || s.session == leader)
-                .map(|(&p, _)| p)
-                .collect()
+            self.peers.get(&leader).cloned().unwrap_or_default()
+        }
+    }
+
+    /// One request to [`Shared::snapshot_at`] and what it decided.
+    #[cfg(test)]
+    #[derive(Clone, Copy)]
+    pub(crate) struct Request {
+        pub(crate) at: Instant,
+        pub(crate) not_before: Instant,
+        pub(crate) scanned: bool,
+    }
+
+    /// The newest complete scan and when it began. One scan serves every
+    /// reader that asks within `max_age`; the lock is held across the scan,
+    /// so readers that arrive meanwhile wait for it instead of each taking
+    /// their own.
+    pub(super) struct Shared {
+        max_age: Duration,
+        last: Mutex<Option<(Instant, Arc<Snapshot>)>>,
+        scans: AtomicUsize,
+        /// Every request in order, for the exact-count test.
+        #[cfg(test)]
+        requests: Mutex<Vec<Request>>,
+    }
+
+    impl Shared {
+        pub(super) fn new(max_age: Duration) -> Self {
+            Self {
+                max_age,
+                last: Mutex::new(None),
+                scans: AtomicUsize::new(0),
+                #[cfg(test)]
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A complete scan that began at or after `not_before` and less than
+        /// `max_age` before the time the lock was taken is reused; otherwise a
+        /// new scan is taken. The age is read after the lock, so a reader that
+        /// waited for another's scan judges the snapshot at the moment it uses
+        /// it. An incomplete scan is returned to its caller only and never
+        /// kept. It does not replace an older complete scan, so a later reader
+        /// may still reuse that older one while it is within `max_age`.
+        pub(super) fn snapshot(
+            &self,
+            leader: i32,
+            tty: &mut Option<u32>,
+            not_before: Instant,
+        ) -> Arc<Snapshot> {
+            let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+            self.reuse_or_take(&mut last, Instant::now(), not_before, || {
+                Snapshot::take(leader, tty)
+            })
+        }
+
+        /// [`Shared::snapshot`] with the time and the scan supplied, so the
+        /// age limit can be tested exactly.
+        #[cfg(test)]
+        pub(super) fn snapshot_at(
+            &self,
+            now: Instant,
+            not_before: Instant,
+            take: impl FnOnce() -> Snapshot,
+        ) -> Arc<Snapshot> {
+            let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+            self.reuse_or_take(&mut last, now, not_before, take)
+        }
+
+        /// The decision of [`Shared::snapshot`], made under the lock.
+        fn reuse_or_take(
+            &self,
+            last: &mut Option<(Instant, Arc<Snapshot>)>,
+            now: Instant,
+            not_before: Instant,
+            take: impl FnOnce() -> Snapshot,
+        ) -> Arc<Snapshot> {
+            let reused = match &*last {
+                Some((began, snap))
+                    if *began >= not_before
+                        && now.saturating_duration_since(*began) < self.max_age =>
+                {
+                    Some(Arc::clone(snap))
+                }
+                _ => None,
+            };
+            #[cfg(test)]
+            let scanned = reused.is_none();
+            let snap = match reused {
+                Some(snap) => snap,
+                None => {
+                    let snap = Arc::new(take());
+                    self.scans.fetch_add(1, Ordering::Relaxed);
+                    if snap.complete() {
+                        *last = Some((now, Arc::clone(&snap)));
+                    }
+                    snap
+                }
+            };
+            #[cfg(test)]
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Request {
+                    at: now,
+                    not_before,
+                    scanned,
+                });
+            snap
+        }
+
+        #[cfg(test)]
+        pub(super) fn scans(&self) -> usize {
+            self.scans.load(Ordering::Relaxed)
+        }
+
+        /// Every request so far, in order.
+        #[cfg(test)]
+        pub(super) fn requests(&self) -> Vec<Request> {
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
         }
     }
 }
@@ -289,6 +665,527 @@ mod tests {
                 "the recorded member was not signalled"
             );
             thread_sleep(20);
+        }
+    }
+
+    /// A process tree to look for: `sh` leads its own session and runs a
+    /// sleep, a subshell with a sleep of its own, and a child that moved to
+    /// another session (found by parent, not by group or session).
+    /// Returns the leader and the pids the script reported.
+    struct Fixture {
+        leader: std::process::Child,
+        members: Vec<i32>,
+        dir: crate::testutil::TempDir,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            use std::os::unix::process::CommandExt;
+            let dir = crate::testutil::TempDir::new(name);
+            let file = dir.path().join("pids");
+            let script = "sleep 60 & echo $! >>\"$F\"; \
+                (sleep 60 & echo $! >>\"$F\"; wait) & echo $! >>\"$F\"; \
+                perl -MPOSIX -e 'POSIX::setsid(); sleep 60' & echo $! >>\"$F\"; wait";
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", script])
+                .env("F", &file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null());
+            // SAFETY: setsid between fork and exec, nothing else.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            let leader = cmd.spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut members: Vec<i32>;
+            loop {
+                members = std::fs::read_to_string(&file)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|l| l.trim().parse().ok())
+                    .collect();
+                // Four pids, all running.
+                let ready = members.len() == 4
+                    && members.iter().all(|&p| os::start_time(p).is_some())
+                    // The perl has left the leader's session (it leads its own).
+                    // SAFETY: getsid only reads a process's session id.
+                    && members.iter().any(|&p| unsafe { libc::getsid(p) } == p);
+                if ready {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the fixture did not start");
+                thread_sleep(20);
+            }
+            members.sort_unstable();
+            Self {
+                leader,
+                members,
+                dir,
+            }
+        }
+
+        fn pid(&self) -> i32 {
+            self.leader.id() as i32
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // SAFETY: kill on the fixture's own group.
+            unsafe {
+                libc::killpg(self.pid(), libc::SIGKILL);
+            }
+            for pid in &self.members {
+                // SAFETY: kill on a pid the fixture started.
+                unsafe {
+                    libc::kill(*pid, libc::SIGKILL);
+                }
+            }
+            let _ = self.leader.wait();
+            let _ = &self.dir;
+        }
+    }
+
+    fn sorted(tree: &Tree) -> Vec<i32> {
+        let mut pids: Vec<i32> = tree.members.keys().copied().collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    /// `refresh` finds the leader's group, its session and a child that left
+    /// both, and nothing else; a second refresh adds nothing.
+    #[test]
+    fn refresh_finds_exactly_the_fixture_tree() {
+        let fx = Fixture::new("procs-fixture-fresh");
+        let mut tree = Tree::default();
+        assert_eq!(tree.refresh(fx.pid()), 4);
+        assert_eq!(sorted(&tree), fx.members);
+        assert_eq!(tree.refresh(fx.pid()), 0);
+        assert_eq!(sorted(&tree), fx.members);
+        assert!(tree.any_alive());
+    }
+
+    /// The shared snapshot finds the same members as a fresh scan.
+    #[test]
+    fn refresh_shared_finds_exactly_the_fixture_tree() {
+        let fx = Fixture::new("procs-fixture-shared");
+        let shared = Shared::new();
+        let mut tree = Tree::default();
+        assert_eq!(
+            tree.refresh_shared(fx.pid(), &shared, Instant::now() - Duration::from_secs(60)),
+            4
+        );
+        assert_eq!(sorted(&tree), fx.members);
+    }
+
+    /// A member that has gone is dropped by the next refresh.
+    #[test]
+    fn a_member_that_exited_is_dropped() {
+        let fx = Fixture::new("procs-fixture-drop");
+        let mut tree = Tree::default();
+        tree.refresh(fx.pid());
+        let gone = *fx.members.last().unwrap();
+        // SAFETY: kill on a pid the fixture started.
+        unsafe {
+            libc::kill(gone, libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while os::start_time(gone).is_some() {
+            assert!(Instant::now() < deadline, "{gone} did not exit");
+            thread_sleep(20);
+        }
+        tree.refresh(fx.pid());
+        assert!(!tree.members.contains_key(&gone));
+        // Whatever else is still running (a sleep whose parent was killed
+        // is re-parented, but is still in the leader's session) stays.
+        let alive: Vec<i32> = fx
+            .members
+            .iter()
+            .copied()
+            .filter(|&p| os::start_time(p).is_some())
+            .collect();
+        assert!(!alive.is_empty() && !alive.contains(&gone));
+        assert_eq!(sorted(&tree), alive);
+    }
+
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use super::*;
+        use os::{parse_stat, Reader, Snapshot, StatRead};
+
+        /// A stat line with `comm` between the parentheses; the fields after
+        /// it are state, ppid 10, pgrp 20, session 30, then filler up to
+        /// starttime 4242 (field 22), then more fields.
+        fn line(pid: i32, comm: &[u8], state: &str) -> Vec<u8> {
+            let mut out = format!("{pid} (").into_bytes();
+            out.extend_from_slice(comm);
+            // fields 3..=21 are state, ppid, pgrp, session, then 15 more.
+            out.extend_from_slice(format!(") {state} 10 20 30").as_bytes());
+            for n in 0..15 {
+                out.extend_from_slice(format!(" {}", 100 + n).as_bytes());
+            }
+            out.extend_from_slice(b" 4242 999 888 777\n");
+            out
+        }
+
+        fn fields(bytes: &[u8]) -> Option<(i32, i32, i32, u64)> {
+            parse_stat(bytes)
+                .ok()
+                .flatten()
+                .map(|s| (s.ppid, s.pgrp, s.session, s.start))
+        }
+
+        /// A zombie is gone; a line that is not a stat line is an unreadable
+        /// process, so the snapshot is incomplete and keeps its members.
+        #[test]
+        fn an_unparseable_line_is_a_failed_read_not_a_gone_process() {
+            assert!(matches!(parse_stat(&line(7, b"z", "Z")), Ok(None)));
+            assert!(matches!(
+                parse_stat(b"7 (sleep) S x 20 30 1 2 3 4 5 6 7 8 9 10 11 12 13 4242"),
+                Err(())
+            ));
+            assert!(matches!(parse_stat(b""), Err(())));
+        }
+
+        #[test]
+        fn a_plain_line_is_parsed() {
+            assert_eq!(fields(&line(7, b"sleep", "S")), Some((10, 20, 30, 4242)));
+        }
+
+        #[test]
+        fn a_comm_with_spaces_and_parentheses_is_parsed() {
+            for comm in [
+                &b"a b c"[..],
+                b"(x)",
+                b") R 1 2 3 (",
+                b"((((",
+                b"))))",
+                b"",
+                b" ",
+            ] {
+                assert_eq!(
+                    fields(&line(7, comm, "R")),
+                    Some((10, 20, 30, 4242)),
+                    "comm {:?}",
+                    String::from_utf8_lossy(comm)
+                );
+            }
+        }
+
+        #[test]
+        fn a_very_long_comm_is_parsed() {
+            let comm = vec![b'x'; 100_000];
+            assert_eq!(fields(&line(7, &comm, "S")), Some((10, 20, 30, 4242)));
+            let mut tricky = b") ".repeat(20_000);
+            tricky.extend_from_slice(b"(");
+            assert_eq!(fields(&line(7, &tricky, "S")), Some((10, 20, 30, 4242)));
+        }
+
+        /// The old text parser dropped such a process; ending it matters
+        /// more than the name.
+        #[test]
+        fn a_comm_that_is_not_utf8_is_parsed() {
+            assert_eq!(
+                fields(&line(7, &[0xff, 0xfe, b'(', 0x80], "S")),
+                Some((10, 20, 30, 4242))
+            );
+        }
+
+        #[test]
+        fn a_zombie_or_dead_process_is_not_found() {
+            assert_eq!(fields(&line(7, b"z", "Z")), None);
+            assert_eq!(fields(&line(7, b"x", "X")), None);
+            assert!(fields(&line(7, b"x", "x")).is_some());
+        }
+
+        #[test]
+        fn a_cut_or_malformed_line_is_not_found() {
+            assert_eq!(fields(b""), None);
+            assert_eq!(fields(b"7 (sleep"), None);
+            assert_eq!(fields(b"7 (sleep)"), None);
+            assert_eq!(fields(b"7 (sleep) S 10 20"), None);
+            let full = line(7, b"sleep", "S");
+            // Cut before starttime (field 22): no start, no process.
+            let before_start = full.len() - " 4242 999 888 777\n".len();
+            assert_eq!(fields(&full[..before_start]), None);
+            assert_eq!(
+                fields(b"7 (sleep) S x 20 30 1 2 3 4 5 6 7 8 9 10 11 12 13 4242"),
+                None
+            );
+        }
+
+        /// A real zombie is not in a snapshot; its parent is.
+        #[test]
+        fn a_real_zombie_is_not_in_a_snapshot() {
+            let mut child = Command::new("/bin/true").spawn().unwrap();
+            let pid = child.id() as i32;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut reader = Reader::default();
+            // Not waited for: the process stays a zombie once it has exited.
+            while std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|t| !t.contains(") Z "))
+                .unwrap_or(true)
+            {
+                assert!(Instant::now() < deadline, "no zombie appeared");
+                thread_sleep(10);
+            }
+            assert!(reader.stat(pid).is_none());
+            assert!(os::start_time(pid).is_none());
+            let snap = Snapshot::take(0, &mut None);
+            assert!(snap.start(pid).is_none());
+            assert!(snap.start(std::process::id() as i32).is_some());
+            child.wait().unwrap();
+        }
+
+        /// A process listed by readdir but gone at the read is skipped.
+        #[test]
+        fn a_process_that_vanished_between_listing_and_reading_is_skipped() {
+            let me = std::process::id() as i32;
+            let mut child = Command::new("/bin/true").spawn().unwrap();
+            let gone = child.id() as i32;
+            child.wait().unwrap();
+            let snap = Snapshot::of([me, gone, i32::MAX, 0, -5]);
+            assert!(snap.start(me).is_some());
+            assert!(snap.start(gone).is_none());
+            assert!(snap.start(i32::MAX).is_none());
+            assert_eq!(Reader::default().stat(i32::MAX).map(|s| s.start), None);
+        }
+
+        /// The snapshot's indexes agree with the stat of each process.
+        #[test]
+        fn the_indexes_list_each_process_once_under_its_parent_group_and_session() {
+            let fx = Fixture::new("procs-index");
+            let snap = Snapshot::take(0, &mut None);
+            let mut reader = Reader::default();
+            for &pid in &fx.members {
+                let s = reader.stat(pid).unwrap();
+                let kids = snap.children(s.ppid);
+                assert_eq!(kids.iter().filter(|&&k| k == pid).count(), 1);
+                for id in [s.pgrp, s.session] {
+                    let peers = snap.peers(id);
+                    assert_eq!(
+                        peers.iter().filter(|&&k| k == pid).count(),
+                        1,
+                        "{pid} in {id}"
+                    );
+                }
+            }
+            assert!(snap.children(i32::MAX).is_empty());
+            assert!(snap.peers(i32::MAX).is_empty());
+        }
+
+        /// A snapshot within the age limit is reused; an older one is not.
+        #[test]
+        fn a_shared_snapshot_is_reused_within_the_age_limit_only() {
+            let long = Shared::with_max_age(Duration::from_secs(3600));
+            let epoch = Instant::now() - Duration::from_secs(60);
+            let mut tty = None;
+            let a = long.0.snapshot(1, &mut tty, epoch);
+            let b = long.0.snapshot(1, &mut tty, epoch);
+            assert!(std::sync::Arc::ptr_eq(&a, &b));
+            assert_eq!(long.scans(), 1);
+
+            let short = Shared::with_max_age(Duration::from_millis(60));
+            let a = short.0.snapshot(1, &mut tty, epoch);
+            thread_sleep(100);
+            let b = short.0.snapshot(1, &mut tty, epoch);
+            assert!(!std::sync::Arc::ptr_eq(&a, &b));
+            assert_eq!(short.scans(), 2);
+
+            let none = Shared::with_max_age(Duration::ZERO);
+            none.0.snapshot(1, &mut tty, epoch);
+            none.0.snapshot(1, &mut tty, epoch);
+            assert_eq!(none.scans(), 2);
+        }
+
+        /// A snapshot that began before the pane did is never used for it.
+        #[test]
+        fn a_shared_snapshot_older_than_the_pane_is_not_used() {
+            let shared = Shared::with_max_age(Duration::from_secs(3600));
+            let mut tty = None;
+            let epoch = Instant::now() - Duration::from_secs(60);
+            shared.0.snapshot(1, &mut tty, epoch);
+            thread_sleep(5);
+            shared.0.snapshot(1, &mut tty, Instant::now());
+            assert_eq!(shared.scans(), 2);
+        }
+
+        /// Panes that poll together cost one scan: 8 trees, one snapshot.
+        #[test]
+        fn eight_trees_refreshed_together_take_one_scan() {
+            let shared = Shared::with_max_age(Duration::from_secs(3600));
+            let epoch = Instant::now() - Duration::from_secs(60);
+            let me = std::process::id() as i32;
+            for _ in 0..8 {
+                Tree::default().refresh_shared(me, &shared, epoch);
+            }
+            assert_eq!(shared.scans(), 1);
+        }
+
+        /// The snapshot is reused just before `SNAPSHOT_MAX_AGE` and replaced
+        /// at it. The window is 250 ms; a doubled constant fails here.
+        #[test]
+        fn a_snapshot_is_reused_until_the_age_limit_and_no_longer() {
+            assert_eq!(SNAPSHOT_MAX_AGE, Duration::from_millis(250));
+            let shared = Shared::new();
+            let t0 = Instant::now();
+            let not_before = t0 - Duration::from_secs(60);
+            let first = shared
+                .0
+                .snapshot_at(t0, not_before, || Snapshot::of(std::iter::empty()));
+            let before_limit =
+                shared
+                    .0
+                    .snapshot_at(t0 + Duration::from_millis(249), not_before, || {
+                        Snapshot::of(std::iter::empty())
+                    });
+            assert!(std::sync::Arc::ptr_eq(&first, &before_limit));
+            let at_limit = shared.0.snapshot_at(t0 + SNAPSHOT_MAX_AGE, not_before, || {
+                Snapshot::of(std::iter::empty())
+            });
+            assert!(!std::sync::Arc::ptr_eq(&first, &at_limit));
+            assert_eq!(shared.scans(), 2);
+        }
+
+        /// Eight panes, each polling every 250 ms from its own phase, take one
+        /// scan per 250 ms window: exactly six in 1.5 s. A doubled window
+        /// gives three.
+        #[test]
+        fn eight_pollers_take_exactly_one_scan_per_window() {
+            let shared = Shared::with_max_age(SNAPSHOT_MAX_AGE);
+            let t0 = Instant::now();
+            let not_before = t0 - Duration::from_secs(60);
+            let mut polls: Vec<Duration> = (0..8u64)
+                .flat_map(|pane| (0..6u64).map(move |k| Duration::from_millis(pane * 31 + 250 * k)))
+                .collect();
+            polls.sort();
+            for at in polls {
+                shared
+                    .0
+                    .snapshot_at(t0 + at, not_before, || Snapshot::of(std::iter::empty()));
+            }
+            assert_eq!(shared.scans(), 6);
+        }
+
+        /// A listing that cannot be read (here `/proc` does not exist under
+        /// the root) is a degraded scan: it finds nothing, so it must not
+        /// prune any pane, and it is not kept.
+        #[test]
+        fn a_missing_listing_is_degraded_and_prunes_no_pane_member() {
+            let fx = Fixture::new("procs-no-listing");
+            let mut tree = Tree::default();
+            assert_eq!(tree.refresh(fx.pid()), 4);
+            let before = sorted(&tree);
+            let dir = crate::testutil::TempDir::new("procs-no-listing-root");
+            let missing = dir.path().join("no-such-proc");
+            let degraded = Snapshot::take_in(missing.to_str().unwrap(), fx.pid(), &mut None);
+            assert!(!degraded.complete());
+            assert_eq!(tree.apply(fx.pid(), &degraded), 0);
+            assert_eq!(sorted(&tree), before);
+            let shared = Shared::with_max_age(Duration::from_secs(3600));
+            let t0 = Instant::now();
+            let not_before = t0 - Duration::from_secs(60);
+            shared.0.snapshot_at(t0, not_before, || {
+                Snapshot::take_in(missing.to_str().unwrap(), 0, &mut None)
+            });
+            let next = shared.0.snapshot_at(t0, not_before, || {
+                Snapshot::take_in(missing.to_str().unwrap(), 0, &mut None)
+            });
+            assert!(!next.complete());
+            assert_eq!(shared.scans(), 2, "a degraded scan was reused");
+        }
+
+        /// Every read fails with an error that is not "gone" (a directory
+        /// where `stat` should be fails with EISDIR, as a read does when a
+        /// descriptor is not usable). The listing works, so the scan is
+        /// degraded, and the pane keeps every member it had.
+        #[test]
+        fn a_failed_read_on_disk_prunes_no_pane_member() {
+            let fx = Fixture::new("procs-eisdir");
+            let mut tree = Tree::default();
+            assert_eq!(tree.refresh(fx.pid()), 4);
+            let before = sorted(&tree);
+            let dir = crate::testutil::TempDir::new("procs-eisdir-root");
+            for &pid in &fx.members {
+                std::fs::create_dir_all(dir.path().join(pid.to_string()).join("stat")).unwrap();
+            }
+            let root = dir.path().to_str().unwrap();
+            let degraded = Snapshot::take_in(root, fx.pid(), &mut None);
+            assert!(!degraded.complete());
+            assert_eq!(tree.apply(fx.pid(), &degraded), 0);
+            assert_eq!(sorted(&tree), before);
+        }
+
+        /// A degraded scan (a read failed, here every read) is handed to its
+        /// caller but not kept, so the next reader takes a fresh scan.
+        #[test]
+        fn a_degraded_snapshot_is_not_cached() {
+            let shared = Shared::with_max_age(Duration::from_secs(3600));
+            let t0 = Instant::now();
+            let not_before = t0 - Duration::from_secs(60);
+            let degraded = shared.0.snapshot_at(t0, not_before, || {
+                Snapshot::build(std::iter::empty(), false, |_| StatRead::Failed)
+            });
+            assert!(!degraded.complete());
+            let next = shared
+                .0
+                .snapshot_at(t0, not_before, || Snapshot::of(std::iter::empty()));
+            assert!(next.complete());
+            assert_eq!(shared.scans(), 2);
+        }
+
+        /// A failed read (out of file descriptors, say) cannot tell a gone
+        /// member from an unread one, so a degraded snapshot prunes nothing:
+        /// two panes keep every member they had.
+        #[test]
+        fn a_degraded_snapshot_prunes_no_pane_member() {
+            let fx = Fixture::new("procs-degraded");
+            let mut first = Tree::default();
+            let mut second = Tree::default();
+            assert_eq!(first.refresh(fx.pid()), 4);
+            assert_eq!(second.refresh(fx.pid()), 4);
+            let before = sorted(&first);
+            let degraded = Snapshot::build(fx.members.iter().copied(), true, |_| StatRead::Failed);
+            assert!(!degraded.complete());
+            assert_eq!(first.apply(fx.pid(), &degraded), 0);
+            assert_eq!(second.apply(fx.pid(), &degraded), 0);
+            assert_eq!(sorted(&first), before);
+            assert_eq!(sorted(&second), before);
+        }
+
+        /// On the fixture the snapshot answers with the known tree: three
+        /// children of the leader (one in another session), and the leader
+        /// and three more in its group and session (the grandchild sleep,
+        /// but not the perl).
+        #[test]
+        fn the_snapshot_answers_for_the_fixture_with_the_known_members() {
+            let fx = Fixture::new("procs-known");
+            let snap = Snapshot::take(0, &mut None);
+            let mut reader = Reader::default();
+            let mut kids = Vec::new();
+            // The leader leads its own group and session.
+            let mut group = vec![fx.pid()];
+            for &pid in &fx.members {
+                let s = reader.stat(pid).unwrap();
+                assert_eq!(snap.start(pid), Some(s.start));
+                if s.ppid == fx.pid() {
+                    kids.push(pid);
+                }
+                if s.pgrp == fx.pid() || s.session == fx.pid() {
+                    group.push(pid);
+                }
+            }
+            assert_eq!(kids.len(), 3, "{kids:?}");
+            assert_eq!(group.len(), 4, "{group:?}");
+            let sorted_set = |mut v: Vec<i32>| {
+                v.sort_unstable();
+                v
+            };
+            assert_eq!(sorted_set(snap.children(fx.pid())), sorted_set(kids));
+            assert_eq!(sorted_set(snap.peers(fx.pid())), sorted_set(group));
         }
     }
 
